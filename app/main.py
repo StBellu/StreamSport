@@ -30,13 +30,27 @@ from app.routers import configure_router, media_router, stremio_router
 logger = logging.getLogger(__name__)
 
 
+def _configure_logging(level_name: str) -> None:
+    """Configure application-wide logging level without disrupting test capture."""
+    level = getattr(logging, (level_name or "INFO").strip().upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    logging.getLogger("app").setLevel(level)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
 def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
     """Build and configure the StreamSport FastAPI application."""
     resolved_settings = settings_override or get_settings()
+    _configure_logging(resolved_settings.LOG_LEVEL)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings = settings_override or get_settings()
+        _configure_logging(settings.LOG_LEVEL)
         settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
         settings.POSTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         settings.BASE_POSTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)

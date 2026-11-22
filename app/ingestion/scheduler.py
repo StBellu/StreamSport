@@ -186,9 +186,15 @@ class PipelineScheduler:
         """Execute one full ingestion -> EPG -> streams -> TSDB -> DB -> RAM snapshot cycle."""
         async with self._run_lock:
             current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+            logger.info("Pipeline cycle started")
 
             # 1. Official schedule ingestion
             diretta_matches, active_tennis_cities = await self._diretta.fetch_schedule()
+            logger.info(
+                "Diretta ingestion completed: %d matches, %d active tennis cities",
+                len(diretta_matches),
+                len(active_tennis_cities),
+            )
 
             # 2. Italian EPG ingestion (throttled by EPG_SYNC_INTERVAL_SECONDS)
             if self._settings.ENABLE_SKY_EPG or self._settings.ENABLE_TIVUSAT_EPG:
@@ -207,11 +213,36 @@ class PipelineScheduler:
 
             enriched, orphan_matches = reconcile_with_schedule(diretta_matches, epg_programs)
             combined_matches = [*enriched, *orphan_matches]
+            logger.info(
+                "EPG reconciliation completed: %d EPG programs, %d orphan EPG candidates",
+                len(epg_programs),
+                len(orphan_matches),
+            )
 
             # 3. Concurrent stream harvesting & top-down attachment (+ ghost EPG filter)
             harvest_results = await self._orchestrator.harvest_all()
+            for provider_name, res in harvest_results.items():
+                if res.error:
+                    logger.warning(
+                        "Provider '%s' harvest error: %s",
+                        provider_name,
+                        res.error,
+                    )
+                else:
+                    logger.info(
+                        "Provider '%s' harvested: %d events, %d linear channels",
+                        provider_name,
+                        len(res.events),
+                        len(res.linear_channels),
+                    )
             matches = self._orchestrator.attach_streams(combined_matches, harvest_results)
             matches = filter_ghost_epg_matches(matches)
+            with_streams = sum(1 for m in matches if m.sources)
+            logger.info(
+                "Stream attachment completed: %d/%d matches have streams",
+                with_streams,
+                len(matches),
+            )
 
             # 4. TheSportsDB calendar sync & in-RAM poster reconciliation
             calendar_by_silo = None
