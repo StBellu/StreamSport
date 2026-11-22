@@ -1,0 +1,147 @@
+"""StreamSport FastAPI application entry point and lifespan manager."""
+
+from __future__ import annotations
+
+import logging
+import os
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, Optional
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import ORJSONResponse
+
+from app.config import Settings, get_settings
+from app.core.database import DatabaseManager
+from app.core.ram_cache import RAMCacheManager
+from app.graphics import BannerService, TennisPosterService, TheSportsDBService
+from app.ingestion import DirettaService, ItalianEPGService, PipelineScheduler
+from app.providers import (
+    DaddyLiveService,
+    Fctv33Service,
+    MandraKodiService,
+    SponService,
+    StreamFreeService,
+    StreamOrchestrator,
+    TvVooService,
+)
+from app.routers import configure_router, media_router, stremio_router
+
+logger = logging.getLogger(__name__)
+
+
+def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
+    """Build and configure the StreamSport FastAPI application."""
+    resolved_settings = settings_override or get_settings()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        settings = settings_override or get_settings()
+        settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        settings.POSTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        settings.BASE_POSTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        db = DatabaseManager(db_path=settings.DB_PATH)
+        await db.connect()
+
+        ram_cache = RAMCacheManager()
+        diretta = DirettaService(settings=settings)
+        epg = ItalianEPGService(settings=settings)
+        tsdb = TheSportsDBService(settings=settings)
+        tennis_poster = TennisPosterService(settings=settings)
+        banner = BannerService(
+            settings=settings,
+            tsdb_service=tsdb,
+            tennis_service=tennis_poster,
+        )
+
+        # Share the exact same TvVooService (and LiveManifestManager) between orchestrator and /live/manifest.m3u8
+        tvvoo = TvVooService(settings=settings)
+        providers = [
+            tvvoo,
+            MandraKodiService(settings=settings),
+            SponService(settings=settings),
+            DaddyLiveService(settings=settings),
+            StreamFreeService(settings=settings),
+            Fctv33Service(settings=settings),
+        ]
+        orchestrator = StreamOrchestrator(providers=providers, settings=settings)
+
+        scheduler = PipelineScheduler(
+            settings=settings,
+            db=db,
+            ram_cache=ram_cache,
+            diretta=diretta,
+            epg=epg,
+            orchestrator=orchestrator,
+            tsdb=tsdb,
+            banner=banner,
+        )
+
+        app.state.settings = settings
+        app.state.db = db
+        app.state.ram_cache = ram_cache
+        app.state.diretta = diretta
+        app.state.epg = epg
+        app.state.tsdb = tsdb
+        app.state.tennis_poster = tennis_poster
+        app.state.banner = banner
+        app.state.tvvoo = tvvoo
+        app.state.orchestrator = orchestrator
+        app.state.scheduler = scheduler
+
+        await scheduler.hydrate_from_db()
+
+        disable_bg = os.environ.get("DISABLE_BACKGROUND_SCHEDULER", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if settings.APP_ENV.strip().lower() != "test" and not disable_bg:
+            scheduler.start()
+
+        try:
+            yield
+        finally:
+            await scheduler.stop()
+            await orchestrator.aclose()
+            await tsdb.aclose()
+            await tennis_poster.aclose()
+            await db.close()
+
+    application = FastAPI(
+        title="StreamSport",
+        version="1.0.0",
+        default_response_class=ORJSONResponse,
+        lifespan=lifespan,
+    )
+    application.state.settings = resolved_settings
+
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @application.get("/health", response_class=ORJSONResponse)
+    async def health_check(request: Request) -> ORJSONResponse:
+        ram_cache: RAMCacheManager = request.app.state.ram_cache
+        snap = ram_cache.snapshot
+        return ORJSONResponse(
+            content={
+                "status": "ok",
+                "matches": len(snap.active_matches),
+                "updated_at": snap.updated_at,
+            }
+        )
+
+    # Register configure and media routes before parameterized /{config}/... routes
+    application.include_router(configure_router)
+    application.include_router(media_router)
+    application.include_router(stremio_router)
+
+    return application
+
+
+app = create_app()

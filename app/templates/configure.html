@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StreamSport — Configurazione Stremio &amp; Nuvio</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: rgba(18, 24, 36, 0.88);
+      --border: rgba(255, 255, 255, 0.1);
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --accent: #f5c518;
+      --accent-dark: #111827;
+      --ok: #22c55e;
+      --off: #64748b;
+      --primary: #3b82f6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at top right, #172033 0%, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 2rem 1rem 3rem;
+    }
+    .container {
+      max-width: 820px;
+      margin: 0 auto;
+    }
+    .header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .brand h1 {
+      margin: 0;
+      font-size: 1.9rem;
+      letter-spacing: -0.02em;
+    }
+    .brand span {
+      color: var(--accent);
+    }
+    .brand p {
+      margin: 0.3rem 0 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    .metric-pill {
+      background: rgba(34, 197, 94, 0.14);
+      border: 1px solid rgba(34, 197, 94, 0.4);
+      color: #bbf7d0;
+      padding: 0.45rem 0.9rem;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 1.4rem;
+      margin-bottom: 1.25rem;
+      backdrop-filter: blur(12px);
+    }
+    .card h2 {
+      margin: 0 0 1rem;
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1rem;
+    }
+    label.field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    input[type="text"],
+    input[type="url"],
+    input[type="password"] {
+      width: 100%;
+      background: #0f1522;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.68rem 0.85rem;
+      color: var(--text);
+      font-size: 0.95rem;
+      outline: none;
+    }
+    input:focus {
+      border-color: var(--accent);
+    }
+    .toggles {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      margin-top: 1rem;
+    }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      cursor: pointer;
+      font-size: 0.93rem;
+    }
+    .toggle-row input {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--accent);
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.35rem 0.7rem;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      border: 1px solid var(--border);
+      background: rgba(15, 21, 34, 0.8);
+    }
+    .chip .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--off);
+    }
+    .chip.on .dot {
+      background: var(--ok);
+      box-shadow: 0 0 8px rgba(34, 197, 94, 0.7);
+    }
+    .chip.off {
+      color: var(--muted);
+      opacity: 0.7;
+    }
+    .url-box {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 0.8rem;
+    }
+    .url-box input {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.83rem;
+    }
+    .btn {
+      border: none;
+      border-radius: 10px;
+      padding: 0.68rem 1rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+      transition: opacity 0.15s ease;
+    }
+    .btn:hover { opacity: 0.9; }
+    .btn-accent {
+      background: var(--accent);
+      color: var(--accent-dark);
+    }
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+    }
+    .btn-ghost {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-top: 1rem;
+    }
+    .hint {
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin: 0.25rem 0 0.55rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="brand">
+        <h1>Stream<span>Sport</span></h1>
+        <p>Configurazione Addon Stremio &amp; Nuvio</p>
+      </div>
+      <div class="metric-pill" id="active-count">
+        {{ active_matches_count }} eventi attivi in RAM
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Parametri EasyProxy &amp; TvVoo</h2>
+      <div class="grid-2">
+        <label class="field">
+          EasyProxy URL
+          <input type="url" id="ep_url" value="{{ user_cfg.ep_url }}" placeholder="https://easyproxy.example.com" />
+        </label>
+        <label class="field">
+          EasyProxy API Password
+          <input type="password" id="ep_pass" value="{{ user_cfg.ep_pass }}" placeholder="Opzionale" />
+        </label>
+      </div>
+      <div class="toggles">
+        <label class="toggle-row">
+          <input type="checkbox" id="prefer_direct_tvvoo" {% if user_cfg.prefer_direct_tvvoo %}checked{% endif %} />
+          <span>Mostra flusso diretto <strong>⚡ TvVoo No-Freeze</strong> (/live/manifest.m3u8, 0% banda video)</span>
+        </label>
+        <label class="toggle-row">
+          <input type="checkbox" id="show_easyproxy_tvvoo" {% if user_cfg.show_easyproxy_tvvoo %}checked{% endif %} />
+          <span>Mostra flusso di backup <strong>🛰️ TvVoo EP</strong> tramite EasyProxy</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Stato Sorgenti &amp; Provider (.env)</h2>
+      <div class="chips">
+        {% for item in source_statuses %}
+        <div class="chip {{ 'on' if item.enabled else 'off' }}" title="{{ item.kind }}">
+          <span class="dot"></span>
+          <span>{{ item.name }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Installazione Stremio &amp; Nuvio</h2>
+      <p class="hint">Manifest Stremio (cataloghi con filtri genere):</p>
+      <div class="url-box">
+        <input type="text" id="stremio_manifest_url" readonly value="{{ base_url }}/{{ initial_token }}/manifest.json" />
+        <button type="button" class="btn btn-ghost" onclick="copyField('stremio_manifest_url', this)">Copia</button>
+      </div>
+
+      <p class="hint">Manifest Nuvio (cataloghi appiattiti):</p>
+      <div class="url-box">
+        <input type="text" id="nuvio_manifest_url" readonly value="{{ base_url }}/{{ initial_token }}/nuvio/manifest.json" />
+        <button type="button" class="btn btn-ghost" onclick="copyField('nuvio_manifest_url', this)">Copia</button>
+      </div>
+
+      <div class="actions">
+        <a id="btn_install_stremio" class="btn btn-accent" href="#">Installa su Stremio</a>
+        <a id="btn_install_nuvio" class="btn btn-primary" href="#">Installa su Nuvio</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const BASE_URL = {{ base_url | tojson }};
+
+    function encodeConfigToken(cfg) {
+      const json = JSON.stringify(cfg);
+      const bytes = new TextEncoder().encode(json);
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) {
+        bin += String.fromCharCode(bytes[i]);
+      }
+      return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    function updateUrls() {
+      const cfg = {
+        ep_url: document.getElementById("ep_url").value.trim().replace(/\/+$/, ""),
+        ep_pass: document.getElementById("ep_pass").value.trim(),
+        prefer_direct_tvvoo: document.getElementById("prefer_direct_tvvoo").checked,
+        show_easyproxy_tvvoo: document.getElementById("show_easyproxy_tvvoo").checked,
+      };
+      const token = encodeConfigToken(cfg);
+      const stremioHttp = `${BASE_URL}/${token}/manifest.json`;
+      const nuvioHttp = `${BASE_URL}/${token}/nuvio/manifest.json`;
+      const stremioDeep = stremioHttp.replace(/^https?:\/\//i, "stremio://");
+      const nuvioDeep = nuvioHttp.replace(/^https?:\/\//i, "stremio://");
+
+      document.getElementById("stremio_manifest_url").value = stremioHttp;
+      document.getElementById("nuvio_manifest_url").value = nuvioHttp;
+      document.getElementById("btn_install_stremio").href = stremioDeep;
+      document.getElementById("btn_install_nuvio").href = nuvioDeep;
+    }
+
+    function copyField(elementId, btn) {
+      const input = document.getElementById(elementId);
+      input.select();
+      input.setSelectionRange(0, 99999);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(input.value).catch(() => document.execCommand("copy"));
+      } else {
+        document.execCommand("copy");
+      }
+      const prev = btn.textContent;
+      btn.textContent = "Copiato!";
+      setTimeout(() => { btn.textContent = prev; }, 1200);
+    }
+
+    ["ep_url", "ep_pass", "prefer_direct_tvvoo", "show_easyproxy_tvvoo"].forEach((id) => {
+      const el = document.getElementById(id);
+      el.addEventListener("input", updateUrls);
+      el.addEventListener("change", updateUrls);
+    });
+    updateUrls();
+  </script>
+</body>
+</html>

@@ -1,0 +1,79 @@
+"""StreamSport Phase 1 Taxonomy, Demographics, Aliases, Matcher, and Classifier."""
+
+from app.taxonomy.aliases import (
+    CORPORATE_STOPWORDS,
+    DISTINGUISHING_TOKENS,
+    PROTECTED_ACRONYMS,
+    STOPWORDS,
+    TEAM_ALIASES,
+    expand_team_variants,
+    normalize_team_name,
+)
+from app.taxonomy.classifier import (
+    CATALOG_DEFINITIONS,
+    DEFAULT_GENRE_CLASSIFIER,
+    LIVE_CATALOG_ID,
+    CatalogDefinition,
+    GenreClassifier,
+    build_nuvio_catalogs,
+    build_stremio_catalogs,
+    classify_event,
+    matches_catalog_filter,
+)
+from app.taxonomy.demographics import (
+    detect_demographics,
+    detect_demographics_from_stream_title,
+)
+from app.taxonomy.leagues import (
+    DEFAULT_LEAGUE_TAXONOMY,
+    SPORT_SILOS,
+    LeagueMatch,
+    LeagueRule,
+    LeagueTaxonomy,
+    normalize_country,
+)
+from app.taxonomy.matcher import (
+    AVG_THRESHOLD,
+    DEFAULT_TEAM_MATCHER,
+    DEMOGRAPHIC_PENALTY,
+    MAX_TIME_DIFF_MS,
+    MIN_SIDE_THRESHOLD,
+    SINGLE_ENTITY_THRESHOLD,
+    MatchResult,
+    TeamMatcher,
+)
+
+__all__ = [
+    "AVG_THRESHOLD",
+    "CATALOG_DEFINITIONS",
+    "CORPORATE_STOPWORDS",
+    "CatalogDefinition",
+    "DEFAULT_GENRE_CLASSIFIER",
+    "DEFAULT_LEAGUE_TAXONOMY",
+    "DEFAULT_TEAM_MATCHER",
+    "DEMOGRAPHIC_PENALTY",
+    "DISTINGUISHING_TOKENS",
+    "GenreClassifier",
+    "LIVE_CATALOG_ID",
+    "LeagueMatch",
+    "LeagueRule",
+    "LeagueTaxonomy",
+    "MAX_TIME_DIFF_MS",
+    "MIN_SIDE_THRESHOLD",
+    "MatchResult",
+    "PROTECTED_ACRONYMS",
+    "SINGLE_ENTITY_THRESHOLD",
+    "SPORT_SILOS",
+    "STOPWORDS",
+    "TEAM_ALIASES",
+    "TeamMatcher",
+    "build_nuvio_catalogs",
+    "build_stremio_catalogs",
+    "classify_event",
+    "detect_demographics",
+    "detect_demographics_from_stream_title",
+    "expand_team_variants",
+    "matches_catalog_filter",
+    "normalize_country",
+    "normalize_team_name",
+]
