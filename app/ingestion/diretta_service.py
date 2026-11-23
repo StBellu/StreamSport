@@ -52,6 +52,21 @@ SPORT_IDS: dict[int, SportFeedSpec] = {
 FEED_DAYS: tuple[int, ...] = (-1, 0, 1, 2)
 IT_FEED_URL = "https://400.flashscore.ninja/400/x/feed/f_{sport_id}_{day}_3_it_1"
 EN_FEED_URL = "https://2.flashscore.ninja/2/x/feed/f_{sport_id}_{day}_3_en-uk_1"
+OTT_EXCLUDE: tuple[str, ...] = (
+    "now tv",
+    "sky go",
+    "amazon prime",
+    "raiplay",
+    "mediaset infinity",
+    "timvision",
+    "discovery+",
+    "onefootball",
+    "uefa.tv",
+    "youtube",
+    "twitch",
+    "apple tv",
+    "dazn app",
+)
 
 _BROADCASTER_REGION_SUFFIX_RE = re.compile(
     r"\s*\((?:ita|it|eng|uk|hd)\)\s*$",
@@ -160,6 +175,8 @@ def extract_tv_broadcasters(al_value: Any) -> list[str]:
         cleaned = _clean_broadcaster_name(raw_name)
         if cleaned:
             norm_key = cleaned.casefold()
+            if any(ott in norm_key for ott in OTT_EXCLUDE):
+                continue
             if norm_key not in seen:
                 seen.add(norm_key)
                 channels.append(cleaned)
@@ -406,10 +423,10 @@ def _clean_motorsports_title(competition: str, stage: str) -> tuple[str, str]:
     suffix = f" - {stg}"
     if comp.lower().endswith(suffix.lower()):
         base = comp[: -len(suffix)].strip()
-        return base, f"{base} — {stg}"
+        return base, f"{base} - {stg}"
     if stg.lower() in comp.lower():
         return comp, comp
-    return comp, f"{comp} — {stg}"
+    return comp, f"{comp} - {stg}"
 
 
 def extract_tennis_cities(competition: str, alt_league: str = "") -> set[str]:
@@ -446,13 +463,15 @@ class DirettaService:
         self._settings = settings or get_settings()
         self._client = client
 
-    def build_headers(self) -> dict[str, str]:
+    def build_headers(self, lang: str = "it") -> dict[str, str]:
         """Build mandatory Flashscore/Diretta HTTP request headers."""
+        base_url = "https://www.flashscore.com" if lang == "en" else "https://www.diretta.it"
+        fsign = (self._settings.FLASHSCORE_FSIGN or "").strip() or "SW9D1eZo"
         return {
             "User-Agent": DEFAULT_USER_AGENT,
-            "Origin": "https://www.diretta.it",
-            "Referer": "https://www.diretta.it/",
-            "x-fsign": self._settings.FLASHSCORE_FSIGN,
+            "Origin": base_url,
+            "Referer": f"{base_url}/",
+            "x-fsign": fsign,
         }
 
     @staticmethod
@@ -471,7 +490,7 @@ class DirettaService:
     ) -> list[dict[str, Any]]:
         url = self.build_feed_url(sport_id, day, lang=lang)
         try:
-            resp = await client.get(url, headers=self.build_headers())
+            resp = await client.get(url, headers=self.build_headers(lang=lang))
             resp.raise_for_status()
             return parse_flashscore_feed(resp.text)
         except Exception as exc:
@@ -500,6 +519,9 @@ class DirettaService:
         alt_home: str,
         alt_away: str,
         alt_league: str,
+        alt_title: str = "",
+        alt_competition: str = "",
+        alt_country: str = "",
         broadcasters: list[str],
         now_ms: int,
     ) -> Optional[Match]:
@@ -570,6 +592,9 @@ class DirettaService:
             alt_home=alt_home,
             alt_away=alt_away,
             alt_league=alt_league,
+            alt_title=alt_title,
+            alt_competition=alt_competition,
+            alt_country=alt_country,
             is_women=is_women,
             is_youth=is_youth,
             broadcasters=broadcasters,
@@ -602,8 +627,10 @@ class DirettaService:
                 comp, country = _split_competition_and_country(
                     ev["za"], ev["country"], base_silo
                 )
-                stage = ev["zae"]
-                key = f"{comp}|{stage}|{ev['start_ms']}"
+                raw_za = ev["za"]
+                sess_name = ev["zae"]
+                time_epoch = ev["start_ms"] // 1000
+                key = f"{raw_za}_{sess_name}_{time_epoch}"
                 grouped.setdefault(key, []).append({**ev, "_comp": comp, "_country": country})
 
             for group in grouped.values():
@@ -628,12 +655,16 @@ class DirettaService:
 
                 alt_league = ""
                 alt_title = ""
+                alt_competition = ""
+                alt_country = ""
                 if en_match is not None:
-                    en_comp, _ = _split_competition_and_country(
+                    en_comp, en_country = _split_competition_and_country(
                         en_match["za"], en_match["country"], base_silo
                     )
                     en_clean_comp, en_title = _clean_motorsports_title(en_comp, en_match["zae"])
                     alt_league = en_clean_comp
+                    alt_competition = en_clean_comp
+                    alt_country = en_country
                     alt_title = en_title
                     if not merged_broadcasters and en_match["broadcasters"]:
                         merged_broadcasters = list(en_match["broadcasters"])
@@ -652,6 +683,9 @@ class DirettaService:
                     alt_home=alt_title,
                     alt_away="",
                     alt_league=alt_league,
+                    alt_title=alt_title,
+                    alt_competition=alt_competition,
+                    alt_country=alt_country,
                     broadcasters=merged_broadcasters,
                     now_ms=now_ms,
                 )
@@ -694,23 +728,29 @@ class DirettaService:
             alt_league = ""
             alt_home = ""
             alt_away = ""
+            alt_title = ""
+            alt_competition = ""
+            alt_country = ""
             if en_ev is not None:
-                en_comp, _ = _split_competition_and_country(
+                en_comp, en_country = _split_competition_and_country(
                     en_ev["za"], en_ev["country"], base_silo
                 )
                 alt_league = en_comp
+                alt_competition = en_comp
+                alt_country = en_country
                 if base_silo == SportSilo.TENNIS:
                     alt_home = deabbreviate_tennis_name(en_ev["home"], en_ev["wu"])
                     alt_away = deabbreviate_tennis_name(en_ev["away"], en_ev["wv"])
                 else:
                     alt_home = en_ev["home"]
                     alt_away = en_ev["away"]
+                alt_title = f"{alt_home} vs {alt_away}" if alt_away else alt_home
 
             broadcasters = list(primary_ev["broadcasters"])
             if not broadcasters and en_ev is not None:
                 broadcasters = list(en_ev["broadcasters"])
 
-            title = f"{home_name} - {away_name}" if away_name else home_name
+            title = f"{home_name} vs {away_name}" if away_name else home_name
             home_team = (
                 TeamInfo(name=home_name, alt_name=alt_home, slug=primary_ev["wu"])
                 if home_name
@@ -736,6 +776,9 @@ class DirettaService:
                 alt_home=alt_home,
                 alt_away=alt_away,
                 alt_league=alt_league,
+                alt_title=alt_title,
+                alt_competition=alt_competition,
+                alt_country=alt_country,
                 broadcasters=broadcasters,
                 now_ms=now_ms,
             )

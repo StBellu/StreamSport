@@ -28,10 +28,18 @@ PING_URLS: tuple[str, ...] = (
     "https://www.vavoo.tv/api/app/ping",
 )
 
+GEIL_MIRROR_BASES: tuple[str, ...] = (
+    "https://geil.app",
+    "https://geil.win",
+    "https://geil.to",
+)
+
 # vavoo.to rejects direct connections; use active MediaHubMX mirror bases.
 VAVOO_MIRROR_BASES: tuple[str, ...] = (
     "https://voltop.net",
     "https://vavoo.net",
+    "https://huhu.to",
+    "https://oha.to",
     "https://kool.to",
     "https://kool.ws",
 )
@@ -75,7 +83,7 @@ _GROUP_LANGUAGE_MAP: dict[str, str] = {
     "Turkey": "TUR",
 }
 
-VAVOO_PING_UA = "electron-fetch/1.0 electron (+https://github.com/arantes555/electron-fetch)"
+VAVOO_PING_UA = "okhttp/4.11.0"
 VAVOO_RESOLVE_UA = "MediaHubMX/2"
 VAVOO_API_UA = "okhttp/4.11.0"
 VAVOO_PLAYLIST_UA = "VAVOO/2.6"
@@ -278,6 +286,7 @@ class LiveManifestManager:
         *,
         client: Optional[httpx.AsyncClient] = None,
         ping_urls: tuple[str, ...] = PING_URLS,
+        geil_bases: tuple[str, ...] = GEIL_MIRROR_BASES,
         mirror_bases: tuple[str, ...] = VAVOO_MIRROR_BASES,
         v2_bases: tuple[str, ...] = VAVOO_V2_BASES,
         playlist_timeout: float = 4.0,
@@ -289,6 +298,7 @@ class LiveManifestManager:
         self._external_client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
         self._ping_urls = ping_urls
+        self._geil_bases = geil_bases
         self._mirror_bases = mirror_bases
         self._v2_bases = v2_bases
         self._playlist_timeout = playlist_timeout
@@ -382,7 +392,7 @@ class LiveManifestManager:
             "process": "app",
             "firstAppStart": now_ms - 86_400_000,
             "lastAppStart": now_ms,
-            "ipLocation": client_ip or None,
+            "ipLocation": client_ip or "",
             "adblockEnabled": True,
             "migrationApplied": False,
             "migrationTargetInstalled": False,
@@ -412,7 +422,7 @@ class LiveManifestManager:
                     "X-Real-IP": client_ip,
                 }
                 attempts.append((base_payload, fwd_headers))
-                attempts.append(({**base_payload, "ipLocation": None}, base_headers))
+                attempts.append(({**base_payload, "ipLocation": ""}, base_headers))
             else:
                 attempts.append((base_payload, base_headers))
 
@@ -433,6 +443,29 @@ class LiveManifestManager:
                         return rewrite_addon_sig_ip(str(raw_sig), client_ip)
                 except Exception as exc:
                     logger.warning("TvVoo ping %s failed: %s", ping_url, exc)
+        return None
+
+    async def _resolve_via_geil(self, play_url: str) -> Optional[str]:
+        """Try fast tokenless Geil Resolver (`GET {geil_base}/live/resolve?url=...`)."""
+        client = self._get_client()
+        for base in self._geil_bases:
+            try:
+                resp = await client.get(
+                    f"{base}/live/resolve",
+                    params={"url": play_url},
+                    headers={"User-Agent": VAVOO_RESOLVE_UA, "Accept": "application/json"},
+                    timeout=self._resolve_timeout,
+                )
+                if resp.status_code != 200:
+                    logger.debug("TvVoo Geil resolve %s returned HTTP %s", base, resp.status_code)
+                    continue
+                data = resp.json()
+                if isinstance(data, dict):
+                    resolved_url = str(data.get("url") or "").strip()
+                    if resolved_url.startswith(("http://", "https://")):
+                        return resolved_url
+            except Exception as exc:
+                logger.debug("TvVoo Geil resolve failed on %s: %s", base, exc)
         return None
 
     async def _resolve_via_v2(self, play_url: str) -> Optional[str]:
@@ -466,12 +499,15 @@ class LiveManifestManager:
         play_url: str,
         client_ip: Optional[str] = None,
     ) -> tuple[str, float]:
-        """Resolve a Vavoo play URL to a CDN stream URL and expiry timestamp (epoch sec)."""
+        """Resolve a Vavoo play URL via Geil first, then v2 / MediaHubMX fallback."""
+        resolved_geil = await self._resolve_via_geil(play_url)
+        if resolved_geil:
+            return resolved_geil, time.time() + _DEFAULT_VALID_SECONDS
+
         if _V2_LINK_RE.search(play_url):
             resolved_v2 = await self._resolve_via_v2(play_url)
             if resolved_v2:
                 return resolved_v2, time.time() + _DEFAULT_VALID_SECONDS
-            raise RuntimeError(f"Failed to resolve Vavoo v2 URL: {play_url}")
 
         canonical_url = _normalize_mediahubmx_play_url(play_url)
         sig = await self.fetch_addon_sig(client_ip)

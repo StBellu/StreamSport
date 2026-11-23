@@ -208,7 +208,7 @@ def _handle_meta(
     return MetaResponse(meta=meta)
 
 
-def _handle_stream(
+async def _handle_stream(
     request: Request,
     response: Response,
     item_id: str,
@@ -227,7 +227,7 @@ def _handle_stream(
         return StreamResponse(streams=[])
 
     user_cfg = decode_config(config, settings)
-    streams = orchestrator.build_stremio_streams(
+    streams = await orchestrator.build_stremio_streams_async(
         match,
         user_cfg,
         base_url,
@@ -350,7 +350,7 @@ async def stremio_stream(
     media_type: str,
     item_id: str,
 ) -> StreamResponse:
-    return _handle_stream(request, response, item_id)
+    return await _handle_stream(request, response, item_id)
 
 
 @router.get(
@@ -364,7 +364,7 @@ async def nuvio_stream(
     media_type: str,
     item_id: str,
 ) -> StreamResponse:
-    return _handle_stream(request, response, item_id)
+    return await _handle_stream(request, response, item_id)
 
 
 # ------------------------------------------------------------------
@@ -490,7 +490,7 @@ async def configured_nuvio_stream(
     media_type: str,
     item_id: str,
 ) -> StreamResponse:
-    return _handle_stream(request, response, item_id, config=config)
+    return await _handle_stream(request, response, item_id, config=config)
 
 
 @router.get(
@@ -505,4 +505,4 @@ async def configured_stremio_stream(
     media_type: str,
     item_id: str,
 ) -> StreamResponse:
-    return _handle_stream(request, response, item_id, config=config)
+    return await _handle_stream(request, response, item_id, config=config)

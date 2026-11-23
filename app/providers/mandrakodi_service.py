@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import html
 import json
 import logging
 import re
@@ -12,6 +14,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import parse_qs, unquote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -26,6 +29,66 @@ from app.taxonomy.demographics import (
 )
 
 logger = logging.getLogger(__name__)
+
+MANDRAKODI_NUM_TESTS: tuple[str, ...] = (
+    "A1A165",
+    "A1A165A",
+    "A1A159",
+    "A1A103",
+    "A1A105",
+    "A1A156",
+    "A1A134C",
+    "A1A134F",
+    "A1A215",
+)
+
+_SKY_FREESHOT_MAP: dict[str, str] = {
+    "skysport24": "SkySport24IT",
+    "skysportuno": "SkySportUnoIT",
+    "skysportarena": "SkySportArenaIT",
+    "skysportmax": "SkySportMaxIT",
+    "skysporttennis": "SkySportTennisIT",
+    "skysportf1": "SkySportF1IT",
+    "skysportmotogp": "SkySportMotoGPIT",
+    "skysportcalcio": "SkySportCalcioIT",
+    "skysportgolf": "SkySportGolfIT",
+    "skysportnba": "SkySportNBAIT",
+}
+
+_SKY_CHANNEL_NAMES: dict[str, str] = {
+    "skysport24": "sky sport 24",
+    "skysportuno": "sky sport uno",
+    "skysportarena": "sky sport arena",
+    "skysportmax": "sky sport max",
+    "skysporttennis": "sky sport tennis",
+    "skysportf1": "sky sport f1",
+    "skysportmotogp": "sky sport motogp",
+    "skysportcalcio": "sky sport calcio",
+    "skysportgolf": "sky sport golf",
+    "skysportnba": "sky sport nba",
+}
+
+_KODI_TAG_RE = re.compile(r"\[/?(?:COLOR|B|I|UPPERCASE|LOWERCASE)[^\]]*\]", re.IGNORECASE)
+_KODI_CR_RE = re.compile(r"\[CR\]", re.IGNORECASE)
+_SECTION_BANNER_RE = re.compile(r"^=+\s*(.*?)\s*=+$")
+_DATE_PREFIX_RE = re.compile(
+    r"^\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}\s+\d{4}\s*",
+    re.IGNORECASE,
+)
+_TECH_SUFFIX_RE = re.compile(
+    r"\s*(?:\([^)]*(?:MPD|M3U8|ACE|WEB|HD|FHD|4K|1080P|720P|ITA|ENG|POL|FR|ES|DE|UK|MULTI)[^)]*\)|"
+    r"\[[^\]]*(?:MPD|M3U8|ACE|WEB|HD|FHD|4K|1080P|720P|FS|MH)[^\]]*\])\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_kodi_tags(raw: str) -> str:
+    """Strip Kodi BBCode markup (`[COLOR ...]`, `[CR]`, etc.) and unescape HTML."""
+    text = html.unescape(raw or "")
+    text = _KODI_CR_RE.sub(" ", text)
+    text = _KODI_TAG_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
+
 
 _STRICT_B64_RE = re.compile(rb"^[A-Za-z0-9+/=\s]+$")
 _ACESTREAM_RE = re.compile(r"acestream://([a-fA-F0-9]{40})", re.IGNORECASE)
@@ -184,9 +247,15 @@ def _parse_start_ms(raw_val: Any) -> int:
 
 
 def _parse_teams_from_title(title: str) -> tuple[str, str]:
-    clean = _TIME_PREFIX_RE.sub("", title).strip()
-    # Strip trailing channel/language tags in brackets if present
-    clean = re.sub(r"\s*\[[^\]]+\]\s*$", "", clean).strip()
+    clean = _strip_kodi_tags(title)
+    clean = _DATE_PREFIX_RE.sub("", clean).strip()
+    clean = _TIME_PREFIX_RE.sub("", clean).strip()
+    # Strip trailing channel/format tags like `(MPD)`, `(ITA - M3U8)`, `[1080]`
+    for _ in range(3):
+        stripped = _TECH_SUFFIX_RE.sub("", clean).strip()
+        if stripped == clean:
+            break
+        clean = stripped
     if ":" in clean and not _TEAM_SPLIT_RE.search(clean.split(":", 1)[0]):
         clean = clean.split(":", 1)[1].strip()
     parts = _TEAM_SPLIT_RE.split(clean, maxsplit=1)
@@ -242,15 +311,12 @@ class MandraKodiService(BaseStreamProvider):
             self._owned_client = None
 
     def _build_request_headers(self) -> dict[str, str]:
-        headers: dict[str, str] = {"Accept": "application/json, text/xml, */*"}
-        if self.settings.MANDRAKODI_DEVICE_ID:
-            headers["X-Device-Id"] = self.settings.MANDRAKODI_DEVICE_ID
-        if self.settings.MANDRAKODI_PASSWORD:
-            headers["X-Auth-Token"] = xor_encrypt(
-                self.settings.MANDRAKODI_DEVICE_ID or "streamsport",
-                self.settings.MANDRAKODI_PASSWORD,
-            )
-        return headers
+        password = self.settings.MANDRAKODI_PASSWORD or ""
+        device_id = self.settings.MANDRAKODI_DEVICE_ID or ""
+        return {
+            "User-Agent": f"MandraKodi2@@1.2.84@@{password}@@{device_id}",
+            "Accept": "application/json, text/plain, */*",
+        }
 
     def _decode_raw_payload(self, raw: str | bytes | dict[str, Any] | list[Any]) -> Any:
         if isinstance(raw, (dict, list)):
@@ -263,12 +329,14 @@ class MandraKodiService(BaseStreamProvider):
 
         if stripped.startswith(("{", "[")):
             try:
-                parsed = json.loads(stripped)
+                parsed = json.loads(stripped, strict=False)
                 if isinstance(parsed, dict) and isinstance(parsed.get("payload"), str):
-                    key = self.settings.MANDRAKODI_PASSWORD
-                    if key:
-                        decrypted = xor_decrypt(parsed["payload"], key)
-                        return self._decode_raw_payload(decrypted)
+                    for key in (self.settings.MANDRAKODI_XOR_KEY, self.settings.MANDRAKODI_PASSWORD):
+                        if key:
+                            decrypted = xor_decrypt(parsed["payload"], key)
+                            dec_s = decrypted.strip()
+                            if dec_s.startswith(("{", "[", "<")):
+                                return self._decode_raw_payload(decrypted)
                 return parsed
             except json.JSONDecodeError:
                 pass
@@ -276,13 +344,16 @@ class MandraKodiService(BaseStreamProvider):
         if stripped.startswith("<"):
             return stripped
 
-        key = self.settings.MANDRAKODI_PASSWORD
-        if key:
+        tried: set[str] = set()
+        for key in (self.settings.MANDRAKODI_XOR_KEY, self.settings.MANDRAKODI_PASSWORD):
+            if not key or key in tried:
+                continue
+            tried.add(key)
             decrypted = xor_decrypt(raw, key)
             dec_stripped = decrypted.strip()
             if dec_stripped.startswith(("{", "[")):
                 try:
-                    return json.loads(dec_stripped)
+                    return json.loads(dec_stripped, strict=False)
                 except json.JSONDecodeError:
                     pass
             if dec_stripped.startswith("<"):
@@ -328,34 +399,273 @@ class MandraKodiService(BaseStreamProvider):
                 items.append(item)
         return items
 
-    def _flatten_json_items(self, data: Any, inherited_category: str = "") -> list[dict[str, Any]]:
+    def _flatten_json_items(
+        self,
+        data: Any,
+        inherited_category: str = "",
+        inherited_competition: str = "",
+    ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         if isinstance(data, list):
+            current_comp = inherited_competition
             for entry in data:
-                items.extend(self._flatten_json_items(entry, inherited_category))
+                if isinstance(entry, dict):
+                    raw_t = _strip_kodi_tags(str(entry.get("title") or entry.get("name") or ""))
+                    sec_m = _SECTION_BANNER_RE.match(raw_t)
+                    if sec_m and (
+                        str(entry.get("link") or "").strip().lower() == "ignore"
+                        or str(entry.get("myresolve") or "").strip().lower() == "ignore"
+                        or not any(k in entry for k in ("url", "myresolve", "mpd_url", "hls"))
+                    ):
+                        sec_name = sec_m.group(1).strip()
+                        if sec_name and sec_name.upper() not in ("LAST MINUTE", "LIVE TV"):
+                            current_comp = sec_name
+                        continue
+                items.extend(self._flatten_json_items(entry, inherited_category, current_comp))
             return items
 
         if not isinstance(data, dict):
             return items
 
         cat = str(data.get("category") or data.get("group") or data.get("type") or inherited_category)
+        comp = str(data.get("competition") or data.get("league") or inherited_competition)
         has_nested = False
         for key in ("items", "channels", "events", "streams", "categories", "list"):
             nested = data.get(key)
             if isinstance(nested, list):
                 has_nested = True
-                items.extend(self._flatten_json_items(nested, cat))
+                items.extend(self._flatten_json_items(nested, cat, comp))
 
         if not has_nested or any(
-            k in data for k in ("url", "link", "stream_url", "mpd", "mpd_url", "hls", "acestream")
+            k in data for k in ("url", "link", "stream_url", "mpd", "mpd_url", "hls", "acestream", "myresolve")
         ):
             merged = dict(data)
             if cat and not merged.get("category"):
                 merged["category"] = cat
+            if comp and not merged.get("competition"):
+                merged["competition"] = comp
             items.append(merged)
         return items
 
+    @staticmethod
+    def _is_skipped_item(item: dict[str, Any], title: str) -> bool:
+        if item.get("enabled") in (0, "0", False):
+            return True
+        if str(item.get("link") or "").strip().lower() == "ignore":
+            return True
+        raw_mr = str(item.get("myresolve") or "").strip().lower()
+        if raw_mr == "ignore" or raw_mr in ("daddycode@@0", "daddycode@@00"):
+            return True
+        upper_title = title.upper()
+        if (
+            "HAVE PROBLEM" in upper_title
+            or "CHANNEL NOT LISTED" in upper_title
+            or "=== " in title
+            or title.strip().startswith("===")
+        ):
+            return True
+        return False
+
+    def _build_myresolve_source(
+        self,
+        myresolve_val: str,
+        item: dict[str, Any],
+        title: str,
+        item_headers: dict[str, str],
+        lang: str,
+    ) -> Optional[StreamSource]:
+        prefix, _, payload_val = myresolve_val.partition("@@")
+        prefix_low = prefix.strip().lower()
+        val = payload_val.strip()
+        ch_key = normalize_channel_name(title)
+
+        if prefix_low == "mediahosting":
+            if not val.lower().startswith("http"):
+                return None
+            return StreamSource(
+                provider=self.name,
+                title=title,
+                url=val,
+                quality=str(item.get("quality") or "FHD"),
+                language=lang,
+                priority=2,
+                requires_proxy=True,
+                proxy_host="",
+                headers=item_headers,
+                channel_name=ch_key,
+                raw_url=val,
+            )
+
+        if prefix_low == "amstaff":
+            decoded_val = val
+            if not decoded_val.lower().startswith("http"):
+                try:
+                    padded = decoded_val + "=" * (-len(decoded_val) % 4)
+                    decoded_val = base64.b64decode(padded).decode("utf-8", errors="replace").strip()
+                except Exception:
+                    return None
+            parts = decoded_val.split("|")
+            target_url = parts[0].strip()
+            if not target_url:
+                return None
+            clearkey = ""
+            headers = dict(item_headers)
+            if len(parts) >= 2:
+                ck_part = parts[1].strip()
+                if ck_part and ck_part != "0000" and ":" in ck_part:
+                    clearkey = ck_part
+            if len(parts) >= 3 and parts[2].strip():
+                headers["User-Agent"] = parts[2].strip()
+
+            is_mpd = bool(clearkey or ".mpd" in target_url.lower())
+            return StreamSource(
+                provider=self.name,
+                title=f"[MPD] {title}" if is_mpd else title,
+                url=target_url,
+                quality=str(item.get("quality") or ("1080p50" if is_mpd else "FHD")),
+                language=lang,
+                priority=1 if (is_mpd or lang == "ITA") else 2,
+                requires_proxy=True if (is_mpd or headers) else False,
+                proxy_host="mpd" if is_mpd else ("hls" if headers else ""),
+                clearkey=clearkey,
+                headers=headers,
+                channel_name=ch_key,
+                raw_url=target_url,
+            )
+
+        if prefix_low == "freeshot":
+            if not val:
+                return None
+            return StreamSource(
+                provider=self.name,
+                title=title,
+                url=val,
+                quality=str(item.get("quality") or "FHD"),
+                language=lang,
+                priority=2,
+                requires_proxy=True,
+                proxy_host="freeshot",
+                headers=item_headers,
+                channel_name=ch_key,
+                raw_url=val,
+            )
+
+        if prefix_low == "sky":
+            if not val:
+                return None
+            mapped = _SKY_FREESHOT_MAP.get(val.lower(), val)
+            sky_ch = _SKY_CHANNEL_NAMES.get(val.lower(), ch_key)
+            return StreamSource(
+                provider=self.name,
+                title=title,
+                url=mapped,
+                quality=str(item.get("quality") or "FHD"),
+                language="ITA",
+                priority=1,
+                requires_proxy=True,
+                proxy_host="freeshot",
+                headers=item_headers,
+                channel_name=sky_ch,
+                raw_url=mapped,
+            )
+
+        if prefix_low in ("daddy", "daddycode"):
+            if not val or (prefix_low == "daddycode" and val in ("0", "00")):
+                return None
+            target_url = f"https://thedaddy.li/watch.php?id={val}" if prefix_low == "daddycode" else val
+            return StreamSource(
+                provider=self.name,
+                title=title,
+                url=target_url,
+                quality=str(item.get("quality") or "HD"),
+                language=lang,
+                priority=3,
+                requires_proxy=True,
+                proxy_host="dlstreams",
+                headers=item_headers,
+                channel_name=ch_key,
+                raw_url=target_url,
+            )
+
+        if prefix_low == "vavooplay":
+            if not val:
+                return None
+            return StreamSource(
+                provider=self.name,
+                title=title,
+                url=val,
+                quality=str(item.get("quality") or "FHD"),
+                language=lang,
+                priority=2,
+                requires_proxy=True,
+                proxy_host="vavoo",
+                headers=item_headers,
+                channel_name=ch_key,
+                raw_url=val,
+            )
+
+        if prefix_low == "spon":
+            if not val:
+                return None
+            return StreamSource(
+                provider=self.name,
+                title=title,
+                url=val,
+                quality=str(item.get("quality") or "HD"),
+                language=lang,
+                priority=3,
+                requires_proxy=True,
+                proxy_host="",
+                headers=item_headers,
+                channel_name=ch_key,
+                raw_url=val,
+            )
+
+        if prefix_low == "ffmpeg":
+            clean_url, parsed_headers, embedded_ck = _split_kodi_pipe_url(val)
+            if not clean_url:
+                return None
+            headers = dict(item_headers)
+            headers.update(parsed_headers)
+            is_mpd = bool(embedded_ck or ".mpd" in clean_url.lower())
+            needs_proxy = is_mpd or bool(headers) or bool(item.get("requires_proxy"))
+            return StreamSource(
+                provider=self.name,
+                title=f"[MPD] {title}" if is_mpd else title,
+                url=clean_url,
+                quality=str(item.get("quality") or "FHD"),
+                language=lang,
+                priority=1 if (is_mpd or lang == "ITA") else 2,
+                requires_proxy=needs_proxy,
+                proxy_host="mpd" if is_mpd else "",
+                clearkey=embedded_ck,
+                headers=headers,
+                channel_name=ch_key,
+                raw_url=clean_url,
+            )
+
+        return None
+
     def _build_stream_source(self, item: dict[str, Any], title: str) -> Optional[StreamSource]:
+        item_headers: dict[str, str] = {}
+        if isinstance(item.get("headers"), dict):
+            item_headers.update({str(k): str(v) for k, v in item["headers"].items()})
+        if item.get("user_agent"):
+            item_headers["User-Agent"] = str(item["user_agent"])
+        if item.get("referer"):
+            item_headers["Referer"] = str(item["referer"])
+        if item.get("origin"):
+            item_headers["Origin"] = str(item["origin"])
+
+        lang = _detect_language(item, title)
+        myresolve_raw = str(item.get("myresolve") or "").strip()
+        if myresolve_raw and "@@" in myresolve_raw:
+            resolved_src = self._build_myresolve_source(myresolve_raw, item, title, item_headers, lang)
+            if resolved_src is not None:
+                return resolved_src
+            if myresolve_raw.lower().startswith("mediahosting@@"):
+                return None
+
         raw_url = str(
             item.get("mpd_url")
             or item.get("mpd")
@@ -374,15 +684,6 @@ class MandraKodiService(BaseStreamProvider):
         if not embedded_ck and kodiprop_match:
             embedded_ck = kodiprop_match.group(1).strip()
 
-        item_headers: dict[str, str] = {}
-        if isinstance(item.get("headers"), dict):
-            item_headers.update({str(k): str(v) for k, v in item["headers"].items()})
-        if item.get("user_agent"):
-            item_headers["User-Agent"] = str(item["user_agent"])
-        if item.get("referer"):
-            item_headers["Referer"] = str(item["referer"])
-        if item.get("origin"):
-            item_headers["Origin"] = str(item["origin"])
         item_headers.update(parsed_headers)
 
         clearkey = _normalize_clearkey(
@@ -446,7 +747,7 @@ class MandraKodiService(BaseStreamProvider):
             language=lang,
             priority=2,
             requires_proxy=needs_proxy,
-            proxy_host="hls" if needs_proxy else "",
+            proxy_host="",
             headers=item_headers,
             channel_name=normalize_channel_name(title),
             raw_url=clean_url,
@@ -473,25 +774,38 @@ class MandraKodiService(BaseStreamProvider):
         event_buckets: dict[tuple[str, int], ProviderEvent] = {}
 
         for item in raw_items:
-            title = str(item.get("title") or item.get("name") or item.get("channel") or "").strip()
-            if not title:
+            raw_title = str(item.get("title") or item.get("name") or item.get("channel") or "").strip()
+            title = _strip_kodi_tags(raw_title)
+            if not title or self._is_skipped_item(item, title):
                 continue
             source = self._build_stream_source(item, title)
             if source is None:
                 continue
 
             if self._is_event_item(item, title):
-                home = str(item.get("home") or "").strip()
-                away = str(item.get("away") or "").strip()
+                home = _strip_kodi_tags(str(item.get("home") or ""))
+                away = _strip_kodi_tags(str(item.get("away") or ""))
                 if not (home and away):
                     parsed_home, parsed_away = _parse_teams_from_title(title)
                     home = home or parsed_home
                     away = away or parsed_away
 
-                competition = str(item.get("competition") or item.get("league") or "").strip()
+                competition = _strip_kodi_tags(str(item.get("competition") or item.get("league") or ""))
                 start_ms = _parse_start_ms(
                     item.get("start_ms") or item.get("start_time") or item.get("date") or item.get("time")
                 )
+                if start_ms == 0:
+                    tm_m = _TIME_PREFIX_RE.match(_DATE_PREFIX_RE.sub("", title).strip())
+                    if tm_m:
+                        try:
+                            tz_rome = ZoneInfo("Europe/Rome")
+                        except ZoneInfoNotFoundError:
+                            tz_rome = timezone.utc
+                        now_rome = datetime.now(tz_rome)
+                        hh, mm = int(tm_m.group(1)), int(tm_m.group(2))
+                        if 0 <= hh <= 23 and 0 <= mm <= 59:
+                            dt_ev = now_rome.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                            start_ms = int(dt_ev.astimezone(timezone.utc).timestamp() * 1000)
                 is_women_t, is_youth_t = detect_demographics_from_stream_title(title)
                 is_women_c, is_youth_c = detect_demographics(competition)
                 key = (title.lower(), start_ms)
@@ -513,17 +827,18 @@ class MandraKodiService(BaseStreamProvider):
                     )
                 event_buckets[key].streams.append(source)
             else:
-                ch_key = normalize_channel_name(str(item.get("channel") or title))
+                raw_ch = _strip_kodi_tags(str(item.get("channel") or ""))
+                ch_key = source.channel_name or normalize_channel_name(raw_ch or title)
                 if not ch_key:
                     continue
                 source.channel_name = ch_key
                 linear_channels.setdefault(ch_key, []).append(source)
 
         for sources in linear_channels.values():
-            sources.sort(key=lambda s: s.priority)
+            sources.sort(key=lambda s: (0 if s.language == "ITA" else 1, 0 if s.clearkey else 1, s.priority))
         events = list(event_buckets.values())
         for ev in events:
-            ev.streams.sort(key=lambda s: s.priority)
+            ev.streams.sort(key=lambda s: (0 if s.language == "ITA" else 1, 0 if s.clearkey else 1, s.priority))
 
         return ProviderHarvestResult(
             provider=self.name,
@@ -532,8 +847,18 @@ class MandraKodiService(BaseStreamProvider):
             raw_count=len(raw_items),
         )
 
+    async def _fetch_num_test(self, client: httpx.AsyncClient, api_url: str, num_test: str) -> ProviderHarvestResult:
+        resp = await client.get(
+            api_url,
+            params={"numTest": num_test},
+            headers=self._build_request_headers(),
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        return self.parse_payload(resp.content)
+
     async def harvest(self) -> ProviderHarvestResult:
-        """Fetch and parse MandraKodi streams, skipping gracefully when `MANDRAKODI_API_URL` is unset."""
+        """Fetch and parse MandraKodi streams across all numTest packs."""
         api_url = (self.settings.MANDRAKODI_API_URL or "").strip()
         if not api_url:
             logger.warning(
@@ -542,6 +867,67 @@ class MandraKodiService(BaseStreamProvider):
             return ProviderHarvestResult(provider=self.name)
 
         client = self._get_client()
-        resp = await client.get(api_url, headers=self._build_request_headers(), timeout=15.0)
-        resp.raise_for_status()
-        return self.parse_payload(resp.content)
+        results = await asyncio.gather(
+            *(self._fetch_num_test(client, api_url, nt) for nt in MANDRAKODI_NUM_TESTS),
+            return_exceptions=True,
+        )
+
+        merged_linear: dict[str, list[StreamSource]] = {}
+        seen_linear: set[tuple[str, str, str]] = set()
+        merged_events: dict[tuple[str, int], ProviderEvent] = {}
+        seen_ev_streams: dict[tuple[str, int], set[tuple[str, str]]] = {}
+        total_raw = 0
+        errors: list[str] = []
+
+        for nt, res in zip(MANDRAKODI_NUM_TESTS, results):
+            if isinstance(res, Exception):
+                logger.warning("MandraKodiService numTest=%s failed: %s", nt, res)
+                errors.append(f"{nt}: {res}")
+                continue
+            total_raw += res.raw_count
+
+            for ch_key, sources in res.linear_channels.items():
+                bucket = merged_linear.setdefault(ch_key, [])
+                for src in sources:
+                    dedup = (ch_key, src.url, src.clearkey)
+                    if dedup not in seen_linear:
+                        seen_linear.add(dedup)
+                        bucket.append(src)
+
+            for ev in res.events:
+                ev_key = (ev.title.lower(), ev.start_ms)
+                if ev_key not in merged_events:
+                    merged_events[ev_key] = ProviderEvent(
+                        provider=ev.provider,
+                        title=ev.title,
+                        home=ev.home,
+                        away=ev.away,
+                        competition=ev.competition,
+                        sport_hint=ev.sport_hint,
+                        start_ms=ev.start_ms,
+                        is_women=ev.is_women,
+                        is_youth=ev.is_youth,
+                        streams=[],
+                    )
+                    seen_ev_streams[ev_key] = set()
+                for src in ev.streams:
+                    s_dedup = (src.url, src.clearkey)
+                    if s_dedup not in seen_ev_streams[ev_key]:
+                        seen_ev_streams[ev_key].add(s_dedup)
+                        merged_events[ev_key].streams.append(src)
+
+        if not merged_linear and not merged_events and len(errors) == len(MANDRAKODI_NUM_TESTS):
+            return ProviderHarvestResult(provider=self.name, error="; ".join(errors[:3]))
+
+        for sources in merged_linear.values():
+            sources.sort(key=lambda s: (0 if s.language == "ITA" else 1, 0 if s.clearkey else 1, s.priority))
+        events_list = list(merged_events.values())
+        for ev in events_list:
+            ev.streams.sort(key=lambda s: (0 if s.language == "ITA" else 1, 0 if s.clearkey else 1, s.priority))
+
+        return ProviderHarvestResult(
+            provider=self.name,
+            events=events_list,
+            linear_channels=merged_linear,
+            raw_count=total_raw,
+        )

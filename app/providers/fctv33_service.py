@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any, Optional, Sequence
 
 import httpx
@@ -22,9 +23,22 @@ DOMAINS_CONFIG_URL = (
     "https://raw.githubusercontent.com/realbestia1/domains/refs/heads/main/domains.json"
 )
 DEFAULT_DATA_API_BASE = "https://apis-data10.tcpwe138stya.ru"
-DEFAULT_PLAYER_REFERER = "https://nadia01eo.tn76degree12ec3out.cfd/"
-DEFAULT_STREAM_DIGIT = "seth"
+DEFAULT_PLAYER_REFERER = "https://www.fctv33hd.host/"
+DEFAULT_PLAYER_ORIGIN = "https://www.fctv33hd.host"
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+SFVER_CACHE_TTL_SECONDS = 600.0
+LIVE_WINDOW_MS = 90 * 60 * 1000
+DEFAULT_STREAM_DIGIT = "foth"
 DEFAULT_SITE_TYPE = 2001
+
+_SFVER_HEX_RE = re.compile(rb"[0-9a-f]{32}")
+_IT_BROADCASTER_RE = re.compile(
+    r"\b(?:it|ita|italia|italian|sky\s*sport|dazn|rai|mediaset|eurosport\s*it|supertennis)\b",
+    re.IGNORECASE,
+)
 
 SPORT_TYPE_TO_HINT: dict[int, str] = {
     1: "football",
@@ -466,6 +480,190 @@ def parse_common_params(rot47_text: str) -> dict[str, str]:
     return out
 
 
+def extract_sfver_from_bs(buffer: bytes) -> str:
+    """Extract 32-char hex `sfver` signature from `/api/common/bs` Protobuf response."""
+    if not buffer:
+        return ""
+    top = read_fields(buffer)
+    for chunk in top.get(10, []):
+        if isinstance(chunk, bytes):
+            sub = read_fields(chunk)
+            for cand in sub.get(2, []):
+                if isinstance(cand, bytes):
+                    txt = _decode_text(cand)
+                    if re.fullmatch(r"[0-9a-f]{32}", txt):
+                        return txt
+                    m = _SFVER_HEX_RE.search(cand)
+                    if m:
+                        return m.group(0).decode("ascii")
+    m = _SFVER_HEX_RE.search(buffer)
+    return m.group(0).decode("ascii") if m else ""
+
+
+def _read_nested_sub2(raw: Any) -> str:
+    if not isinstance(raw, bytes) or not raw:
+        return ""
+    sub = read_fields(raw)
+    for cand in sub.get(2, []):
+        txt = _decode_text(cand)
+        if txt:
+            return txt
+    return _decode_text(raw)
+
+
+def parse_fctv33_live_catalog(
+    buffer: bytes,
+    *,
+    sport_type: int = 1,
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """Parse real live `/sfver{sig}/api/match/live` Protobuf catalog.
+
+    Returns `(matches, active_match_ids)` where `matches` is a list of metadata dicts
+    and `active_match_ids` comes from `wrapper[2]` (`field 50`).
+    """
+    if not buffer:
+        return [], set()
+    top = read_fields(buffer)
+    payload_chunks = [c for c in top.get(10, []) if isinstance(c, bytes)]
+    if not payload_chunks:
+        return [], set()
+
+    wrapper = read_fields(payload_chunks[0])
+    active_ids: set[int] = set()
+    for active_chunk in wrapper.get(2, []):
+        if not isinstance(active_chunk, bytes):
+            continue
+        af = read_fields(active_chunk)
+        mid = _decode_int_or_varint_bytes(af.get(50, [None])[0])
+        if mid and mid > 0:
+            active_ids.add(mid)
+
+    matches: list[dict[str, Any]] = []
+    for match_chunk in wrapper.get(1, []):
+        if not isinstance(match_chunk, bytes):
+            continue
+        mf = read_fields(match_chunk)
+        match_id = _decode_int_or_varint_bytes(mf.get(1, [None])[0])
+        if not match_id or match_id <= 0:
+            continue
+
+        start_ms = _normalize_timestamp_ms(
+            _decode_int_or_varint_bytes(mf.get(3, [None])[0])
+        )
+
+        league_name = ""
+        country_name = ""
+        comp_chunk = mf.get(10, [None])[0]
+        if isinstance(comp_chunk, bytes):
+            comp_f = read_fields(comp_chunk)
+            if comp_f.get(3):
+                league_name = _read_nested_sub2(comp_f[3][0])
+            if comp_f.get(80) and isinstance(comp_f[80][0], bytes):
+                c80 = read_fields(comp_f[80][0])
+                if c80.get(3):
+                    country_name = _read_nested_sub2(c80[3][0])
+
+        competition = league_name
+        if country_name and league_name and country_name.lower() not in league_name.lower():
+            competition = f"{country_name} - {league_name}"
+
+        event_title = ""
+        teams: list[str] = []
+        for c30 in mf.get(30, []):
+            if not isinstance(c30, bytes):
+                continue
+            f30 = read_fields(c30)
+            if not event_title and f30.get(2):
+                event_title = _decode_text(f30[2][0])
+            for t_chunk in f30.get(10, []):
+                if not isinstance(t_chunk, bytes):
+                    continue
+                tf = read_fields(t_chunk)
+                if tf.get(3):
+                    t_name = _read_nested_sub2(tf[3][0])
+                    if t_name:
+                        teams.append(t_name)
+
+        home = teams[0] if len(teams) >= 1 else ""
+        away = teams[1] if len(teams) >= 2 else ""
+        if (not home or not away) and event_title:
+            parts = _EVENT_SPLIT_RE.split(event_title, maxsplit=1)
+            if len(parts) == 2:
+                home = home or parts[0].strip()
+                away = away or parts[1].strip()
+            elif not home:
+                home = event_title
+
+        if not home and not event_title:
+            continue
+
+        slug = _decode_text(mf.get(150, [None])[0])
+        matches.append(
+            {
+                "match_id": match_id,
+                "sport_type": sport_type,
+                "start_ms": start_ms,
+                "competition": competition,
+                "home": home,
+                "away": away,
+                "title": event_title or (f"{home} vs {away}" if away else home),
+                "slug": slug,
+            }
+        )
+    return matches, active_ids
+
+
+def parse_fctv33_match_detail(buffer: bytes, match_id: int) -> list[StreamSource]:
+    """Parse `/api/match/detail` Protobuf response (`top[10][0]` -> `f10[2]`) into `StreamSource`s."""
+    if not buffer:
+        return []
+    top = read_fields(buffer)
+    payload_chunks = [c for c in top.get(10, []) if isinstance(c, bytes)]
+    if not payload_chunks:
+        return []
+
+    f10 = read_fields(payload_chunks[0])
+    raw_streams: list[tuple[int, int, str, str]] = []
+    seen_sids: set[str] = set()
+
+    for idx, st_chunk in enumerate(f10.get(2, [])):
+        if not isinstance(st_chunk, bytes):
+            continue
+        sf = read_fields(st_chunk)
+        sid = _decode_id_str(sf.get(1, [None])[0])
+        if not sid or not sid.isdigit() or sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        channel_name = _decode_text(sf.get(3, [None])[0])
+        is_it = bool(channel_name and _IT_BROADCASTER_RE.search(channel_name))
+        raw_streams.append((0 if is_it else 1, idx, sid, channel_name))
+
+    raw_streams.sort(key=lambda item: (item[0], item[1]))
+    sources: list[StreamSource] = []
+    for lang_rank, _, sid, channel_name in raw_streams:
+        target = f"{match_id}:{sid}"
+        display_title = (
+            f"FCTV33 Live • {channel_name} • 1080p 50fps"
+            if channel_name
+            else "FCTV33 Live • 1080p 50fps"
+        )
+        sources.append(
+            StreamSource(
+                provider="fctv33",
+                title=display_title,
+                url=target,
+                quality="1080p",
+                language="it" if lang_rank == 0 else "en",
+                priority=6,
+                requires_proxy=True,
+                proxy_host="fctv33",
+                channel_name=channel_name,
+                raw_url=target,
+            )
+        )
+    return sources
+
+
 class Fctv33Service(BaseStreamProvider):
     """Async FCTV33 Protobuf catalog harvester with dynamic domain & sfver handshake."""
 
@@ -483,6 +681,7 @@ class Fctv33Service(BaseStreamProvider):
         self._external_client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
         self._sport_types: tuple[int, ...] = tuple(sport_types or DEFAULT_SPORT_TYPES)
+        self._sfver_cache: Optional[tuple[float, str]] = None
 
     @property
     def enabled(self) -> bool:
@@ -501,6 +700,45 @@ class Fctv33Service(BaseStreamProvider):
         if self._owned_client is not None and not self._owned_client.is_closed:
             await self._owned_client.aclose()
             self._owned_client = None
+
+    @staticmethod
+    def _live_headers() -> dict[str, str]:
+        return {
+            "User-Agent": CHROME_USER_AGENT,
+            "Referer": DEFAULT_PLAYER_REFERER,
+            "Origin": DEFAULT_PLAYER_ORIGIN,
+            "Accept": "*/*",
+        }
+
+    async def _fetch_sfver_bs(
+        self,
+        client: httpx.AsyncClient,
+        api_base: str,
+    ) -> str:
+        """Fetch 32-char `sfver` signature via `/api/common/bs` with 600s TTL cache."""
+        now = time.monotonic()
+        if self._sfver_cache and now - self._sfver_cache[0] < SFVER_CACHE_TTL_SECONDS:
+            return self._sfver_cache[1]
+
+        try:
+            resp = await client.get(
+                f"{api_base}/api/common/bs",
+                params=[
+                    ("code", "100"),
+                    ("code", "101"),
+                    ("sportType", "1"),
+                    ("stream", "true"),
+                ],
+                headers=self._live_headers(),
+            )
+            if resp.status_code == 200 and resp.content:
+                sig = extract_sfver_from_bs(resp.content)
+                if sig:
+                    self._sfver_cache = (now, sig)
+                    return sig
+        except Exception as exc:
+            logger.debug("FCTV33 /api/common/bs handshake failed: %s", exc)
+        return ""
 
     async def _fetch_domains_and_handshake(
         self,
@@ -589,22 +827,150 @@ class Fctv33Service(BaseStreamProvider):
                 )
         return []
 
+    async def _fetch_match_detail_streams(
+        self,
+        client: httpx.AsyncClient,
+        api_base: str,
+        match_id: int,
+        sport_type: int,
+        sem: asyncio.Semaphore,
+    ) -> list[StreamSource]:
+        async with sem:
+            try:
+                resp = await client.get(
+                    f"{api_base}/api/match/detail",
+                    params={
+                        "matchId": str(match_id),
+                        "sportType": str(sport_type),
+                        "digit": "foth",
+                        "country": "IT",
+                        "continent": "EU",
+                    },
+                    headers=self._live_headers(),
+                )
+                if resp.status_code == 200 and resp.content:
+                    return parse_fctv33_match_detail(resp.content, match_id)
+            except Exception as exc:
+                logger.debug(
+                    "FCTV33 match detail failed (matchId=%s sportType=%s): %s",
+                    match_id,
+                    sport_type,
+                    exc,
+                )
+        return []
+
+    async def _fetch_live_sport_events(
+        self,
+        client: httpx.AsyncClient,
+        api_base: str,
+        sfver: str,
+        sport_type: int,
+        sem: asyncio.Semaphore,
+    ) -> list[ProviderEvent]:
+        resp = await client.get(
+            f"{api_base}/sfver{sfver}/api/match/live",
+            params={"sportType": str(sport_type), "stream": "true"},
+            headers=self._live_headers(),
+        )
+        if resp.status_code != 200 or not resp.content:
+            return []
+
+        matches, active_ids = parse_fctv33_live_catalog(
+            resp.content, sport_type=sport_type
+        )
+        if not matches:
+            return []
+
+        now_ms = int(time.time() * 1000)
+        if active_ids:
+            target_matches = [m for m in matches if m["match_id"] in active_ids]
+        else:
+            target_matches = [
+                m
+                for m in matches
+                if m["start_ms"] > 0 and abs(m["start_ms"] - now_ms) <= LIVE_WINDOW_MS
+            ]
+
+        if not target_matches:
+            return []
+
+        detail_tasks = [
+            self._fetch_match_detail_streams(
+                client, api_base, m["match_id"], sport_type, sem
+            )
+            for m in target_matches
+        ]
+        detail_results = await asyncio.gather(*detail_tasks, return_exceptions=True)
+
+        events: list[ProviderEvent] = []
+        for meta, streams_res in zip(target_matches, detail_results):
+            if isinstance(streams_res, Exception) or not streams_res:
+                continue
+            title = meta["title"]
+            competition = meta["competition"]
+            is_women, is_youth = detect_demographics_from_stream_title(title)
+            if competition and (not is_women or not is_youth):
+                comp_w, comp_y = detect_demographics_from_stream_title(competition)
+                is_women = is_women or comp_w
+                is_youth = is_youth or comp_y
+
+            events.append(
+                ProviderEvent(
+                    provider="fctv33",
+                    title=title,
+                    home=meta["home"],
+                    away=meta["away"],
+                    competition=competition,
+                    sport_hint=SPORT_TYPE_TO_HINT.get(sport_type, "others"),
+                    start_ms=meta["start_ms"],
+                    is_women=is_women,
+                    is_youth=is_youth,
+                    streams=streams_res,
+                )
+            )
+        return events
+
     async def harvest(self) -> ProviderHarvestResult:
-        """Perform FCTV33 domain/params handshake and harvest Protobuf match catalog."""
+        """Perform FCTV33 sfver handshake and harvest Protobuf live match catalog."""
         if not self.enabled:
             return ProviderHarvestResult(provider=self.name)
 
         client = self._get_client()
-        data_api_base, _, handshake = await self._fetch_domains_and_handshake(client)
+        api_base = (self.settings.FCTV33_API_BASE or DEFAULT_DATA_API_BASE).rstrip("/")
 
+        events: list[ProviderEvent] = []
+        errors: list[str] = []
+
+        sfver = await self._fetch_sfver_bs(client, api_base)
+        if sfver:
+            sem = asyncio.Semaphore(8)
+            live_tasks = [
+                self._fetch_live_sport_events(client, api_base, sfver, st, sem)
+                for st in self._sport_types
+            ]
+            live_results = await asyncio.gather(*live_tasks, return_exceptions=True)
+            for res in live_results:
+                if isinstance(res, Exception):
+                    errors.append(str(res))
+                else:
+                    events.extend(res)
+
+            if events or not errors:
+                return ProviderHarvestResult(
+                    provider=self.name,
+                    events=events,
+                    raw_count=len(events),
+                    error="",
+                )
+
+        # Fallback to legacy domains.json + /api/common/params handshake
+        data_api_base, _, handshake = await self._fetch_domains_and_handshake(client)
         tasks = [
             self._fetch_sport_catalog(client, data_api_base, st, handshake)
             for st in self._sport_types
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        events: list[ProviderEvent] = []
-        errors: list[str] = []
         for res in results:
             if isinstance(res, Exception):
                 errors.append(str(res))

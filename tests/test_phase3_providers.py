@@ -137,7 +137,7 @@ def test_daddylive_html_parse_and_24_7_channels() -> None:
 
     ch_html = """
     <div class="grid">
-      <a href="/watch.php?id=870">Sky Sport Calcio IT</a>
+      <a href="/watch.php?id=870">Sky Sport Calcio ID: 870 IT</a>
       <a href="/stream/stream-871.php">DAZN 1 HD</a>
     </div>
     """
@@ -146,6 +146,63 @@ def test_daddylive_html_parse_and_24_7_channels() -> None:
     assert "dazn 1" in channels
     assert channels["sky sport calcio"][0].url == "https://dlhd.dad/watch.php?id=870"
     assert channels["dazn 1"][0].url == "https://dlhd.dad/watch.php?id=871"
+
+
+@pytest.mark.asyncio
+async def test_streamfree_on_demand_0x_async_stremio_formatting() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/sources/inter-vs-monza":
+            return httpx.Response(
+                200,
+                json={"sources": [{"quality": "FHD", "url": "https://cdn.sf.test/embed/soccer/inter-vs-monza1080p"}]},
+            )
+        if path == "/get-stream-key/inter-vs-monza":
+            return httpx.Response(200, json={"server_name": "cdn"})
+        if path == "/embed/soccer/inter-vs-monza1080p":
+            assert "inter-vs-monza" in request.headers.get("Referer", "")
+            return httpx.Response(
+                200,
+                text='<script>const _0x = {"inter-vs-monza1080p": {"_t": "tok1", "_ta": "ta1", "_e": 1795462117, "_s": "sig1", "_sa": "sa1"}};</script>',
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sf = StreamFreeService(Settings(ENABLE_STREAMFREE=True), client=client)
+        orch = StreamOrchestrator([sf])
+        kickoff = 1795450000000
+        match = Match(
+            id="diretta-sf1",
+            title="Inter vs Monza",
+            category="calcio_italiano",
+            silo=SportSilo.CALCIO_ITA,
+            date=kickoff,
+            end_date=kickoff + 135 * 60_000,
+            sources=[
+                StreamSource(
+                    provider="streamfree",
+                    title="Inter vs Monza",
+                    url="https://strmfree.pk/player/soccer/inter-vs-monza",
+                    raw_url="inter-vs-monza",
+                    channel_name="soccer",
+                    proxy_host="streamfree",
+                )
+            ],
+        )
+        items = await orch.build_stremio_streams_async(
+            match,
+            UserConfig(ep_url="https://ep.test", ep_pass="pw"),
+            "https://addon.test",
+            now_ms=kickoff,
+        )
+        assert len(items) == 1
+        stream_url = items[0].url or ""
+        assert stream_url.startswith("https://ep.test/proxy/manifest.m3u8?")
+        qs = parse_qs(urlsplit(stream_url).query)
+        assert "/live-cdn/inter-vs-monza1080p/index.m3u8" in qs["url"][0]
+        assert qs["h_referer"] == ["https://cdn.sf.test/embed/soccer/inter-vs-monza1080p"]
+        assert qs["h_origin"] == ["https://cdn.sf.test"]
+        assert qs["api_password"] == ["pw"]
 
 
 @pytest.mark.asyncio
@@ -666,7 +723,7 @@ def test_orchestrator_stremio_formatting_and_countdown() -> None:
                 provider="spon",
                 title="HD7 ITALIAN",
                 url="https://sportsonline.st/hd7.php",
-                proxy_host="sportsonline",
+                proxy_host="",
                 headers={"Referer": "https://sportsonline.st/"},
             ),
             StreamSource(
@@ -746,9 +803,10 @@ def test_orchestrator_stremio_formatting_and_countdown() -> None:
     assert mk_hls_qs["d"] == ["https://cdn.example/stream.m3u8"]
     assert mk_hls_qs["h_Referer"] == ["https://cdn.example/"]
 
-    # SPON + headers
+    # SPON -> /proxy/manifest.m3u8?url=...&api_password=...
+    assert (live_items[4].url or "").startswith("https://ep.example.org/proxy/manifest.m3u8?")
     spon_qs = parse_qs(urlsplit(live_items[4].url or "").query)
-    assert spon_qs["host"] == ["sportsonline"]
+    assert spon_qs["url"] == ["https://sportsonline.st/hd7.php"]
     assert spon_qs["h_Referer"] == ["https://sportsonline.st/"]
 
     # DaddyLive, StreamFree, FCTV33

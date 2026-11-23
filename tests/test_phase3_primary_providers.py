@@ -180,6 +180,8 @@ async def test_live_manifest_manager_v2_resolve_and_mirror_rotation() -> None:
         host = urlparse(url).netloc
         if "/live/resolve" in url:
             seen_hosts.append(host)
+            if host.startswith("geil."):
+                return httpx.Response(404)
             if host == "voltop.net":
                 return httpx.Response(503)
             return httpx.Response(200, json={"url": "https://edge.vavoo.test/v2/live/playlist.m3u8"})
@@ -191,6 +193,7 @@ async def test_live_manifest_manager_v2_resolve_and_mirror_rotation() -> None:
         mgr = LiveManifestManager(client=client)
         out = await mgr.get_live_manifest("https://vavoo.to/live2/play3/998877", None)
         assert "https://edge.vavoo.test/v2/live/seg0.ts" in out
+        assert "geil.app" in seen_hosts
         assert "voltop.net" in seen_hosts
         assert "vavoo.net" in seen_hosts
         await mgr.aclose()
@@ -334,22 +337,30 @@ async def test_mandrakodi_mpd_clearkey_dtt_socceron_and_acestream() -> None:
             },
         ]
     }
-    encrypted_body = xor_encrypt(json.dumps(payload), "test-mk-pass")
+    encrypted_body = xor_encrypt(json.dumps(payload), "my_secret_key")
+    seen_num_tests: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers.get("X-Device-Id") == "dev-123"
-        return httpx.Response(200, text=encrypted_body)
+        assert request.headers.get("User-Agent") == "MandraKodi2@@1.2.84@@test-mk-pass@@dev-123"
+        assert request.headers.get("Accept") == "application/json, text/plain, */*"
+        nt = request.url.params.get("numTest", "")
+        seen_num_tests.append(nt)
+        if nt == "A1A165":
+            return httpx.Response(200, text=encrypted_body)
+        return httpx.Response(200, json={"items": []})
 
     settings = Settings(
         ENABLE_MANDRAKODI=True,
         MANDRAKODI_API_URL="https://mk.test/api/feed",
         MANDRAKODI_PASSWORD="test-mk-pass",
         MANDRAKODI_DEVICE_ID="dev-123",
+        MANDRAKODI_XOR_KEY="my_secret_key",
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         svc = MandraKodiService(settings=settings, client=client)
         res = await svc.safe_harvest()
 
+    assert "A1A165" in seen_num_tests and "A1A103" in seen_num_tests
     assert res.error == ""
     assert "sky sport uno" in res.linear_channels
     mpd_src = res.linear_channels["sky sport uno"][0]
@@ -375,6 +386,49 @@ async def test_mandrakodi_mpd_clearkey_dtt_socceron_and_acestream() -> None:
     assert women_ev.streams[0].is_acestream is True
     assert women_ev.streams[0].priority == 7
     assert women_ev.streams[0].url == "acestream://1234567890abcdef1234567890abcdef12345678"
+
+
+def test_mandrakodi_bbcode_nested_channels_and_myresolve_handlers() -> None:
+    import base64
+
+    b64_mpd = base64.b64encode(b"https://cdn.dazn.test/stream.mpd|aa11:bb22|CustomUA").decode("ascii")
+    nested_payload = {
+        "SetViewMode": "500",
+        "channels": [
+            {
+                "name": "[COLOR yellow]Sport Italy[/COLOR]",
+                "items": [
+                    {
+                        "title": "[COLOR lime]===  LALIGA EA SPORTS ===[/COLOR]",
+                        "link": "ignore",
+                    },
+                    {
+                        "title": "[COLOR lime]14:00 Barcelona - Villarreal (MPD)[/COLOR]",
+                        "myresolve": f"amstaff@@{b64_mpd}",
+                    },
+                    {
+                        "title": "[COLOR lime]SPORT UNO[/COLOR]",
+                        "myresolve": "sky@@skysportuno",
+                    },
+                    {
+                        "title": "[COLOR red]Channel Not Listed[/COLOR]",
+                        "myresolve": "daddyCode@@00",
+                    },
+                ],
+            }
+        ],
+    }
+    svc = MandraKodiService(Settings(ENABLE_MANDRAKODI=True))
+    res = svc.parse_payload(nested_payload)
+    assert "sky sport uno" in res.linear_channels
+    assert res.linear_channels["sky sport uno"][0].proxy_host == "freeshot"
+    assert len(res.events) == 1
+    ev = res.events[0]
+    assert ev.competition == "LALIGA EA SPORTS"
+    assert ev.home == "Barcelona"
+    assert ev.away == "Villarreal"
+    assert ev.streams[0].clearkey == "aa11:bb22"
+    assert ev.streams[0].headers["User-Agent"] == "CustomUA"
 
 
 # ---------------------------------------------------------------------------
@@ -412,15 +466,17 @@ MONDAY
     assert len(inter_ev.streams) == 3
     first = inter_ev.streams[0]
     assert first.channel_name == "HD7"
-    assert first.language == "ITA"
+    assert first.language == "it"
+    assert "[720p]" in first.title
+    assert "🇮🇹" in first.title
     assert first.priority == 3
     assert first.requires_proxy is True
-    assert first.proxy_host == "sportsonline"
+    assert first.proxy_host == ""
     assert all(s.priority == 31 for s in inter_ev.streams[1:])
 
     nba_ev = events[1]
     assert nba_ev.streams[0].channel_name == "HD8"
-    assert nba_ev.streams[0].language == "ITA"
+    assert nba_ev.streams[0].language == "it"
     assert nba_ev.streams[0].priority == 3
 
     mon_ev = events[2]
@@ -454,10 +510,10 @@ async def test_spon_service_mirror_fallback_and_enable_toggle() -> None:
     assert res.error == ""
     assert len(seen_urls) == 2
     assert "sportsonline.st" in seen_urls[0]
-    assert "sportzonline.st" in seen_urls[1]
+    assert "sportsonline.cx" in seen_urls[1]
     assert len(res.events) == 1
-    assert res.events[0].streams[0].language == "ITA"
-    assert res.events[0].streams[0].proxy_host == "sportsonline"
+    assert res.events[0].streams[0].language == "it"
+    assert res.events[0].streams[0].proxy_host == ""
 
     disabled = SponService(settings=Settings(ENABLE_SPON=False))
     disabled_res = await disabled.safe_harvest()

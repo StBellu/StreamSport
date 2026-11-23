@@ -177,6 +177,19 @@ _NON_LIVE_TITLE_RE = re.compile(
     r"|\brewind\b"
     r"|\brivedi\b"
     r"|\bbest\s+of\b"
+    r"|\bfederico\s+buffa\b"
+    r"|\bicarus\b"
+    r"|\bbasket\s+room\b"
+    r"|\bsky\s+sport\s+tech\b"
+    r"|\bnessun\s+evento\b"
+    r"|^\s*ep\.?\s*\d+\b"
+    r"|\bdifferita\b"
+    r"|\barchivio\b"
+    r"|\bstory\b"
+    r"|\blegends\b"
+    r"|\bdoc\b"
+    r"|\bintervista\b"
+    r"|\bpodcast\b"
     r"|[\(\[]\s*r\s*[\)\]]"
     r")",
     re.IGNORECASE,
@@ -196,6 +209,14 @@ _NON_LIVE_DESC_RE = re.compile(
     r"|\bcalciomercato\b"
     r"|\bpre\s*-?\s*partita\b"
     r"|\bpost\s*-?\s*partita\b"
+    r"|\btrasmissione\s+dedicata\b"
+    r"|\bdifferita\b"
+    r"|\barchivio\b"
+    r"|\bdocumentario\b"
+    r"|\bintervista\b"
+    r"|\bpodcast\b"
+    r"|\bspeciale\b"
+    r"|\bbest\s+of\b"
     r")",
     re.IGNORECASE,
 )
@@ -237,7 +258,76 @@ _SIMULCAST_NOISE_RE = re.compile(
 )
 
 _YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+_CLUB_YEAR_PREFIX_RE = re.compile(
+    r"\b(?:fc|tsg|sv|tsv|vfb|vfl|sc|ac|as|us|ss|ssv|sg|fk|bk|if|nk|gnk|cd|ud|sd|cf|asd|usd|ssd|real|club)\s*$",
+    re.IGNORECASE,
+)
 _TEAM_SPLIT_RE = re.compile(r"\s+(?:vs\.?|v\.?|-|–|—)\s+", re.IGNORECASE)
+_ROUND_PHASE_SUFFIX_RE = re.compile(
+    r"(?:\s*[-–—,|]\s*|\s*[\(\[]\s*)"
+    r"(?:"
+    r"\d+[aª°\^]?\s*giornata"
+    r"|giornata\s*\d+"
+    r"|quarti\s+di\s+finale|quarto\s+di\s+finale"
+    r"|ottavi\s+di\s+finale|sedicesimi\s+di\s+finale"
+    r"|semifinal[ei]|final[ei]?"
+    r"|play\s*-?\s*(?:off|out|in)s?"
+    r"|gara\s*\d+|game\s*\d+|match\s*\d+"
+    r"|andata|ritorno"
+    r"|turno\s+preliminare|fase\s+a\s+gironi"
+    r"|round\s+of\s+\d+|quarter\s*-?\s*finals?|semi\s*-?\s*finals?"
+    r")"
+    r"(?:\s*[\)\]])?\s*$",
+    re.IGNORECASE,
+)
+_MOTORI_PREFIX_RE = re.compile(
+    r"^(formula\s*1|f1|motogp|moto\s*2|moto\s*3|wrc|wsbk|sbk|superbike|indycar|nascar)\b\s*[:\-–—]?\s*(.*)$",
+    re.IGNORECASE,
+)
+_COMPOUND_HYPHEN_PREFIXES: frozenset[str] = frozenset(
+    {
+        "saint",
+        "st",
+        "al",
+        "el",
+        "ben",
+        "abu",
+        "ibn",
+        "san",
+        "santa",
+        "sao",
+        "under",
+        "u",
+        "sub",
+        "play",
+        "all",
+        "pre",
+        "post",
+        "ex",
+        "de",
+        "del",
+        "la",
+        "le",
+        "mac",
+        "mc",
+    }
+)
+_KNOWN_COMPOUND_HYPHEN_WORDS: frozenset[str] = frozenset(
+    {
+        "auger-aliassime",
+        "bautista-agut",
+        "carreno-busta",
+        "davidovich-fokina",
+        "mpetshi-perricard",
+        "clermont-ferrand",
+        "emilia-romagna",
+        "friuli-venezia",
+        "trentino-alto",
+        "saint-etienne",
+        "saint-germain",
+        "west-ham",
+    }
+)
 
 
 def _strip_accents(text: str) -> str:
@@ -259,12 +349,31 @@ def clamp_sky_from(requested_from: datetime, now_utc: datetime) -> datetime:
     return req if req >= min_allowed else min_allowed
 
 
-def is_non_live_or_studio(title: str, description: str = "") -> bool:
+def _has_historical_year(text: str, ref_year: int) -> bool:
+    for match in _YEAR_RE.finditer(text):
+        year_val = int(match.group(1))
+        if 1960 <= year_val < ref_year:
+            prefix = text[: match.start()].rstrip()
+            if _CLUB_YEAR_PREFIX_RE.search(prefix):
+                continue
+            return True
+    return False
+
+
+def is_non_live_or_studio(
+    title: str,
+    description: str = "",
+    *,
+    current_year: Optional[int] = None,
+) -> bool:
     """Return True if the EPG entry is a studio show, news, magazine, highlights, or replay."""
     clean_title = _strip_accents((title or "").strip())
     if not clean_title:
         return True
     if _NON_LIVE_TITLE_RE.search(clean_title):
+        return True
+    ref_year = current_year if current_year is not None else datetime.now(timezone.utc).year
+    if _has_historical_year(clean_title, ref_year):
         return True
     clean_desc = _strip_accents((description or "").strip())
     if clean_desc and _NON_LIVE_DESC_RE.search(clean_desc):
@@ -448,10 +557,72 @@ def _infer_silo_from_epg(epg: EPGProgram) -> SportSilo:
     return SportSilo.ALTRI_SPORT
 
 
+def _split_unspaced_hyphen(text: str) -> Optional[tuple[str, str]]:
+    """Split `TeamA-TeamB` on an unspaced hyphen unless it belongs to a known compound name."""
+    for idx, ch in enumerate(text):
+        if ch != "-" or idx == 0 or idx == len(text) - 1:
+            continue
+        if text[idx - 1].isspace() or text[idx + 1].isspace():
+            continue
+        left = text[:idx].strip()
+        right = text[idx + 1 :].strip()
+        m_left = re.search(r"([A-Za-zÀ-ÖØ-öø-ÿ0-9]+)$", left)
+        m_right = re.match(r"^([A-Za-zÀ-ÖØ-öø-ÿ0-9]+)", right)
+        if not m_left or not m_right:
+            continue
+        lw = m_left.group(1)
+        rw = m_right.group(1)
+        if len(lw) < 2 or len(rw) < 2:
+            continue
+        lw_low = _strip_accents(lw).lower()
+        rw_low = _strip_accents(rw).lower()
+        if rw.isdigit() or rw_low in {"off", "offs", "in", "out", "star", "stars"}:
+            continue
+        if lw_low in _COMPOUND_HYPHEN_PREFIXES:
+            continue
+        if f"{lw_low}-{rw_low}" in _KNOWN_COMPOUND_HYPHEN_WORDS:
+            continue
+        return left, right
+    return None
+
+
+def _strip_round_phase_suffixes(text: str) -> str:
+    cleaned = text.strip()
+    while True:
+        updated = _ROUND_PHASE_SUFFIX_RE.sub("", cleaned).strip()
+        if updated == cleaned:
+            break
+        cleaned = updated
+    return cleaned
+
+
+def _normalize_motorsports_session(text: str) -> str:
+    """Map Italian/English motorsports session labels to their counterpart for matching."""
+    out = text
+    replacements = (
+        (r"\bprove\s+libere\s*([123])\b", r"FP\1"),
+        (r"\blibere\s*([123])\b", r"FP\1"),
+        (r"\bfree\s+practice\s*([123])\b", r"FP\1"),
+        (r"\bfp\s*([123])\b", r"Prove Libere \1"),
+        (r"\bprove\s+libere\b", "FP"),
+        (r"\bqualifiche\b", "Qualifying"),
+        (r"\bqualifying\b", "Qualifiche"),
+        (r"\bgara\b", "Race"),
+        (r"\brace\b", "Gara"),
+    )
+    for pattern, repl in replacements:
+        new_out = re.sub(pattern, repl, out, flags=re.IGNORECASE)
+        if new_out != out:
+            out = new_out
+            break
+    return out
+
+
 def _extract_epg_teams(title: str) -> tuple[str, str, str]:
     """Return `(league_hint, home, away)` parsed from an EPG program title."""
     cleaned = re.sub(r"\s*[\(\[]\s*(?:diretta|live)\s*[\)\]]\s*", " ", title or "", flags=re.IGNORECASE)
     cleaned = re.sub(r"^(?:diretta|live)\s*[:\-–]\s*", "", cleaned.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
     league_hint = ""
     if ":" in cleaned:
@@ -460,14 +631,65 @@ def _extract_epg_teams(title: str) -> tuple[str, str, str]:
             league_hint = prefix.strip()
             cleaned = rest.strip()
 
+    # Preserve motorsports prefix (F1, MotoGP, WRC, SBK, IndyCar) and treat as single-entity.
+    m_hint = _MOTORI_PREFIX_RE.match(league_hint) if league_hint else None
+    m_body = _MOTORI_PREFIX_RE.match(cleaned)
+    if m_hint or m_body:
+        if m_body:
+            sport_prefix = m_body.group(1).strip()
+            rest_body = m_body.group(2).strip()
+            if not league_hint or _strip_accents(league_hint).lower() in {"motori", "automobilismo", "motociclismo"}:
+                league_hint = sport_prefix
+            elif sport_prefix.lower() not in league_hint.lower():
+                league_hint = f"{league_hint} - {sport_prefix}"
+            cleaned = rest_body or cleaned
+        return league_hint, cleaned.strip(), ""
+
+    cleaned = _strip_round_phase_suffixes(cleaned)
+
+    # Handle multiple `-` with a competition prefix: e.g. "Serie A - Inter - Juventus"
+    dash_parts = [p.strip() for p in re.split(r"\s+[-–—]\s+", cleaned) if p.strip()]
+    if len(dash_parts) >= 3:
+        comp_part = " - ".join(dash_parts[:-2])
+        league_hint = f"{league_hint} - {comp_part}" if league_hint else comp_part
+        return league_hint, dash_parts[-2], dash_parts[-1]
+
     parts = _TEAM_SPLIT_RE.split(cleaned, maxsplit=1)
     if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-        return league_hint, parts[0].strip(), parts[1].strip()
+        return league_hint, _strip_round_phase_suffixes(parts[0]), _strip_round_phase_suffixes(parts[1])
+
+    unspaced = _split_unspaced_hyphen(cleaned)
+    if unspaced is not None:
+        return league_hint, _strip_round_phase_suffixes(unspaced[0]), _strip_round_phase_suffixes(unspaced[1])
+
     return league_hint, cleaned.strip(), ""
+
+
+_ALTRI_SPORT_EXPLICIT_RE = re.compile(
+    r"\b(?:golf|ciclismo|cycling|sci|biathlon|atletica|equtv|ippica|padel|snooker)\b",
+    re.IGNORECASE,
+)
+
+
+def is_epg_match_compatible(epg: EPGProgram, match: Match) -> bool:
+    """Enforce strict sport silo compatibility between an EPG program and a Match."""
+    epg_silo = _infer_silo_from_epg(epg)
+    football_family = {SportSilo.FOOTBALL, SportSilo.CALCIO_ITA}
+    if epg_silo in football_family:
+        return match.silo in football_family
+    if epg_silo == SportSilo.ALTRI_SPORT:
+        if match.silo == SportSilo.ALTRI_SPORT:
+            return True
+        combined = _strip_accents(f"{epg.sport_hint} {epg.category} {epg.channel_name} {epg.title}")
+        return not bool(_ALTRI_SPORT_EXPLICIT_RE.search(combined))
+    return epg_silo == match.silo
 
 
 def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
     """Return match confidence score > 0 if `epg` represents `match`, else 0.0."""
+    if not is_epg_match_compatible(epg, match):
+        return 0.0
+
     # Time guard: check kickoff proximity (60m) or active broadcast overlap.
     start_diff = abs(match.date - epg.start_ms)
     overlaps = epg.start_ms <= match.date <= epg.end_ms
@@ -498,12 +720,18 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
     # Single-entity events (e.g. F1 / MotoGP / Boxing cards)
     if match.away_team is None and match.home_team is not None:
         epg_single = epg.title if not epg_away else f"{epg_home} {epg_away}"
+        alt_epg = (
+            _normalize_motorsports_session(epg_single)
+            if match.silo == SportSilo.MOTORI
+            else ""
+        )
         res = DEFAULT_TEAM_MATCHER.match_score(
             match.home_team.name,
             "",
             epg_single,
             "",
             alt_home_1=match.alt_home or match.competition,
+            alt_home_2=alt_epg if alt_epg != epg_single else "",
             date_1_ms=match.date,
             date_2_ms=epg.start_ms if start_diff <= _RECONCILE_WINDOW_MS else 0,
             is_women_1=match.is_women,
@@ -937,7 +1165,7 @@ class ItalianEPGService:
             combined = [*sky_items, *tivusat_items]
             filtered: list[EPGProgram] = []
             for prog in combined:
-                if is_non_live_or_studio(prog.title, prog.description):
+                if is_non_live_or_studio(prog.title, prog.description, current_year=ref_now.year):
                     continue
                 if is_out_of_calendar_tennis(
                     prog.title,

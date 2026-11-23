@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -22,7 +24,13 @@ logger = logging.getLogger(__name__)
 
 DOMAINS_API_URL = "https://strmfree.link/api/domains"
 FALLBACK_MIRROR = "https://streamfree.top"
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+RESOLVE_CACHE_TTL_SECONDS = 300.0
 _MATCH_ENDPOINTS: tuple[str, ...] = (
+    "/streams",
     "/api/v1/matches",
     "/api/matches",
     "/api/v1/events",
@@ -32,6 +40,7 @@ _MATCH_ENDPOINTS: tuple[str, ...] = (
 _PLAYER_PATH_RE = re.compile(r"/player/([^/]+)/([^/?#]+)", re.IGNORECASE)
 _EVENT_SPLIT_RE = re.compile(r"\s+(?:vs\.?|v\.?|@|–|—|-)\s+", re.IGNORECASE)
 _QUALITY_RE = re.compile(r"\b(4k|2160p|1080p|fhd|720p|hd|540p|sd)\b", re.IGNORECASE)
+_OX_RE = re.compile(r"const\s+_0x\s*=\s*(\{.*?\})\s*;", re.DOTALL)
 
 
 def _normalize_mirror_url(candidate: str) -> str:
@@ -91,7 +100,16 @@ def _parse_start_ms(item: dict[str, Any]) -> int:
                 return num if num > 10_000_000_000 else num * 1000
             except (ValueError, TypeError):
                 pass
-    for key in ("timestamp", "start_timestamp", "unix", "date", "start_time", "startTime", "kickoff"):
+    for key in (
+        "match_timestamp",
+        "timestamp",
+        "start_timestamp",
+        "unix",
+        "date",
+        "start_time",
+        "startTime",
+        "kickoff",
+    ):
         val = item.get(key)
         if val is None or not str(val).strip():
             continue
@@ -139,6 +157,18 @@ def _extract_quality(text: str) -> str:
     return m.group(1).upper() if m else ""
 
 
+def _extract_team_field(item: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        val = item.get(key)
+        if isinstance(val, dict):
+            name = str(val.get("name") or val.get("title") or "").strip()
+            if name:
+                return name
+        elif isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
 def _parse_json_matches(data: Any, mirror: str) -> list[ProviderEvent]:
     items: list[tuple[str, dict[str, Any]]] = []
 
@@ -147,21 +177,34 @@ def _parse_json_matches(data: Any, mirror: str) -> list[ProviderEvent]:
             if isinstance(entry, dict):
                 items.append(("", entry))
     elif isinstance(data, dict):
-        unwrapped = None
-        for key in ("matches", "events", "data", "results"):
-            if isinstance(data.get(key), list):
-                unwrapped = data[key]
-                break
-        if unwrapped is not None:
-            for entry in unwrapped:
-                if isinstance(entry, dict):
-                    items.append(("", entry))
-        else:
-            for cat_key, val in data.items():
+        # Live `/streams` payload: {"streams": {"soccer": [...], "basketball": [...], ...}}
+        streams_block = data.get("streams")
+        if isinstance(streams_block, dict):
+            for cat_key, val in streams_block.items():
                 if isinstance(val, list):
                     for entry in val:
                         if isinstance(entry, dict):
                             items.append((str(cat_key), entry))
+        elif isinstance(streams_block, list):
+            for entry in streams_block:
+                if isinstance(entry, dict):
+                    items.append(("", entry))
+        else:
+            unwrapped = None
+            for key in ("matches", "events", "data", "results"):
+                if isinstance(data.get(key), list):
+                    unwrapped = data[key]
+                    break
+            if unwrapped is not None:
+                for entry in unwrapped:
+                    if isinstance(entry, dict):
+                        items.append(("", entry))
+            else:
+                for cat_key, val in data.items():
+                    if isinstance(val, list):
+                        for entry in val:
+                            if isinstance(entry, dict):
+                                items.append((str(cat_key), entry))
 
     events: list[ProviderEvent] = []
     for default_cat, item in items:
@@ -173,8 +216,8 @@ def _parse_json_matches(data: Any, mirror: str) -> list[ProviderEvent]:
             or default_cat
             or "sports"
         ).strip()
-        home = str(item.get("home") or item.get("home_team") or item.get("team1") or "").strip()
-        away = str(item.get("away") or item.get("away_team") or item.get("team2") or "").strip()
+        home = _extract_team_field(item, "home", "home_team", "team1")
+        away = _extract_team_field(item, "away", "away_team", "team2")
         title = str(item.get("title") or item.get("name") or item.get("event") or "").strip()
         if not title and home and away:
             title = f"{home} vs {away}"
@@ -187,7 +230,9 @@ def _parse_json_matches(data: Any, mirror: str) -> list[ProviderEvent]:
             item.get("competition") or item.get("league") or item.get("tournament") or ""
         ).strip()
         start_ms = _parse_start_ms(item)
-        item_slug = str(item.get("slug") or item.get("key") or item.get("id") or "").strip()
+        stream_key = str(
+            item.get("stream_key") or item.get("slug") or item.get("key") or item.get("id") or ""
+        ).strip()
         item_url = str(item.get("player_url") or item.get("url") or "").strip()
 
         sources: list[StreamSource] = []
@@ -196,7 +241,9 @@ def _parse_json_matches(data: Any, mirror: str) -> list[ProviderEvent]:
             for idx, st in enumerate(raw_streams):
                 if isinstance(st, dict):
                     st_cat = str(st.get("category") or st.get("cat") or cat).strip()
-                    st_slug = str(st.get("slug") or st.get("key") or item_slug).strip()
+                    st_slug = str(
+                        st.get("stream_key") or st.get("slug") or st.get("key") or stream_key
+                    ).strip()
                     st_url = str(st.get("player_url") or st.get("url") or item_url).strip()
                     player_url = _build_player_url(mirror, st_cat, st_slug, st_url)
                     if not player_url:
@@ -216,11 +263,12 @@ def _parse_json_matches(data: Any, mirror: str) -> list[ProviderEvent]:
                             priority=5,
                             requires_proxy=True,
                             proxy_host="streamfree",
-                            raw_url=player_url,
+                            channel_name=st_cat.lower(),
+                            raw_url=st_slug or player_url,
                         )
                     )
         if not sources:
-            player_url = _build_player_url(mirror, cat, item_slug, item_url)
+            player_url = _build_player_url(mirror, cat, stream_key, item_url)
             if not player_url:
                 continue
             quality = str(item.get("quality") or _extract_quality(title)).strip()
@@ -235,7 +283,8 @@ def _parse_json_matches(data: Any, mirror: str) -> list[ProviderEvent]:
                     priority=5,
                     requires_proxy=True,
                     proxy_host="streamfree",
-                    raw_url=player_url,
+                    channel_name=cat.lower(),
+                    raw_url=stream_key or player_url,
                 )
             )
 
@@ -343,6 +392,11 @@ class StreamFreeService(BaseStreamProvider):
         super().__init__(settings)
         self._external_client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
+        self._active_mirror: str = (
+            _normalize_mirror_url(self.settings.STREAMFREE_PRIMARY_MIRROR)
+            or FALLBACK_MIRROR
+        )
+        self._resolve_cache: dict[tuple[str, str], tuple[float, list[dict[str, str]]]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -362,21 +416,172 @@ class StreamFreeService(BaseStreamProvider):
             await self._owned_client.aclose()
             self._owned_client = None
 
+    def _fallback_mirrors(self) -> list[str]:
+        candidates: list[str] = []
+        primary = _normalize_mirror_url(self.settings.STREAMFREE_PRIMARY_MIRROR)
+        if primary:
+            candidates.append(primary)
+        for raw in (self.settings.STREAMFREE_FALLBACK_MIRRORS or "").split(","):
+            norm = _normalize_mirror_url(raw)
+            if norm and norm not in candidates:
+                candidates.append(norm)
+        if FALLBACK_MIRROR not in candidates:
+            candidates.append(FALLBACK_MIRROR)
+        return candidates
+
     async def discover_mirror(self, client: httpx.AsyncClient) -> str:
-        """Query `strmfree.link/api/domains` to find the active StreamFree mirror."""
+        """Query `STREAMFREE_DIRECTORY_URL` to find the active StreamFree mirror."""
+        directory_url = (self.settings.STREAMFREE_DIRECTORY_URL or DOMAINS_API_URL).strip()
+        primary_fallback = (
+            _normalize_mirror_url(self.settings.STREAMFREE_PRIMARY_MIRROR)
+            or FALLBACK_MIRROR
+        )
         try:
             resp = await client.get(
-                DOMAINS_API_URL,
-                headers={"Accept": "application/json"},
+                directory_url,
+                headers={"User-Agent": CHROME_USER_AGENT, "Accept": "application/json"},
             )
             if resp.status_code == 200 and resp.text.strip():
                 try:
-                    return extract_mirror_url(resp.json(), FALLBACK_MIRROR)
+                    return extract_mirror_url(resp.json(), primary_fallback)
                 except ValueError:
-                    return extract_mirror_url(resp.text, FALLBACK_MIRROR)
+                    return extract_mirror_url(resp.text, primary_fallback)
         except Exception as exc:
             logger.debug("StreamFree mirror discovery failed, using fallback: %s", exc)
-        return FALLBACK_MIRROR
+        return primary_fallback
+
+    async def resolve_stream_url(
+        self,
+        stream_key: str,
+        category: str = "soccer",
+        domain: Optional[str] = None,
+    ) -> list[dict[str, str]]:
+        """Resolve signed `.m3u8` URLs for `stream_key` via sources + routing + `_0x` (300s cache)."""
+        key = (stream_key or "").strip()
+        if not key:
+            return []
+
+        cat = (category or "soccer").strip().lower()
+        cache_key = (key, cat)
+        now = time.monotonic()
+        cached = self._resolve_cache.get(cache_key)
+        if cached and now - cached[0] < RESOLVE_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        client = self._get_client()
+        mirror = _normalize_mirror_url(domain or "") or self._active_mirror
+        if not mirror:
+            mirror = await self.discover_mirror(client)
+
+        api_headers = {
+            "User-Agent": CHROME_USER_AGENT,
+            "Accept": "application/json, text/html, */*",
+            "Referer": f"{mirror}/player/{cat}/{key}",
+            "Origin": mirror,
+        }
+
+        sources_req = client.get(f"{mirror}/api/v1/sources/{key}", headers=api_headers)
+        route_req = client.get(f"{mirror}/get-stream-key/{key}", headers=api_headers)
+        sources_resp, route_resp = await asyncio.gather(
+            sources_req, route_req, return_exceptions=True
+        )
+
+        sources_list: list[dict[str, Any]] = []
+        if isinstance(sources_resp, httpx.Response) and sources_resp.status_code == 200:
+            try:
+                payload = sources_resp.json()
+                raw_src = payload.get("sources") if isinstance(payload, dict) else payload
+                if isinstance(raw_src, list):
+                    sources_list = [s for s in raw_src if isinstance(s, dict)]
+            except Exception:
+                pass
+
+        server_name = ""
+        if isinstance(route_resp, httpx.Response) and route_resp.status_code == 200:
+            try:
+                route_data = route_resp.json()
+                if isinstance(route_data, dict):
+                    server_name = str(route_data.get("server_name") or "").strip().lower()
+            except Exception:
+                pass
+
+        if server_name == "externalcdn":
+            route_prefix = "/live-externalcdn"
+        elif server_name == "origin":
+            route_prefix = "/live"
+        else:
+            route_prefix = "/live-cdn"
+
+        resolved: list[dict[str, str]] = []
+        player_referer = f"{mirror}/player/{cat}/{key}"
+
+        for src in sources_list:
+            embed_url = str(src.get("url") or src.get("embed_url") or "").strip()
+            if not embed_url:
+                continue
+            src_quality = str(src.get("quality") or "").strip()
+
+            try:
+                embed_resp = await client.get(
+                    embed_url,
+                    headers={
+                        "User-Agent": CHROME_USER_AGENT,
+                        "Referer": player_referer,
+                        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                    },
+                )
+                if embed_resp.status_code != 200 or not embed_resp.text:
+                    continue
+                ox_match = _OX_RE.search(embed_resp.text)
+                if not ox_match:
+                    continue
+                ox_data = json.loads(ox_match.group(1))
+            except Exception as exc:
+                logger.debug("StreamFree embed _0x extraction failed for %s: %s", embed_url, exc)
+                continue
+
+            if not isinstance(ox_data, dict):
+                continue
+
+            parsed_embed = urlsplit(embed_url)
+            embed_host = parsed_embed.netloc
+            embed_scheme = parsed_embed.scheme or "https"
+            embed_origin = f"{embed_scheme}://{embed_host}" if embed_host else mirror
+
+            variants: dict[str, dict[str, Any]] = {}
+            if "_t" in ox_data or "_e" in ox_data or "_s" in ox_data:
+                variants[src_quality or "1080p"] = ox_data
+            else:
+                for var_name, var_tokens in ox_data.items():
+                    if isinstance(var_tokens, dict):
+                        variants[str(var_name)] = var_tokens
+
+            for variant, tokens in variants.items():
+                params: list[tuple[str, str]] = []
+                for tk in ("_t", "_ta", "_e", "_s", "_sa"):
+                    if tokens.get(tk) is not None and str(tokens.get(tk)) != "":
+                        params.append((tk, str(tokens[tk])))
+                if tokens.get("_n") is not None and str(tokens.get("_n")) != "":
+                    params.append(("_n", str(tokens["_n"])))
+                if not params:
+                    continue
+
+                m3u8_url = (
+                    f"{embed_origin}{route_prefix}/{variant}/index.m3u8?"
+                    f"{urlencode(params)}"
+                )
+                resolved.append(
+                    {
+                        "m3u8_url": m3u8_url,
+                        "embed_url": embed_url,
+                        "origin": f"https://{embed_host}" if embed_host else embed_origin,
+                        "quality": src_quality or variant,
+                    }
+                )
+
+        if resolved:
+            self._resolve_cache[cache_key] = (now, resolved)
+        return resolved
 
     async def harvest(self) -> ProviderHarvestResult:
         """Discover active mirror and fetch StreamFree live matches."""
@@ -384,25 +589,37 @@ class StreamFreeService(BaseStreamProvider):
             return ProviderHarvestResult(provider=self.name)
 
         client = self._get_client()
-        mirror = await self.discover_mirror(client)
-        headers = {"Referer": f"{mirror}/", "Origin": mirror}
+        discovered = await self.discover_mirror(client)
+        candidate_mirrors = [discovered] + [
+            m for m in self._fallback_mirrors() if m != discovered
+        ]
 
         events: list[ProviderEvent] = []
         last_error = ""
 
-        for endpoint in _MATCH_ENDPOINTS:
-            url = urljoin(f"{mirror}/", endpoint.lstrip("/"))
-            try:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code != 200 or not resp.text.strip():
-                    continue
-                parsed = parse_streamfree_matches(resp.text, mirror)
-                if parsed:
-                    events = parsed
-                    break
-            except Exception as exc:
-                last_error = str(exc)
-                logger.debug("StreamFree fetch failed for %s: %s", url, exc)
+        for mirror in candidate_mirrors:
+            headers = {
+                "User-Agent": CHROME_USER_AGENT,
+                "Accept": "application/json, text/html, */*",
+                "Referer": f"{mirror}/",
+                "Origin": mirror,
+            }
+            for endpoint in _MATCH_ENDPOINTS:
+                url = urljoin(f"{mirror}/", endpoint.lstrip("/"))
+                try:
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code != 200 or not resp.text.strip():
+                        continue
+                    parsed = parse_streamfree_matches(resp.text, mirror)
+                    if parsed:
+                        self._active_mirror = mirror
+                        events = parsed
+                        break
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.debug("StreamFree fetch failed for %s: %s", url, exc)
+            if events:
+                break
 
         return ProviderHarvestResult(
             provider=self.name,

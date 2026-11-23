@@ -73,6 +73,9 @@ class Match(BaseModel):
     alt_home: str = ""
     alt_away: str = ""
     alt_league: str = ""
+    alt_title: str = ""
+    alt_competition: str = ""
+    alt_country: str = ""
     is_women: bool = False
     is_youth: bool = False
     has_tvvoo: bool = False

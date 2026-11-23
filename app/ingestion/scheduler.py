@@ -27,7 +27,6 @@ from app.providers.stream_orchestrator import StreamOrchestrator
 from app.providers.tvvoo_service import TvVooService
 from app.taxonomy.classifier import (
     CATALOG_DEFINITIONS,
-    LIVE_CATALOG_ID,
     matches_catalog_filter,
 )
 
@@ -73,23 +72,13 @@ def build_catalog_buckets(
     genres_by_catalog: dict[str, tuple[str, ...]] = {}
 
     for cat_def in CATALOG_DEFINITIONS:
-        if cat_def.id == LIVE_CATALOG_ID:
-            bucket = [
-                m
-                for m in ordered
-                if is_match_live_window(m, current_ms)
-                and matches_catalog_filter(
-                    m.silo.value, m.category, m.genres, cat_def.id, None
-                )
-            ]
-        else:
-            bucket = [
-                m
-                for m in ordered
-                if matches_catalog_filter(
-                    m.silo.value, m.category, m.genres, cat_def.id, None
-                )
-            ]
+        bucket = [
+            m
+            for m in ordered
+            if matches_catalog_filter(
+                m.silo.value, m.category, m.genres, cat_def.id, None
+            )
+        ]
 
         matches_by_catalog[cat_def.id] = tuple(bucket)
 
@@ -107,13 +96,12 @@ def build_catalog_buckets(
                     seen_genres.add(key)
                     active_genres.append(declared_genre)
 
-        if cat_def.id != LIVE_CATALOG_ID:
-            for m in bucket:
-                for g in m.genres:
-                    clean_g = g.strip()
-                    if clean_g and clean_g.casefold() not in seen_genres:
-                        seen_genres.add(clean_g.casefold())
-                        active_genres.append(clean_g)
+        for m in bucket:
+            for g in m.genres:
+                clean_g = g.strip()
+                if clean_g and clean_g.casefold() not in seen_genres:
+                    seen_genres.add(clean_g.casefold())
+                    active_genres.append(clean_g)
 
         genres_by_catalog[cat_def.id] = tuple(active_genres)
 

@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -22,14 +23,31 @@ logger = logging.getLogger(__name__)
 
 MAX_CHANNELS_PER_EVENT = 30
 DEFAULT_MIRRORS: tuple[str, ...] = (
-    "https://dlhd.dad",
-    "https://daddylive.mp",
-    "https://dlive.sx",
+    "https://thedaddy.li",
+    "https://dlhd.pk",
+    "https://dlhd.st",
+    "https://thedaddy.pk",
+    "https://daddylive.pk",
 )
+STATUS_CHECKER_URL = "https://daddylive.pk/check_status.php?url=https://dlhd.pk"
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+PLAYER_TEMPLATES: tuple[str, ...] = (
+    "watch.php?id={id}",
+    "stream/stream-{id}.php",
+    "cast/stream-{id}.php",
+    "watch/stream-{id}.php",
+    "plus/stream-{id}.php",
+    "casting/stream-{id}.php",
+    "player/stream-{id}.php",
+)
+PLAYER_CACHE_TTL_SECONDS = 60.0
+
 _SCHEDULE_PATHS: tuple[str, ...] = (
+    "/index.php",
     "/schedule/schedule-generated.php",
-    "/schedule/schedule-generated.json",
-    "/api/schedule",
     "/",
 )
 _CHANNELS_PATHS: tuple[str, ...] = (
@@ -39,9 +57,10 @@ _CHANNELS_PATHS: tuple[str, ...] = (
 )
 
 _CHANNEL_ID_RE = re.compile(
-    r"(?:watch\.php\?id=|stream-|/watch/|channel_id=)(\d+)",
+    r"(?:watchextra\.php\?id=|watch\.php\?id=|[?&]id=|stream-|/watch/|channel_id=)(\d+)(?:\.php)?",
     re.IGNORECASE,
 )
+_EMOJI_RE = re.compile(r"[\U00010000-\U0010ffff\u2600-\u27bf\ufe0f]+")
 _ORDINAL_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\b", re.IGNORECASE)
 _TIME_HHMM_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
 _EVENT_SPLIT_RE = re.compile(r"\s+(?:vs\.?|v\.?|@|–|—|-)\s+", re.IGNORECASE)
@@ -99,7 +118,8 @@ _SPORT_HINT_MAP: dict[str, str] = {
 
 def normalize_daddylive_channel_key(name: str) -> str:
     """Normalize a 24/7 channel name for cross-matching with Diretta/EPG broadcasters."""
-    cleaned = _CHANNEL_SUFFIX_NOISE_RE.sub(" ", name or "")
+    cleaned = re.sub(r"\bid\s*:?\s*\d+\b", " ", name or "", flags=re.IGNORECASE)
+    cleaned = _CHANNEL_SUFFIX_NOISE_RE.sub(" ", cleaned)
     cleaned = re.sub(r"[^\w\s]", " ", cleaned.lower())
     return re.sub(r"\s+", " ", cleaned).strip()
 
@@ -405,6 +425,50 @@ def _parse_json_event_list(
     return parsed
 
 
+def _strip_emojis(text: str) -> str:
+    cleaned = _EMOJI_RE.sub(" ", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _extract_header_date_time_title(
+    header_text: str,
+    data_title: str,
+    default_date: datetime,
+    reference_dt: datetime,
+) -> tuple[datetime, str, str]:
+    """Extract event date, HH:MM time, and cleaned competition/match title from eventHeader."""
+    raw_visible = _strip_emojis(header_text)
+    raw_attr = _strip_emojis(data_title)
+    combined = raw_attr or raw_visible
+
+    event_date = default_date
+    for candidate_src in (raw_visible, raw_attr):
+        if not candidate_src:
+            continue
+        cleaned_ord = _ORDINAL_RE.sub(r"\1", candidate_src)
+        if _TEXT_DATE_RE.search(cleaned_ord) or _ISO_DATE_RE.search(cleaned_ord):
+            event_date = _parse_date_header(candidate_src, reference_dt)
+            combined = _TEXT_DATE_RE.sub(" ", _ISO_DATE_RE.sub(" ", cleaned_ord))
+            combined = re.sub(r"\s+", " ", combined).strip(" -:|,")
+            break
+
+    time_text = ""
+    for candidate_src in (raw_visible, raw_attr):
+        if not candidate_src:
+            continue
+        tm = _TIME_HHMM_RE.search(candidate_src)
+        if tm:
+            time_text = tm.group(0)
+            break
+
+    if time_text:
+        combined = _TIME_HHMM_RE.sub(" ", combined, count=1)
+        combined = re.sub(r"\b(?:UK|GMT|UTC)\b", " ", combined, flags=re.IGNORECASE)
+        combined = re.sub(r"\s+", " ", combined).strip(" -:|")
+
+    return event_date, time_text, combined
+
+
 def _parse_html_schedule(
     html: str,
     base_url: str,
@@ -417,7 +481,85 @@ def _parse_html_schedule(
     )
     current_cat = ""
 
-    # Primary structured DLHD DOM: .schedule__day, .schedule__category, .schedule__event
+    # Real live thedaddy.li/index.php DOM: .schedule__category -> .schedule__event
+    category_blocks = soup.select(".schedule__category")
+    if category_blocks:
+        for cat_block in category_blocks:
+            cat_header = cat_block.select_one(
+                ".schedule__catHeader, .schedule__categoryHeader, h2, h3, summary"
+            )
+            cat_name = _strip_emojis(
+                cat_header.get_text(" ", strip=True)
+                if cat_header
+                else str(cat_block.get("data-category") or "")
+            )
+            if cat_name.lower() in ("tv shows", "tv show"):
+                continue
+            if _TEXT_DATE_RE.search(_ORDINAL_RE.sub(r"\1", cat_name)) or _ISO_DATE_RE.search(cat_name):
+                current_date = _parse_date_header(cat_name, reference_dt)
+            elif cat_name:
+                current_cat = cat_name
+
+            for ev_node in cat_block.select(".schedule__event"):
+                day_parent = ev_node.find_parent(class_="schedule__day")
+                ev_date = current_date
+                if day_parent:
+                    day_title = day_parent.select_one(".schedule__dayTitle")
+                    if day_title:
+                        ev_date = _parse_date_header(
+                            _strip_emojis(day_title.get_text(" ", strip=True)),
+                            reference_dt,
+                        )
+
+                ch_container = ev_node.select_one(".schedule__channels") or ev_node
+                anchors = [
+                    a for a in ch_container.find_all("a", href=True)
+                    if _extract_channel_id(a["href"])
+                ]
+                if not anchors:
+                    continue
+
+                header_el = ev_node.select_one(".schedule__eventHeader")
+                if header_el is not None:
+                    data_title = str(header_el.get("data-title") or "")
+                    header_text = header_el.get_text(" ", strip=True)
+                    time_el = ev_node.select_one(".schedule__time, .time")
+                    if time_el and time_el.get_text(strip=True) not in header_text:
+                        header_text = f"{time_el.get_text(' ', strip=True)} {header_text}"
+                    ev_date, time_text, title_text = _extract_header_date_time_title(
+                        header_text, data_title, ev_date, reference_dt
+                    )
+                else:
+                    time_el = ev_node.select_one(".schedule__time, .time, td.time")
+                    title_el = ev_node.select_one(
+                        ".schedule__eventTitle, .event-title, .title, summary, strong"
+                    )
+                    time_text = time_el.get_text(" ", strip=True) if time_el else ""
+                    title_text = _strip_emojis(title_el.get_text(" ", strip=True) if title_el else "")
+
+                if not title_text:
+                    continue
+
+                raw_channels = [
+                    (
+                        _extract_channel_id(a["href"]),
+                        _strip_emojis(a.get_text(" ", strip=True) or str(a.get("title") or "")),
+                    )
+                    for a in anchors
+                ]
+                ev = _build_provider_event(
+                    raw_title=title_text,
+                    category=current_cat,
+                    start_ms=_parse_start_ms(time_text, ev_date),
+                    raw_channels=raw_channels,
+                    base_url=base_url,
+                )
+                if ev is not None:
+                    events.append(ev)
+        if events:
+            return events
+
+    # Legacy structured DLHD DOM: .schedule__dayTitle, .schedule__catHeader, .schedule__event
     structured_nodes = soup.select(
         ".schedule__dayTitle, .schedule__catHeader, .schedule__event, "
         ".card-header, .event, tr[data-event], details"
@@ -429,49 +571,62 @@ def _parse_html_schedule(
                 current_date = _parse_date_header(node.get_text(" ", strip=True), reference_dt)
                 continue
             if "catHeader" in classes or "card-header" in classes:
-                text = node.get_text(" ", strip=True)
+                text = _strip_emojis(node.get_text(" ", strip=True))
                 if _TEXT_DATE_RE.search(_ORDINAL_RE.sub(r"\1", text)) or _ISO_DATE_RE.search(text):
                     current_date = _parse_date_header(text, reference_dt)
                 else:
                     current_cat = text
                 continue
+            if current_cat.lower() in ("tv shows", "tv show"):
+                continue
 
+            ch_container = node.select_one(".schedule__channels") or node
             anchors = [
-                a for a in node.find_all("a", href=True)
+                a for a in ch_container.find_all("a", href=True)
                 if _extract_channel_id(a["href"])
             ]
             if not anchors:
                 continue
 
-            time_el = node.select_one(".schedule__time, .time, td.time")
-            title_el = node.select_one(
-                ".schedule__eventTitle, .event-title, .title, summary, strong"
-            )
-            time_text = time_el.get_text(" ", strip=True) if time_el else ""
-            title_text = title_el.get_text(" ", strip=True) if title_el else ""
-            if not title_text:
-                # Strip anchor text to reconstruct event title from remaining node text
-                clone_texts = [
-                    t.strip()
-                    for t in node.stripped_strings
-                    if t.strip() and not any(t.strip() == a.get_text(" ", strip=True) for a in anchors)
-                ]
-                joined = " ".join(clone_texts)
-                if not time_text:
-                    tm = _TIME_HHMM_RE.search(joined)
-                    if tm:
-                        time_text = tm.group(0)
-                        joined = joined.replace(time_text, "", 1).strip(" -:|")
-                title_text = joined
+            header_el = node.select_one(".schedule__eventHeader")
+            ev_date = current_date
+            if header_el is not None:
+                ev_date, time_text, title_text = _extract_header_date_time_title(
+                    header_el.get_text(" ", strip=True),
+                    str(header_el.get("data-title") or ""),
+                    current_date,
+                    reference_dt,
+                )
+            else:
+                time_el = node.select_one(".schedule__time, .time, td.time")
+                title_el = node.select_one(
+                    ".schedule__eventTitle, .event-title, .title, summary, strong"
+                )
+                time_text = time_el.get_text(" ", strip=True) if time_el else ""
+                title_text = _strip_emojis(title_el.get_text(" ", strip=True) if title_el else "")
+                if not title_text:
+                    # Strip anchor text to reconstruct event title from remaining node text
+                    clone_texts = [
+                        t.strip()
+                        for t in node.stripped_strings
+                        if t.strip() and not any(t.strip() == a.get_text(" ", strip=True) for a in anchors)
+                    ]
+                    joined = _strip_emojis(" ".join(clone_texts))
+                    if not time_text:
+                        tm = _TIME_HHMM_RE.search(joined)
+                        if tm:
+                            time_text = tm.group(0)
+                            joined = joined.replace(time_text, "", 1).strip(" -:|")
+                    title_text = joined
 
             raw_channels = [
-                (_extract_channel_id(a["href"]), a.get_text(" ", strip=True))
+                (_extract_channel_id(a["href"]), _strip_emojis(a.get_text(" ", strip=True)))
                 for a in anchors
             ]
             ev = _build_provider_event(
                 raw_title=title_text,
                 category=current_cat,
-                start_ms=_parse_start_ms(time_text, current_date),
+                start_ms=_parse_start_ms(time_text, ev_date),
                 raw_channels=raw_channels,
                 base_url=base_url,
             )
@@ -631,9 +786,12 @@ class DaddyLiveService(BaseStreamProvider):
         super().__init__(settings)
         self._external_client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
+        self._custom_mirrors: bool = mirrors is not None
         self._mirrors: tuple[str, ...] = tuple(
             m.rstrip("/") for m in (mirrors or DEFAULT_MIRRORS) if m.strip()
         )
+        self._active_mirror: str = self._mirrors[0] if self._mirrors else DEFAULT_MIRRORS[0]
+        self._player_cache: dict[tuple[str, str], tuple[float, str]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -653,13 +811,67 @@ class DaddyLiveService(BaseStreamProvider):
             await self._owned_client.aclose()
             self._owned_client = None
 
+    @staticmethod
+    def _normalize_origin(candidate: str) -> str:
+        raw = (candidate or "").strip().rstrip("/")
+        if not raw:
+            return ""
+        if not raw.startswith(("http://", "https://")):
+            raw = f"https://{raw.lstrip('/')}"
+        parsed = urlsplit(raw)
+        if not parsed.netloc:
+            return ""
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    async def _discover_mirrors(self, client: httpx.AsyncClient) -> tuple[str, ...]:
+        """Query STATUS_CHECKER_URL for canonical mirror with fast fallback on DEFAULT_MIRRORS."""
+        if self._custom_mirrors:
+            return self._mirrors
+        discovered = ""
+        try:
+            resp = await client.get(
+                STATUS_CHECKER_URL,
+                headers={"User-Agent": CHROME_USER_AGENT, "Accept": "application/json, text/plain, */*"},
+                timeout=5.0,
+            )
+            if resp.status_code == 200 and resp.text.strip():
+                text = resp.text.strip()
+                if text.startswith("{"):
+                    try:
+                        data = resp.json()
+                        if isinstance(data, dict):
+                            for key in ("url", "canonical", "active", "domain", "redirect"):
+                                val = data.get(key)
+                                if isinstance(val, str) and val.strip():
+                                    discovered = self._normalize_origin(val)
+                                    if discovered:
+                                        break
+                    except ValueError:
+                        pass
+                if not discovered:
+                    m = re.search(r"https?://[^\s\"'<>]+", text)
+                    if m:
+                        discovered = self._normalize_origin(m.group(0))
+        except Exception as exc:
+            logger.debug("DaddyLive status checker failed, falling back to DEFAULT_MIRRORS: %s", exc)
+
+        if discovered:
+            ordered = [discovered] + [m for m in self._mirrors if m != discovered]
+            return tuple(ordered)
+        return self._mirrors
+
     async def _fetch_first_valid(
         self,
         client: httpx.AsyncClient,
         mirror: str,
         paths: tuple[str, ...],
     ) -> str:
-        headers = {"Referer": f"{mirror}/", "Origin": mirror}
+        headers = {
+            "User-Agent": CHROME_USER_AGENT,
+            "Referer": f"{mirror}/",
+            "Origin": mirror,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
         for path in paths:
             url = urljoin(f"{mirror}/", path.lstrip("/"))
             try:
@@ -669,6 +881,56 @@ class DaddyLiveService(BaseStreamProvider):
             except Exception as exc:
                 logger.debug("DaddyLive fetch failed for %s: %s", url, exc)
         return ""
+
+    async def resolve_working_player_url(
+        self,
+        channel_id: str,
+        ep_url: str = "",
+        ep_pass: str = "",
+    ) -> str:
+        """Resolve a working player/EasyProxy URL via 7-player failover cascade (60s TTL cache)."""
+        cid = _extract_channel_id(channel_id) or str(channel_id).strip()
+        if not cid:
+            return ""
+
+        ep_base = (ep_url or "").strip().rstrip("/")
+        cache_key = (cid, ep_base)
+        now = time.monotonic()
+        cached = self._player_cache.get(cache_key)
+        if cached and now - cached[0] < PLAYER_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        client = self._get_client()
+        domain = (self._active_mirror or DEFAULT_MIRRORS[0]).rstrip("/")
+        headers = {"User-Agent": CHROME_USER_AGENT, "Referer": f"{domain}/"}
+
+        def _format_target(player_url: str) -> str:
+            if not ep_base:
+                return player_url
+            return (
+                f"{ep_base}/extractor/video.m3u8?host=dlstreams"
+                f"&d={quote(player_url, safe='')}&redirect_stream=true"
+                f"&api_password={quote(ep_pass or '', safe='')}"
+            )
+
+        first_fallback = _format_target(f"{domain}/{PLAYER_TEMPLATES[0].format(id=cid)}")
+        for template in PLAYER_TEMPLATES:
+            player_url = f"{domain}/{template.format(id=cid)}"
+            target_url = _format_target(player_url)
+            try:
+                resp = await client.get(
+                    target_url,
+                    headers=headers,
+                    follow_redirects=False,
+                    timeout=6.0,
+                )
+                if resp.status_code in (200, 302, 307):
+                    self._player_cache[cache_key] = (now, target_url)
+                    return target_url
+            except Exception as exc:
+                logger.debug("DaddyLive player probe failed for %s: %s", target_url, exc)
+
+        return first_fallback
 
     async def harvest(self) -> ProviderHarvestResult:
         """Scrape DaddyLive active mirror schedule and 24/7 TV channels."""
@@ -680,7 +942,8 @@ class DaddyLiveService(BaseStreamProvider):
         linear_channels: dict[str, list[StreamSource]] = {}
         errors: list[str] = []
 
-        for mirror in self._mirrors:
+        mirrors = await self._discover_mirrors(client)
+        for mirror in mirrors:
             try:
                 sched_payload = await self._fetch_first_valid(client, mirror, _SCHEDULE_PATHS)
                 if sched_payload:
@@ -691,6 +954,7 @@ class DaddyLiveService(BaseStreamProvider):
                     linear_channels = parse_daddylive_channels(ch_payload, mirror)
 
                 if events or linear_channels:
+                    self._active_mirror = mirror
                     break
             except Exception as exc:
                 errors.append(f"{mirror}: {exc}")

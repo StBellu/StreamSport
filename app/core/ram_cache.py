@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from app.models.domain import Match
+from app.taxonomy.classifier import NUVIO_CATALOG_LOOKUP, _normalize_catalog_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,9 @@ def _matches_search(match: Match, needle: str) -> bool:
         match.alt_league,
         match.alt_home,
         match.alt_away,
+        match.alt_title,
+        match.alt_competition,
+        match.alt_country,
         match.home_team.name if match.home_team else "",
         match.away_team.name if match.away_team else "",
     ]
@@ -62,10 +66,20 @@ class RAMCacheManager:
         if limit <= 0:
             return []
         start = max(skip, 0)
-        items = self._snapshot.matches_by_catalog.get(catalog_id, ())
 
-        if genre:
-            genre_norm = genre.strip().lower()
+        effective_genre = genre
+        if catalog_id in NUVIO_CATALOG_LOOKUP:
+            base_cat_id, mapped_genre = NUVIO_CATALOG_LOOKUP[catalog_id]
+            items = self._snapshot.matches_by_catalog.get(base_cat_id, ())
+            effective_genre = genre or mapped_genre
+        else:
+            items = self._snapshot.matches_by_catalog.get(catalog_id)
+            if items is None:
+                norm_id = _normalize_catalog_id(catalog_id)
+                items = self._snapshot.matches_by_catalog.get(norm_id, ())
+
+        if effective_genre:
+            genre_norm = effective_genre.strip().lower()
             items = tuple(
                 m for m in items if any(g.lower() == genre_norm for g in m.genres)
             )

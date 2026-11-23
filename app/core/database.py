@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS matches (
     alt_home TEXT NOT NULL DEFAULT '',
     alt_away TEXT NOT NULL DEFAULT '',
     alt_league TEXT NOT NULL DEFAULT '',
+    alt_title TEXT NOT NULL DEFAULT '',
+    alt_competition TEXT NOT NULL DEFAULT '',
+    alt_country TEXT NOT NULL DEFAULT '',
     is_women INTEGER NOT NULL DEFAULT 0,
     is_youth INTEGER NOT NULL DEFAULT 0,
     has_tvvoo INTEGER NOT NULL DEFAULT 0,
@@ -66,10 +69,10 @@ _UPSERT_MATCH_SQL = """
 INSERT INTO matches (
     id, title, category, silo, genres, date, end_date, poster, popular,
     competition, canonical_competition, country, stage, sources, teams,
-    alt_home, alt_away, alt_league, is_women, is_youth, has_tvvoo,
-    broadcasters, source_origin, updated_at
+    alt_home, alt_away, alt_league, alt_title, alt_competition, alt_country,
+    is_women, is_youth, has_tvvoo, broadcasters, source_origin, updated_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 ON CONFLICT(id) DO UPDATE SET
     title = excluded.title,
@@ -89,6 +92,9 @@ ON CONFLICT(id) DO UPDATE SET
     alt_home = excluded.alt_home,
     alt_away = excluded.alt_away,
     alt_league = excluded.alt_league,
+    alt_title = excluded.alt_title,
+    alt_competition = excluded.alt_competition,
+    alt_country = excluded.alt_country,
     is_women = excluded.is_women,
     is_youth = excluded.is_youth,
     has_tvvoo = excluded.has_tvvoo,
@@ -131,6 +137,9 @@ def _match_to_row(match: Match) -> tuple[Any, ...]:
         match.alt_home,
         match.alt_away,
         match.alt_league,
+        match.alt_title,
+        match.alt_competition,
+        match.alt_country,
         int(match.is_women),
         int(match.is_youth),
         int(match.has_tvvoo),
@@ -169,6 +178,9 @@ def _row_to_match(row: aiosqlite.Row) -> Match:
         alt_home=row["alt_home"],
         alt_away=row["alt_away"],
         alt_league=row["alt_league"],
+        alt_title=row["alt_title"] if "alt_title" in row.keys() else "",
+        alt_competition=row["alt_competition"] if "alt_competition" in row.keys() else "",
+        alt_country=row["alt_country"] if "alt_country" in row.keys() else "",
         is_women=bool(row["is_women"]),
         is_youth=bool(row["is_youth"]),
         has_tvvoo=bool(row["has_tvvoo"]),
@@ -208,6 +220,14 @@ class DatabaseManager:
         await conn.execute("PRAGMA busy_timeout = 30000;")
         await conn.execute("PRAGMA foreign_keys = ON;")
         await conn.executescript(_SCHEMA_SQL)
+        # Idempotent schema migration for pre-existing SQLite databases.
+        async with conn.execute("PRAGMA table_info(matches);") as cur:
+            existing_cols = {r[1] for r in await cur.fetchall()}
+        for col in ("alt_title", "alt_competition", "alt_country"):
+            if col not in existing_cols:
+                await conn.execute(
+                    f"ALTER TABLE matches ADD COLUMN {col} TEXT NOT NULL DEFAULT '';"
+                )
         self._db = conn
 
     async def close(self) -> None:

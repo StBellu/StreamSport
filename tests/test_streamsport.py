@@ -399,9 +399,9 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
     now_ms = int(time.time() * 1000)
     live_match = _make_match(
         "diretta-inter-napoli",
-        "Inter - Napoli",
+        "Inter vs Napoli",
         silo=SportSilo.CALCIO_ITA,
-        category="calcio_ita",
+        category="calcio_italiano",
         genres=["Serie A"],
         date_ms=now_ms - 10 * 60_000,
         end_ms=now_ms + 125 * 60_000,
@@ -431,11 +431,11 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
             ),
             StreamSource(
                 provider="spon",
-                title="HD7 ITALIAN",
+                title="[SPON] 🇮🇹 [720p] HD7",
                 url="https://spon.example/hd7",
                 language="it",
                 requires_proxy=True,
-                proxy_host="sportsonline",
+                proxy_host="",
             ),
             StreamSource(
                 provider="daddylive",
@@ -450,12 +450,12 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
                 url="https://streamfree.example/live.m3u8",
                 headers={"Referer": "https://streamfree.example/", "Origin": "https://streamfree.example"},
                 requires_proxy=True,
-                proxy_host="streamfree",
+                proxy_host="",
             ),
             StreamSource(
                 provider="fctv33",
                 title="FCTV33 Edge",
-                url="https://fctv33.example/live.m3u8",
+                url="4424653:969541",
                 requires_proxy=True,
                 proxy_host="fctv33",
             ),
@@ -463,9 +463,9 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
     )
     upcoming_match = _make_match(
         "diretta-roma-lazio",
-        "Roma - Lazio",
+        "Roma vs Lazio",
         silo=SportSilo.CALCIO_ITA,
-        category="calcio_ita",
+        category="calcio_italiano",
         genres=["Serie A"],
         date_ms=now_ms + 90 * 60_000,
         end_ms=now_ms + 225 * 60_000,
@@ -483,19 +483,19 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
             ),
             StreamSource(
                 provider="spon",
-                title="HD7 ITALIAN",
+                title="[SPON] 🇮🇹 [720p] HD7",
                 url="https://spon.example/future",
                 requires_proxy=True,
-                proxy_host="sportsonline",
+                proxy_host="",
             ),
         ],
     )
     coppa_match = _make_match(
         "diretta-coppa",
-        "Atalanta - Bologna",
+        "Atalanta vs Bologna",
         silo=SportSilo.CALCIO_ITA,
-        category="calcio_ita",
-        genres=["Coppa Italia"],
+        category="calcio_italiano",
+        genres=["Coppa Italia e Supercoppa"],
         date_ms=now_ms + 120 * 60_000,
         end_ms=now_ms + 255 * 60_000,
         competition="Coppa Italia",
@@ -528,11 +528,24 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
 
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            # Stremio manifest (nested genre options)
+            # Stremio manifest (11 nested genre catalogs)
             r_stremio = await client.get("/manifest.json")
             assert r_stremio.status_code == 200
             m_stremio = r_stremio.json()
             assert m_stremio["id"] == "org.streamsport.addon"
+            assert [c["id"] for c in m_stremio["catalogs"]] == [
+                "calcio_italiano",
+                "calcio_estero",
+                "tennis",
+                "motori",
+                "basket",
+                "volley",
+                "football_americano",
+                "baseball",
+                "hockey",
+                "combattimento",
+                "altri_sport",
+            ]
             assert any(
                 any(ex.get("name") == "genre" and ex.get("options") for ex in c.get("extra", []))
                 for c in m_stremio["catalogs"]
@@ -543,6 +556,8 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
             assert r_nuvio.status_code == 200
             m_nuvio = r_nuvio.json()
             assert m_nuvio["id"] == "org.streamsport.nuvio"
+            nuvio_ids = [c["id"] for c in m_nuvio["catalogs"]]
+            assert "nuvio_calcio_italiano_serie_a" in nuvio_ids
             for c in m_nuvio["catalogs"]:
                 assert all(ex.get("name") != "genre" for ex in c.get("extra", []))
 
@@ -550,9 +565,9 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
             assert (await client.get(f"/{cfg_token}/manifest.json")).json()["id"] == "org.streamsport.addon"
             assert (await client.get(f"/{cfg_token}/nuvio/manifest.json")).json()["id"] == "org.streamsport.nuvio"
 
-            # Catalog + genre filter + X-Forwarded-* base_url honoring
+            # Catalog + genre filter + Nuvio flattened catalog + X-Forwarded-* base_url honoring
             r_cat = await client.get(
-                "/catalog/tv/ss_calcio_ita.json",
+                "/catalog/tv/calcio_italiano.json",
                 headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "addon.example.org"},
             )
             assert r_cat.status_code == 200
@@ -561,16 +576,20 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
             assert len(metas) == 3
             assert metas[0]["poster"].startswith("https://addon.example.org/poster/")
 
-            r_genre = await client.get(f"/{cfg_token}/catalog/tv/ss_calcio_ita/genre=Serie%20A.json")
+            r_genre = await client.get(f"/{cfg_token}/catalog/tv/calcio_italiano/genre=Serie%20A.json")
             assert r_genre.status_code == 200
             genre_metas = r_genre.json()["metas"]
             assert len(genre_metas) == 2
             assert all(m["id"] in ("streamsport:diretta-inter-napoli", "streamsport:diretta-roma-lazio") for m in genre_metas)
 
+            r_nuvio_cat = await client.get(f"/{cfg_token}/nuvio/catalog/tv/nuvio_calcio_italiano_serie_a.json")
+            assert r_nuvio_cat.status_code == 200
+            assert len(r_nuvio_cat.json()["metas"]) == 2
+
             # Meta route
             r_meta = await client.get(f"/{cfg_token}/meta/tv/streamsport:diretta-inter-napoli.json")
             assert r_meta.status_code == 200
-            assert r_meta.json()["meta"]["name"] == "Inter - Napoli"
+            assert r_meta.json()["meta"]["name"] == "Inter vs Napoli"
 
             # Stream route (live match with all 6 providers)
             r_stream = await client.get(f"/{cfg_token}/stream/tv/streamsport:diretta-inter-napoli.json")
@@ -580,10 +599,10 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
             assert any(f"/{cfg_token}/live/manifest.m3u8?url=" in u for u in urls)
             assert any("host=vavoo" in u and "api_password=secret123" in u for u in urls)
             assert any("/proxy/mpd/manifest.m3u8" in u and "clearkey=abcd1234%3Aef567890" in u for u in urls)
-            assert any("host=sportsonline" in u for u in urls)
+            assert any("/proxy/manifest.m3u8?url=https%3A%2F%2Fspon.example%2Fhd7" in u for u in urls)
             assert any("host=dlstreams" in u for u in urls)
-            assert any("host=streamfree" in u and "h_Referer=" in u and "h_Origin=" in u for u in urls)
-            assert any("host=fctv33" in u for u in urls)
+            assert any("/proxy/manifest.m3u8?url=https%3A%2F%2Fstreamfree.example%2Flive.m3u8" in u and "h_Referer=" in u and "h_Origin=" in u for u in urls)
+            assert any("host=fctv33" in u and "4424653%3A969541" in u for u in urls)
 
             # Pre-match countdown (> 20m before start)
             r_pre = await client.get(f"/{cfg_token}/stream/tv/streamsport:diretta-roma-lazio.json")

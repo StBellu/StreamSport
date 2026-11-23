@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Optional
 from urllib.parse import urlparse
@@ -71,6 +72,10 @@ _CHANNEL_LANG_LINE_RE = re.compile(
 )
 _DAY_HEADER_RE = re.compile(
     r"^\s*(MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)\b(.*)$",
+    re.IGNORECASE,
+)
+_LAST_UPDATE_RE = re.compile(
+    r"LAST\s+UPDATE\s*:\s*(\d{1,2})-(\d{1,2})-(\d{2,4})",
     re.IGNORECASE,
 )
 _EXPLICIT_DMY_RE = re.compile(r"\b(\d{1,2})[/.\-](\d{1,2})(?:[/.\-](\d{2,4}))?\b")
@@ -197,7 +202,19 @@ def parse_prog_txt(text: str, now_utc: Optional[datetime] = None) -> list[Provid
     if ref_utc.tzinfo is None:
         ref_utc = ref_utc.replace(tzinfo=timezone.utc)
     ref_london = ref_utc.astimezone(_LONDON_TZ)
-    current_date = ref_london.date()
+    base_date = ref_london.date()
+    last_update_match = _LAST_UPDATE_RE.search(text)
+    if last_update_match:
+        d_num = int(last_update_match.group(1))
+        m_num = int(last_update_match.group(2))
+        y_num = int(last_update_match.group(3))
+        if y_num < 100:
+            y_num += 2000
+        try:
+            base_date = date(y_num, m_num, d_num)
+        except ValueError:
+            pass
+    current_date = base_date
 
     channel_lang_map: dict[str, tuple[str, str]] = {}
     event_buckets: dict[tuple[int, str], ProviderEvent] = {}
@@ -211,7 +228,7 @@ def parse_prog_txt(text: str, now_utc: Optional[datetime] = None) -> list[Provid
         day_match = _DAY_HEADER_RE.match(line)
         if day_match and "|" not in line:
             current_date = _resolve_day_header_date(
-                day_match.group(1), day_match.group(2), ref_london.date()
+                day_match.group(1), day_match.group(2), base_date
             )
             continue
 
@@ -283,15 +300,18 @@ def parse_prog_txt(text: str, now_utc: Optional[datetime] = None) -> list[Provid
                 or "[ITA]" in raw_title.upper()
             )
             if is_italian:
-                final_lang = "ITA"
+                final_lang = "it"
                 stream_priority = 3
             else:
                 final_lang = lang_code or "ENG"
                 stream_priority = 31
 
             quality = "SD" if ch_code.startswith("SD") else "HD"
-            label_parts = [p for p in (ch_code or "SPON", final_lang, quality) if p]
-            stream_title = f"[SPON] {' '.join(label_parts)}"
+            if is_italian:
+                stream_title = f"[SPON] 🇮🇹 [720p] {ch_code or 'SPON'}"
+            else:
+                label_parts = [p for p in (ch_code or "SPON", final_lang, quality) if p]
+                stream_title = f"[SPON] {' '.join(label_parts)}"
 
             event.streams.append(
                 StreamSource(
@@ -302,7 +322,7 @@ def parse_prog_txt(text: str, now_utc: Optional[datetime] = None) -> list[Provid
                     language=final_lang,
                     priority=stream_priority,
                     requires_proxy=True,
-                    proxy_host="sportsonline",
+                    proxy_host="",
                     channel_name=ch_code,
                     raw_url=url,
                 )
@@ -326,12 +346,22 @@ class SponService(BaseStreamProvider):
         settings: Optional[Settings] = None,
         *,
         client: Optional[httpx.AsyncClient] = None,
-        prog_urls: tuple[str, ...] = SPON_PROG_URLS,
+        prog_urls: Optional[tuple[str, ...]] = None,
     ) -> None:
         super().__init__(settings)
         self._external_client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
-        self._prog_urls = prog_urls
+        if prog_urls is not None:
+            self._prog_urls = prog_urls
+        else:
+            candidates = [
+                self.settings.SPON_PRIMARY_URL,
+                self.settings.SPON_FALLBACK_URL,
+                *SPON_PROG_URLS,
+            ]
+            self._prog_urls = tuple(dict.fromkeys(u for u in candidates if u))
+        self._cache_result: Optional[ProviderHarvestResult] = None
+        self._cache_expires_at: float = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -350,14 +380,23 @@ class SponService(BaseStreamProvider):
             self._owned_client = None
 
     async def harvest(self) -> ProviderHarvestResult:
-        """Fetch `prog.txt` via DoH across Sportsonline mirrors and parse events."""
+        """Fetch `prog.txt` via DoH across Sportsonline mirrors with in-memory TTL cache."""
+        ttl = int(getattr(self.settings, "SPON_CACHE_TTL", 7200) or 0)
+        now_mono = time.monotonic()
+        if ttl > 0 and self._cache_result is not None and now_mono < self._cache_expires_at:
+            return self._cache_result
+
         client = self._get_client()
         last_error = ""
         prog_text = ""
 
         for url in self._prog_urls:
             try:
-                resp = await client.get(url, timeout=15.0)
+                resp = await client.get(
+                    url,
+                    headers={"Accept": "text/plain, */*"},
+                    timeout=15.0,
+                )
                 if resp.status_code != 200:
                     last_error = f"HTTP {resp.status_code} from {url}"
                     continue
@@ -373,8 +412,12 @@ class SponService(BaseStreamProvider):
             return ProviderHarvestResult(provider=self.name, error=last_error or "All SPON mirrors failed")
 
         events = parse_prog_txt(prog_text)
-        return ProviderHarvestResult(
+        result = ProviderHarvestResult(
             provider=self.name,
             events=events,
             raw_count=len(events),
         )
+        if ttl > 0:
+            self._cache_result = result
+            self._cache_expires_at = time.monotonic() + ttl
+        return result

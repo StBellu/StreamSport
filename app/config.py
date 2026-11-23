@@ -49,9 +49,24 @@ class Settings(BaseSettings):
     MANDRAKODI_PASSWORD: str = ""
     MANDRAKODI_DEVICE_ID: str = ""
     MANDRAKODI_API_URL: str = ""
+    MANDRAKODI_XOR_KEY: str = "my_secret_key"
     FLASHSCORE_FSIGN: str = "SW9D1eZo"
     DEFAULT_EP_URL: str = ""
     DEFAULT_EP_PASS: str = ""
+
+    # Provider endpoints & cache TTLs
+    STREAMFREE_DIRECTORY_URL: str = "https://strmfree.link/api/domains"
+    STREAMFREE_PRIMARY_MIRROR: str = "strmfree.pk"
+    STREAMFREE_FALLBACK_MIRRORS: str = "strmfree.st,streamfree.top"
+    FCTV33_API_BASE: str = "https://apis-data10.tcpwe138stya.ru"
+    SPON_PRIMARY_URL: str = "https://sportsonline.st/prog.txt"
+    SPON_FALLBACK_URL: str = "https://sportsonline.cx/prog.txt"
+    SPON_CACHE_TTL: int = 7200
+
+    @property
+    def DIRETTA_X_FSIGN(self) -> str:
+        """Backward-compatible alias for `FLASHSCORE_FSIGN`."""
+        return self.FLASHSCORE_FSIGN
 
     # Filesystem paths
     BASE_DIR: Path = _BASE_DIR

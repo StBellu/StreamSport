@@ -128,7 +128,7 @@ async def test_diretta_f1_dedup_dual_feed_and_tennis_cities() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         requested_urls.append(url)
-        seen_headers.append(dict(request.headers))
+        seen_headers.append((url, dict(request.headers)))
         if "f_1_0_3_it_1" in url:
             return httpx.Response(200, text=it_football)
         if "f_1_0_3_en-uk_1" in url:
@@ -150,9 +150,13 @@ async def test_diretta_f1_dedup_dual_feed_and_tennis_cities() -> None:
 
     assert any("400.flashscore.ninja" in u for u in requested_urls)
     assert any("2.flashscore.ninja" in u for u in requested_urls)
-    assert all(h.get("origin") == "https://www.diretta.it" for h in seen_headers)
-    assert all(h.get("referer") == "https://www.diretta.it/" for h in seen_headers)
-    assert all(h.get("x-fsign") == "test-fsign-val" for h in seen_headers)
+    it_hdrs = [h for u, h in seen_headers if "400.flashscore.ninja" in u]
+    en_hdrs = [h for u, h in seen_headers if "2.flashscore.ninja" in u]
+    assert it_hdrs and all(h.get("origin") == "https://www.diretta.it" for h in it_hdrs)
+    assert it_hdrs and all(h.get("referer") == "https://www.diretta.it/" for h in it_hdrs)
+    assert en_hdrs and all(h.get("origin") == "https://www.flashscore.com" for h in en_hdrs)
+    assert en_hdrs and all(h.get("referer") == "https://www.flashscore.com/" for h in en_hdrs)
+    assert all(h.get("x-fsign") == "test-fsign-val" for _, h in seen_headers)
 
     by_id = {m.id: m for m in matches}
     # Serie D minor league without broadcasters rejected; Serie A, ATP, F1 admitted.
@@ -161,10 +165,11 @@ async def test_diretta_f1_dedup_dual_feed_and_tennis_cities() -> None:
 
     fb = by_id["diretta-fb001"]
     assert fb.silo == SportSilo.CALCIO_ITA
-    assert fb.category == "ss_calcio_ita"
+    assert fb.category == "calcio_italiano"
     assert fb.alt_home == "Inter Milan"
     assert fb.alt_away == "AC Milan"
     assert fb.alt_league == "Serie A"
+    assert fb.alt_title == "Inter Milan vs AC Milan"
     assert fb.broadcasters == ["DAZN"]
     assert fb.end_date - fb.date == SPORT_IDS[1].duration_minutes * 60 * 1000
 
@@ -219,6 +224,9 @@ def test_non_live_or_studio_and_out_of_calendar_tennis_filters() -> None:
     assert is_non_live_or_studio("Sky Calcio Club")
     assert is_non_live_or_studio("F1 GP Italia - Highlights")
     assert is_non_live_or_studio("MotoGP - On Board")
+    assert is_non_live_or_studio("Ep. 14", "La trasmissione dedicata ai gol della Serie A")
+    assert is_non_live_or_studio("Nessun evento in onda")
+    assert not is_non_live_or_studio("Diretta Gol Serie A")
     assert is_non_live_or_studio("Partita", "Sintesi e azioni salienti in replica")
     assert not is_non_live_or_studio("Serie A: Inter - Juventus", "Telecronaca diretta")
 

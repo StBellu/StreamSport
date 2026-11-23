@@ -9,7 +9,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Optional, Sequence
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import Settings, get_settings
@@ -88,10 +88,15 @@ _CHANNEL_ALIASES: dict[str, str] = {
     "dazn2": "dazn 2",
     "dazn3": "dazn 3",
     "dazn4": "dazn 4",
+    "sport 24": "sky sport 24",
+    "sport uno": "sky sport uno",
+    "sport arena": "sky sport arena",
+    "sport max": "sky sport max",
+    "sport tennis": "sky sport tennis",
+    "sport calcio": "sky sport calcio",
 }
 
 _PROXY_HOST_DEFAULTS: dict[str, str] = {
-    "spon": "sportsonline",
     "daddylive": "dlstreams",
     "streamfree": "streamfree",
     "fctv33": "fctv33",
@@ -242,11 +247,12 @@ def _live_window_ms(silo: SportSilo) -> int:
     return minutes * 60 * 1000
 
 
-def _build_easyproxy_headers_qs(headers: dict[str, str]) -> str:
+def _build_easyproxy_headers_qs(headers: dict[str, str], *, quote_plus_vals: bool = False) -> str:
     parts: list[str] = []
+    encoder = quote_plus if quote_plus_vals else (lambda v: quote(v, safe=""))
     for key, val in (headers or {}).items():
         if key and val:
-            parts.append(f"&h_{quote(key, safe='')}={quote(val, safe='')}")
+            parts.append(f"&h_{quote(key, safe='')}={encoder(val)}")
     return "".join(parts)
 
 
@@ -612,25 +618,40 @@ class StreamOrchestrator:
                 missing_easyproxy = True
                 continue
 
-            proxy_host = src.proxy_host or _PROXY_HOST_DEFAULTS.get(provider, "")
-            hdr_qs = _build_easyproxy_headers_qs(src.headers)
-            if proxy_host in ("hls", "mpd"):
-                stream_url = (
-                    f"{ep_url}/proxy/{proxy_host}/manifest.m3u8"
-                    f"?d={quote(src.url, safe='')}{pass_qs}{hdr_qs}"
-                )
-            elif proxy_host:
-                stream_url = (
-                    f"{ep_url}/extractor/video.m3u8"
-                    f"?host={quote(proxy_host, safe='')}"
-                    f"&d={quote(src.url, safe='')}"
-                    f"&redirect_stream=true{pass_qs}{hdr_qs}"
-                )
-            else:
+            if provider == "spon":
+                hdr_qs = _build_easyproxy_headers_qs(src.headers, quote_plus_vals=True)
                 stream_url = (
                     f"{ep_url}/proxy/manifest.m3u8"
-                    f"?url={quote(src.url, safe='')}{pass_qs}{hdr_qs}"
+                    f"?url={quote_plus(src.url)}{pass_qs}{hdr_qs}"
                 )
+            elif provider == "streamfree" and not src.proxy_host:
+                hdr_qs = _build_easyproxy_headers_qs(src.headers, quote_plus_vals=True)
+                stream_url = (
+                    f"{ep_url}/proxy/manifest.m3u8"
+                    f"?url={quote_plus(src.url)}{hdr_qs}{pass_qs}"
+                )
+            else:
+                proxy_host = src.proxy_host or _PROXY_HOST_DEFAULTS.get(provider, "")
+                if proxy_host in ("hls", "mpd"):
+                    hdr_qs = _build_easyproxy_headers_qs(src.headers)
+                    stream_url = (
+                        f"{ep_url}/proxy/{proxy_host}/manifest.m3u8"
+                        f"?d={quote(src.url, safe='')}{pass_qs}{hdr_qs}"
+                    )
+                elif proxy_host:
+                    hdr_qs = _build_easyproxy_headers_qs(src.headers)
+                    stream_url = (
+                        f"{ep_url}/extractor/video.m3u8"
+                        f"?host={quote(proxy_host, safe='')}"
+                        f"&d={quote(src.url, safe='')}"
+                        f"&redirect_stream=true{pass_qs}{hdr_qs}"
+                    )
+                else:
+                    hdr_qs = _build_easyproxy_headers_qs(src.headers, quote_plus_vals=True)
+                    stream_url = (
+                        f"{ep_url}/proxy/manifest.m3u8"
+                        f"?url={quote_plus(src.url)}{pass_qs}{hdr_qs}"
+                    )
 
             items.append(
                 StreamItem(
@@ -651,3 +672,114 @@ class StreamOrchestrator:
 
         items.extend(acestream_items)
         return items
+
+    async def build_stremio_streams_async(
+        self,
+        match: Match,
+        user_cfg: UserConfig,
+        base_url: str,
+        *,
+        config_segment: str = "",
+        now_ms: Optional[int] = None,
+    ) -> list[StreamItem]:
+        """Resolve dynamic StreamFree `_0x` endpoints on-demand before formatting streams."""
+        current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        window_ms = _live_window_ms(match.silo)
+        if match.date > 0 and current_ms > match.date + window_ms:
+            return []
+
+        ep_url = (user_cfg.ep_url or "").strip().rstrip("/")
+        sf_service: Optional[StreamFreeService] = next(
+            (p for p in self._providers if isinstance(p, StreamFreeService)),
+            None,
+        )
+        is_pre_match = match.date > 0 and current_ms < (match.date - PRE_MATCH_WINDOW_MS)
+
+        if not ep_url or sf_service is None or is_pre_match:
+            return self.build_stremio_streams(
+                match,
+                user_cfg,
+                base_url,
+                config_segment=config_segment,
+                now_ms=current_ms,
+            )
+
+        sf_indices = [
+            idx
+            for idx, src in enumerate(match.sources)
+            if (src.provider or "").strip().lower() == "streamfree"
+            and ".m3u8" not in src.url.lower()
+            and (src.raw_url or "/player/" in src.url)
+        ]
+        if not sf_indices:
+            return self.build_stremio_streams(
+                match,
+                user_cfg,
+                base_url,
+                config_segment=config_segment,
+                now_ms=current_ms,
+            )
+
+        async def _resolve_one(src: StreamSource) -> list[dict[str, str]]:
+            raw_key = (src.raw_url or "").strip()
+            category = (src.channel_name or "soccer").strip().lower()
+            parsed = urlsplit(src.url)
+            domain = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else None
+            if not raw_key and "/player/" in (parsed.path or ""):
+                parts = [p for p in parsed.path.split("/") if p]
+                if len(parts) >= 3:
+                    category, raw_key = parts[1], parts[2]
+            if not raw_key:
+                return []
+            return await sf_service.resolve_stream_url(raw_key, category, domain=domain)
+
+        resolved_batches = await asyncio.gather(
+            *(_resolve_one(match.sources[idx]) for idx in sf_indices),
+            return_exceptions=True,
+        )
+
+        new_sources: list[StreamSource] = []
+        idx_map = dict(zip(sf_indices, resolved_batches))
+        for idx, src in enumerate(match.sources):
+            outcome = idx_map.get(idx)
+            if isinstance(outcome, list) and outcome:
+                seen_urls: set[str] = set()
+                added = 0
+                for entry in outcome:
+                    m3u8_url = (entry.get("m3u8_url") or "").strip()
+                    if not m3u8_url or m3u8_url in seen_urls:
+                        continue
+                    seen_urls.add(m3u8_url)
+                    qual = (entry.get("quality") or src.quality or "FHD").strip()
+                    new_sources.append(
+                        StreamSource(
+                            provider="streamfree",
+                            title=f"[StreamFree] {qual}",
+                            url=m3u8_url,
+                            quality=qual,
+                            language=src.language,
+                            priority=src.priority,
+                            requires_proxy=True,
+                            proxy_host="",
+                            headers={
+                                "referer": entry.get("embed_url", src.url),
+                                "origin": entry.get("origin", ""),
+                            },
+                            channel_name=src.channel_name,
+                            raw_url=src.raw_url,
+                        )
+                    )
+                    added += 1
+                    if added >= 3:
+                        break
+            else:
+                new_sources.append(src)
+
+        resolved_match = match.model_copy(update={"sources": new_sources})
+        return self.build_stremio_streams(
+            resolved_match,
+            user_cfg,
+            base_url,
+            config_segment=config_segment,
+            now_ms=current_ms,
+        )
