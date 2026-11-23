@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import OrderedDict
+import ipaddress
 import json
 import logging
 import re
@@ -11,15 +13,20 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
-from urllib.parse import parse_qs, quote, urljoin, urlparse
+from typing import Any, Callable, Optional
+from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit
 
 import httpx
 
 from app.config import Settings
-from app.core.network import create_standard_client
+from app.core.network import create_standard_client, is_safe_public_ip
 from app.models.domain import StreamSource
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult
+from app.taxonomy.channels import (
+    TVVOO_COUNTRY_GROUPS,
+    canonicalize_channel_name,
+    server_tag_rank,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,24 +115,99 @@ _STALE_FALLBACK_SECONDS = 10.0
 _IDLE_TTL_SECONDS = 45 * 60.0
 _MAX_MANIFEST_BYTES = 2 * 1024 * 1024  # 2 MiB guard: text playlists only
 
+_ALLOWED_PLAY_HOST_PREFIXES: tuple[str, ...] = (
+    "geil.",
+    "vavoo.",
+    "vypn.",
+    "voltop.",
+    "huhu.",
+    "oha.",
+    "kool.",
+)
+_ALLOWED_PLAY_PATH_PREFIXES: tuple[str, ...] = (
+    "/play",
+    "/live/play",
+    "/live2/play3",
+    "/vavoo-iptv/play",
+)
+_BLOCKED_HOSTNAMES: frozenset[str] = frozenset({
+    "localhost",
+    "0.0.0.0",
+    "metadata.google.internal",
+})
+_BLOCKED_HOST_SUFFIXES: tuple[str, ...] = (
+    ".localhost",
+    ".local",
+    ".internal",
+    ".lan",
+)
 
-def normalize_channel_name(name: str) -> str:
-    """Normalize a Vavoo/TV channel title to a canonical lookup key."""
-    if not name:
-        return ""
-    cleaned = name.strip()
-    cleaned = _COUNTRY_PREFIX_RE.sub("", cleaned)
 
-    # Iteratively strip trailing dot-codes (.c, .s, .b) and parenthesized tags ((1), (HD), [FHD])
-    prev = None
-    while prev != cleaned:
-        prev = cleaned
-        cleaned = _TRAILING_DOT_TAG_RE.sub("", cleaned).strip()
-        cleaned = _TRAILING_PAREN_TAG_RE.sub("", cleaned).strip()
+def is_safe_vavoo_play_url(url: str) -> bool:
+    """Validate that a play URL is an authorized Vavoo/Geil stream endpoint (anti-SSRF)."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlsplit(url.strip())
+    except Exception:
+        return False
 
-    cleaned = _QUALITY_TOKEN_RE.sub(" ", cleaned)
-    cleaned = _MULTI_SPACE_RE.sub(" ", cleaned).strip().lower()
-    return cleaned
+    if (parsed.scheme or "").lower() not in ("http", "https"):
+        return False
+
+    hostname = (parsed.hostname or "").lower().strip().strip("[]")
+    if not hostname:
+        return False
+    if hostname in _BLOCKED_HOSTNAMES or hostname.endswith(_BLOCKED_HOST_SUFFIXES):
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+        if not is_safe_public_ip(hostname):
+            return False
+        # IP literals are not in the authorized Vavoo/Geil host allowlist
+        return False
+    except ValueError:
+        pass
+
+    is_allowed_host = any(
+        hostname.startswith(prefix) or f".{prefix}" in hostname
+        for prefix in _ALLOWED_PLAY_HOST_PREFIXES
+    )
+    if not is_allowed_host:
+        return False
+
+    path = parsed.path or ""
+    return any(path.startswith(prefix) for prefix in _ALLOWED_PLAY_PATH_PREFIXES)
+
+
+def is_safe_stream_target(url: str) -> bool:
+    """Validate that an upstream CDN stream URL does not target private/internal networks."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlsplit(url.strip())
+    except Exception:
+        return False
+
+    if (parsed.scheme or "").lower() not in ("http", "https"):
+        return False
+
+    hostname = (parsed.hostname or "").lower().strip().strip("[]")
+    if not hostname:
+        return False
+    if hostname in _BLOCKED_HOSTNAMES or hostname.endswith(_BLOCKED_HOST_SUFFIXES):
+        return False
+
+    try:
+        ipaddress.ip_address(hostname)
+        return is_safe_public_ip(hostname)
+    except ValueError:
+        return True
+
+
+def normalize_channel_name(name: str, country: Optional[str] = None) -> str:
+    """Normalize a Vavoo/TV channel title via shared canonical taxonomy."""
+    return canonicalize_channel_name(name, country=country)
 
 
 def _detect_quality(raw_name: str, is_italian: bool) -> str:
@@ -281,6 +363,8 @@ class _LiveStreamSession:
 class LiveManifestManager:
     """Thread-safe / asyncio single-flight HLS manifest manager with zero video bandwidth."""
 
+    MAX_SESSIONS: int = 1000
+
     def __init__(
         self,
         *,
@@ -294,6 +378,8 @@ class LiveManifestManager:
         idle_ttl_seconds: float = _IDLE_TTL_SECONDS,
         proactive_refresh_seconds: float = _PROACTIVE_REFRESH_SECONDS,
         throttle_seconds: float = _THROTTLE_SECONDS,
+        max_sessions: int = MAX_SESSIONS,
+        sibling_lookup: Optional[Callable[[str], list[str]]] = None,
     ) -> None:
         self._external_client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
@@ -306,13 +392,19 @@ class LiveManifestManager:
         self._idle_ttl_seconds = idle_ttl_seconds
         self._proactive_refresh_seconds = proactive_refresh_seconds
         self._throttle_seconds = throttle_seconds
+        self._max_sessions = max(1, max_sessions)
+        self._sibling_lookup = sibling_lookup
 
         self._thread_lock = threading.RLock()
-        self._sessions: dict[tuple[str, str], _LiveStreamSession] = {}
+        self._sessions: OrderedDict[tuple[str, str], _LiveStreamSession] = OrderedDict()
         self._inflight: dict[tuple[str, str], asyncio.Task[_LiveStreamSession]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._mirror_index = 0
         self._last_cleanup_at = time.time()
+
+    def set_sibling_lookup(self, lookup: Optional[Callable[[str], list[str]]]) -> None:
+        """Register a callback returning sibling play URLs for failover."""
+        self._sibling_lookup = lookup
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._external_client is not None:
@@ -500,13 +592,16 @@ class LiveManifestManager:
         client_ip: Optional[str] = None,
     ) -> tuple[str, float]:
         """Resolve a Vavoo play URL via Geil first, then v2 / MediaHubMX fallback."""
+        if not is_safe_vavoo_play_url(play_url):
+            raise ValueError(f"Unsafe or unauthorized Vavoo play URL rejected: {play_url}")
+
         resolved_geil = await self._resolve_via_geil(play_url)
-        if resolved_geil:
+        if resolved_geil and is_safe_stream_target(resolved_geil):
             return resolved_geil, time.time() + _DEFAULT_VALID_SECONDS
 
         if _V2_LINK_RE.search(play_url):
             resolved_v2 = await self._resolve_via_v2(play_url)
-            if resolved_v2:
+            if resolved_v2 and is_safe_stream_target(resolved_v2):
                 return resolved_v2, time.time() + _DEFAULT_VALID_SECONDS
 
         canonical_url = _normalize_mediahubmx_play_url(play_url)
@@ -553,7 +648,11 @@ class LiveManifestManager:
                     continue
                 resolved = _extract_resolved_url(resp.json())
                 if resolved:
+                    if not is_safe_stream_target(resolved):
+                        raise ValueError(f"Unsafe resolved stream target rejected: {resolved}")
                     return resolved, valid_until
+            except ValueError:
+                raise
             except Exception as exc:
                 logger.warning("TvVoo resolve failed on %s: %s", base, exc)
 
@@ -583,6 +682,9 @@ class LiveManifestManager:
                     last_manifest_at=prev.last_manifest_at if prev else 0.0,
                 )
                 self._sessions[key] = session
+                self._sessions.move_to_end(key)
+                while len(self._sessions) > self._max_sessions:
+                    self._sessions.popitem(last=False)
                 return session
         finally:
             with self._thread_lock:
@@ -617,6 +719,8 @@ class LiveManifestManager:
             return task, True
 
     async def _fetch_playlist_text(self, stream_url: str) -> str:
+        if not is_safe_stream_target(stream_url):
+            raise ValueError(f"Unsafe upstream stream target rejected: {stream_url}")
         client = self._get_client()
         resp = await client.get(
             stream_url,
@@ -639,7 +743,35 @@ class LiveManifestManager:
     ) -> Optional[_LiveStreamSession]:
         """Return the cached session object for inspection/testing."""
         with self._thread_lock:
-            return self._sessions.get(self._session_key(play_url, client_ip))
+            key = self._session_key(play_url, client_ip)
+            session = self._sessions.get(key)
+            if session is not None:
+                self._sessions.move_to_end(key)
+            return session
+
+    async def _try_sibling_failover(
+        self,
+        play_url: str,
+        client_ip: Optional[str],
+        session: _LiveStreamSession,
+    ) -> Optional[str]:
+        if self._sibling_lookup is None:
+            return None
+        for sib_url in self._sibling_lookup(play_url):
+            if not sib_url or sib_url == play_url or not is_safe_vavoo_play_url(sib_url):
+                continue
+            try:
+                sib_stream_url, sib_valid_until = await self.resolve_play_url(sib_url, client_ip)
+                raw_m3u8 = await self._fetch_playlist_text(sib_stream_url)
+                sib_base = sib_stream_url.rsplit("/", 1)[0] + "/" if "/" in sib_stream_url else sib_stream_url
+                with self._thread_lock:
+                    session.stream_url = sib_stream_url
+                    session.base_url = sib_base
+                    session.valid_until = sib_valid_until
+                return raw_m3u8
+            except Exception as exc:
+                logger.debug("LiveManifest sibling failover failed for %s: %s", sib_url, exc)
+        return None
 
     async def get_live_manifest(
         self,
@@ -647,12 +779,17 @@ class LiveManifestManager:
         client_ip: Optional[str] = None,
     ) -> str:
         """Fetch, rewrite relative URIs to CDN URLs, and cache an HLS playlist (0% video bandwidth)."""
+        if not is_safe_vavoo_play_url(play_url):
+            raise ValueError(f"Unsafe or unauthorized Vavoo play URL rejected: {play_url}")
+
         now = time.time()
         with self._thread_lock:
             if (now - self._last_cleanup_at) > 600.0:
                 self.cleanup_idle_sessions(now)
             key = self._session_key(play_url, client_ip)
             session = self._sessions.get(key)
+            if session is not None:
+                self._sessions.move_to_end(key)
 
         if session is None or session.valid_until <= now:
             task, _ = self._get_or_start_refresh(key, play_url, client_ip)
@@ -684,7 +821,13 @@ class LiveManifestManager:
 
             task, _ = self._get_or_start_refresh(key, play_url, client_ip)
             session = await task
-            raw_m3u8 = await self._fetch_playlist_text(session.stream_url)
+            try:
+                raw_m3u8 = await self._fetch_playlist_text(session.stream_url)
+            except Exception:
+                sib_m3u8 = await self._try_sibling_failover(play_url, client_ip, session)
+                if sib_m3u8 is None:
+                    raise
+                raw_m3u8 = sib_m3u8
 
         rewritten = rewrite_hls_manifest(raw_m3u8, session.base_url)
         now_done = time.time()
@@ -740,6 +883,11 @@ class TvVooService(BaseStreamProvider):
         self._owned_client: Optional[httpx.AsyncClient] = None
         self.live_manifest_manager = live_manifest_manager or LiveManifestManager(client=client)
         self._m3u_fallback_path = m3u_fallback_path
+        self._siblings_by_url: dict[str, list[str]] = {}
+        self.live_manifest_manager.set_sibling_lookup(self._lookup_siblings)
+
+    def _lookup_siblings(self, play_url: str) -> list[str]:
+        return list(self._siblings_by_url.get(play_url, ()))
 
     @property
     def enabled(self) -> bool:
@@ -757,6 +905,63 @@ class TvVooService(BaseStreamProvider):
         if self._owned_client is not None and not self._owned_client.is_closed:
             await self._owned_client.aclose()
             self._owned_client = None
+
+    async def _fetch_geil_catalog(self) -> dict[str, list[dict[str, Any]]]:
+        """Try fast tokenless Geil catalog (`/live/catalog/live/channels.json`) paginated via `nextCursor`."""
+        client = self._get_client()
+        headers = {
+            "User-Agent": VAVOO_RESOLVE_UA,
+            "Accept": "application/json",
+        }
+        tag_to_group: dict[str, str] = {}
+        for grp in VAVOO_GROUPS:
+            for alias in _GROUP_ALIASES.get(grp, (grp,)):
+                tag_to_group[alias.lower()] = grp
+        for grp in TVVOO_COUNTRY_GROUPS:
+            tag_to_group.setdefault(grp.lower(), grp)
+
+        for base in GEIL_MIRROR_BASES:
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            cursor: Any = None
+            failed = False
+            for _ in range(40):
+                params = {"cursor": str(cursor)} if cursor else None
+                try:
+                    resp = await client.get(
+                        f"{base}/live/catalog/live/channels.json",
+                        params=params,
+                        headers=headers,
+                        timeout=12.0,
+                    )
+                    if resp.status_code != 200:
+                        failed = True
+                        break
+                    payload = resp.json()
+                    page_items = payload.get("items") or []
+                    if not isinstance(page_items, list) or not page_items:
+                        break
+                    for item in page_items:
+                        if not isinstance(item, dict):
+                            continue
+                        raw_tags = item.get("tags") or []
+                        matched_group: Optional[str] = None
+                        for tag in raw_tags:
+                            grp = tag_to_group.get(str(tag).strip().lower())
+                            if grp is not None:
+                                matched_group = grp
+                                break
+                        if matched_group is not None:
+                            grouped.setdefault(matched_group, []).append(item)
+                    cursor = payload.get("nextCursor")
+                    if not cursor:
+                        break
+                except Exception as exc:
+                    logger.debug("TvVoo Geil catalog failed on %s: %s", base, exc)
+                    failed = True
+                    break
+            if not failed and grouped:
+                return grouped
+        return {}
 
     async def _fetch_catalog_group(self, group: str, sig: str) -> list[dict[str, Any]]:
         client = self._get_client()
@@ -847,7 +1052,8 @@ class TvVooService(BaseStreamProvider):
         play_url: str,
         group: str,
     ) -> Optional[tuple[str, StreamSource]]:
-        canonical = normalize_channel_name(raw_name)
+        country_arg = group if group in TVVOO_COUNTRY_GROUPS else None
+        canonical = normalize_channel_name(raw_name, country=country_arg)
         if not canonical or not play_url:
             return None
 
@@ -872,12 +1078,17 @@ class TvVooService(BaseStreamProvider):
         return canonical, source
 
     async def harvest(self) -> ProviderHarvestResult:
-        """Harvest linear channels across configured Vavoo groups with live2 & M3U fallbacks."""
+        """Harvest linear channels Geil-first, then ping+MediaHubMX, live2 & M3U fallbacks."""
         linear_channels: dict[str, list[StreamSource]] = {}
+        ranked_entries: dict[str, list[tuple[int, StreamSource]]] = {}
         seen_raw_urls: set[tuple[str, str]] = set()
         raw_count = 0
 
-        sig = await self.live_manifest_manager.fetch_addon_sig()
+        geil_grouped = await self._fetch_geil_catalog()
+        sig: Optional[str] = None
+        if not geil_grouped:
+            sig = await self.live_manifest_manager.fetch_addon_sig()
+
         live2_cache: Optional[list[dict[str, Any]]] = None
 
         async def _get_live2() -> list[dict[str, Any]]:
@@ -887,8 +1098,8 @@ class TvVooService(BaseStreamProvider):
             return live2_cache
 
         for group in VAVOO_GROUPS:
-            group_items: list[dict[str, Any]] = []
-            if sig:
+            group_items: list[dict[str, Any]] = geil_grouped.get(group, []) if geil_grouped else []
+            if not group_items and sig:
                 group_items = await self._fetch_catalog_group(group, sig)
 
             if not group_items:
@@ -926,10 +1137,19 @@ class TvVooService(BaseStreamProvider):
                 if dedup_key in seen_raw_urls:
                     continue
                 seen_raw_urls.add(dedup_key)
-                linear_channels.setdefault(canonical, []).append(source)
+                tag_rank = server_tag_rank(raw_name)
+                ranked_entries.setdefault(canonical, []).append((tag_rank, source))
 
-        for sources in linear_channels.values():
-            sources.sort(key=lambda s: (s.priority, 0 if s.language == "ITA" else 1))
+        new_siblings: dict[str, list[str]] = {}
+        for canonical, entries in ranked_entries.items():
+            entries.sort(key=lambda pair: (pair[1].priority, 0 if pair[1].language == "ITA" else 1, pair[0]))
+            sorted_sources = [pair[1] for pair in entries]
+            linear_channels[canonical] = sorted_sources
+            sib_urls = [s.raw_url for s in sorted_sources if s.raw_url]
+            if len(sib_urls) > 1:
+                for u in sib_urls:
+                    new_siblings[u] = [other for other in sib_urls if other != u]
+        self._siblings_by_url = new_siblings
 
         return ProviderHarvestResult(
             provider=self.name,

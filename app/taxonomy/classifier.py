@@ -237,15 +237,227 @@ NUVIO_CATALOG_LOOKUP: dict[str, tuple[str, str]] = {
     for genre in cat.genres
 }
 
-# Level 0 Simulcast patterns
-_REDZONE_RE = re.compile(r"\b(?:nfl\s+)?red\s*zone\b", re.IGNORECASE)
-_DIRETTA_GOL_RE = re.compile(r"\b(?:diretta\s+gol|zona\s+dazn|zona\s+gol)\b", re.IGNORECASE)
+# Level 0 Simulcast patterns (13 families)
+_SIMULCAST_RE = re.compile(
+    r"\b(?:red\s*zone|redzone|golazo(?:\s*show)?|simulcast|diretta\s*gol|direttagol|"
+    r"zona\s*gol|zona\s*serie\s*[ab]|zona\s*dazn|zona\s*europa|konferenz|"
+    r"multifoot|multiplex|multiliga|multichampions|multipremier|multigoal|"
+    r"multicampo|diretta\s*campo|goal\s*rush|diretta\s*basket|diretta\s*eurolega|"
+    r"diretta\s*tennis|early\s*rounds|tennis\s*channel|whip\s*around)\b",
+    re.IGNORECASE,
+)
+_VS_SEP_RE = re.compile(r"\s+(?:vs\.?|v\.?)\s+", re.IGNORECASE)
+_TENNIS_MULTI_RE = re.compile(r"\b(?:atp|wta)\b", re.IGNORECASE)
 _EURO_COMP_HINT_RE = re.compile(
     r"\b(?:champions\s+league|europa\s+league|conference\s+league|premier\s+league|la\s*liga|bundesliga|ligue\s*1)\b",
     re.IGNORECASE,
 )
-_MULTICAMPO_RE = re.compile(r"\b(?:multicampo|diretta\s+campo|simulcast)\b", re.IGNORECASE)
 _TENNIS_HINT_RE = re.compile(r"\b(?:tennis|atp|wta|slam|wimbledon|roland\s+garros|us\s+open|australian\s+open)\b", re.IGNORECASE)
+
+# Silo resolution regexes (used by resolve_sport_silo fallback)
+_WINTER_ATHLETICS_GUARD_RE = re.compile(
+    r"\b(?:pattinaggio|skating|sci|ski|curling|biathlon|atletica|athletics|nuoto|swimming)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_MOTOR_SERIES_RE = re.compile(
+    r"\b(?:f[123e]|formula\s*(?:1|2|3|e|one)|motogp|moto\s*gp|moto[23e]|superbike|wsbk|worldsbk|rally|wrc|nascar|indycar|wec|dtm|imsa)\b",
+    re.IGNORECASE,
+)
+_SILO_MOTORSPORT_RE = re.compile(
+    r"\b(?:formula\s*[123e]|f[123e]|formula\s*one|motogp|moto\s*gp|moto\s*[23e]|"
+    r"motomondiale|motociclismo|automobilismo|superbike|wsbk|worldsbk|wec|"
+    r"world\s*endurance|le\s*mans|imsa|dtm|supercars|nascar|indycar|indy\s*500|"
+    r"rally|wrc|dakar|erc|mxgp|motocross|supercross|gp|gran\s*premio)\b",
+    re.IGNORECASE,
+)
+_SILO_TENNIS_RE = re.compile(
+    r"\b(?:atp|wta|bjk|davis\s*cup|(?<!afc\s)wimbledon|us\s*open|roland\s*garros|australian\s*open|french\s*open)\b",
+    re.IGNORECASE,
+)
+_SILO_BASKET_RE = re.compile(r"\b(?:nba|wnba|euroleague|eurolega|eurocup|lba|nbl|fiba|cba|acb|bbl)\b", re.IGNORECASE)
+_SILO_COMBAT_RE = re.compile(r"\b(?:ufc|wwe|aew|bellator|boxing|boxe|mma|pfl|one\s*championship)\b", re.IGNORECASE)
+_SILO_HOCKEY_RE = re.compile(r"\b(?:nhl|khl|shl|liiga|extraliga|ice\s*hockey)\b", re.IGNORECASE)
+_SILO_NFL_RE = re.compile(r"\b(?:nfl|cfl|ufl|cfb|college\s*football|american\s*football|super\s*bowl)\b", re.IGNORECASE)
+_SILO_BASEBALL_RE = re.compile(r"\b(?:baseball|mlb|npb|kbo|lmb)\b", re.IGNORECASE)
+_SILO_VOLLEY_RE = re.compile(r"\b(?:volleyball|volley|pallavolo|superlega|plusliga)\b", re.IGNORECASE)
+_SILO_RUGBY_RE = re.compile(r"\b(?:rugby|six\s*nations|sei\s*nazioni|urc|top\s*14|super\s*rugby|afl|aflw)\b", re.IGNORECASE)
+_SILO_HANDBALL_RE = re.compile(r"\b(?:handball|pallamano|ehf|ihf)\b", re.IGNORECASE)
+_SILO_FOOTBALL_CUE_RE = re.compile(
+    r"\b(?:fc|cf|calcio|football|soccer|serie\s*[abc]|premier\s*league|la\s*liga|bundesliga|ligue\s*[12]|"
+    r"champions\s*league|europa\s*league|conference\s*league|copa|coppa|primavera|u23|next\s*gen|futuro)\b",
+    re.IGNORECASE,
+)
+_OTHER_SPORTS_EXCLUSION_RE = re.compile(
+    r"\b(?:snooker|padel|golf|pga|lpga|darts|freccette|pdc|rugby|afl|cricket|ciclismo|cycling|handball|pallamano)\b",
+    re.IGNORECASE,
+)
+
+
+def resolve_sport_silo(sport_hint: str = "", league: str = "", title: str = "") -> str:
+    """Infer canonical internal sport silo from an explicit hint, league, or event title."""
+    hint = (sport_hint or "").strip().lower()
+    hint_map = {
+        "calcio_ita": "calcio_ita",
+        "calcio_italiano": "calcio_ita",
+        "football": "football",
+        "soccer": "football",
+        "calcio": "football",
+        "tennis": "tennis",
+        "motori": "motori",
+        "motor-sports": "motori",
+        "motorsport": "motori",
+        "motorsports": "motori",
+        "basket": "basket",
+        "basketball": "basket",
+        "volley": "volley",
+        "volleyball": "volley",
+        "nfl": "nfl",
+        "american-football": "nfl",
+        "american_football": "nfl",
+        "baseball": "baseball",
+        "hockey": "hockey",
+        "ice-hockey": "hockey",
+        "combat": "combat",
+        "fight": "combat",
+        "combattimento": "combat",
+        "rugby": "rugby",
+        "handball": "handball",
+        "pallamano": "handball",
+    }
+    if hint in hint_map:
+        return hint_map[hint]
+
+    eval_text = f"{league} {title}".strip().lower()
+    if not eval_text:
+        return "altri_sport"
+
+    if _WINTER_ATHLETICS_GUARD_RE.search(eval_text) and not _EXPLICIT_MOTOR_SERIES_RE.search(eval_text):
+        return "altri_sport"
+
+    if _SILO_MOTORSPORT_RE.search(eval_text):
+        return "motori"
+    if _SILO_TENNIS_RE.search(eval_text):
+        return "tennis"
+    if _SILO_BASKET_RE.search(eval_text):
+        return "basket"
+    if _SILO_COMBAT_RE.search(eval_text):
+        return "combat"
+    if _SILO_HOCKEY_RE.search(eval_text) or (
+        re.search(r"\bdel\b", eval_text) and any(k in eval_text for k in ("hockey", "eishockey"))
+    ):
+        return "hockey"
+    if _SILO_NFL_RE.search(eval_text):
+        return "nfl"
+    if _SILO_BASEBALL_RE.search(eval_text):
+        return "baseball"
+    if _SILO_VOLLEY_RE.search(eval_text):
+        return "volley"
+    if _SILO_RUGBY_RE.search(eval_text):
+        return "rugby"
+    if _SILO_HANDBALL_RE.search(eval_text):
+        return "handball"
+
+    if _SILO_FOOTBALL_CUE_RE.search(eval_text) and not _OTHER_SPORTS_EXCLUSION_RE.search(eval_text):
+        return "football"
+
+    return "altri_sport"
+
+
+def _resolve_simulcast(
+    combined_text: str,
+    silo_norm: str,
+    is_women: bool | None,
+) -> tuple[str, list[str]] | None:
+    """Resolve all 13 simulcast / multi-court broadcast families."""
+    is_tennis_multi = (
+        bool(_TENNIS_MULTI_RE.search(combined_text))
+        and bool(re.search(r"[&+,]", combined_text))
+        and not bool(_VS_SEP_RE.search(combined_text))
+    )
+    if not _SIMULCAST_RE.search(combined_text) and not is_tennis_multi:
+        return None
+
+    t = combined_text.lower().replace("-", " ").replace("_", " ")
+
+    # 1. NFL RedZone
+    if re.search(r"\b(?:nfl\s+)?red\s*zone\b|\bredzone\b", t):
+        return "football_americano", ["NFL"]
+
+    # 2. Golazo Show
+    if "golazo" in t:
+        if any(k in t for k in ("europa", "conference", "uel", "uecl")):
+            return "calcio_estero", ["Europa e Conference League"]
+        return "calcio_estero", ["Champions League"]
+
+    # 3. Serie A / Zona Serie A
+    if re.search(r"\b(?:zona\s*)?serie\s*a\b", t):
+        return "calcio_italiano", ["Serie A"]
+
+    # 4. Serie B / Zona Serie B
+    if re.search(r"\b(?:zona\s*)?serie\s*b\b", t):
+        return "calcio_italiano", ["Serie B"]
+
+    # 5. Champions League / MultiChampions
+    if re.search(r"\b(?:champions|ucl|multichampions)\b", t):
+        return "calcio_estero", ["Champions League"]
+
+    # 6. Europa / Conference League
+    if re.search(r"\b(?:europa|conference|uel|uecl)\b", t):
+        return "calcio_estero", ["Europa e Conference League"]
+
+    # 7. Premier League / Goal Rush / MultiPremier
+    if re.search(r"\b(?:premier|multipremier|goal\s*rush)\b", t):
+        return "calcio_estero", ["Premier League"]
+
+    # 8. Bundesliga Konferenz
+    if re.search(r"\b(?:bundesliga|konferenz)\b", t):
+        return "calcio_estero", ["Bundesliga e Ligue 1"]
+
+    # 9. LaLiga / MultiLiga
+    if re.search(r"\b(?:laliga|la\s*liga|multiliga)\b", t):
+        return "calcio_estero", ["La Liga"]
+
+    # 10. Ligue 1 / Multifoot / Multiplex
+    if re.search(r"\b(?:ligue\s*1|multifoot|multiplex)\b", t):
+        return "calcio_estero", ["Bundesliga e Ligue 1"]
+
+    # 11. Basket simulcast (NBA / NCAA / Eurolega / LBA)
+    if re.search(r"\b(?:basket|eurolega|euroleague|nba|ncaa)\b", t):
+        if "nba" in t:
+            return "basket", ["NBA"]
+        if "ncaa" in t or "college" in t:
+            return "basket", ["NCAA e College Basket"]
+        if "euro" in t:
+            return "basket", ["Eurolega ed Eurocup"]
+        return "basket", ["LBA Serie A"]
+
+    # 12. Tennis multi-court / early rounds / tennis channel
+    if (
+        silo_norm == "tennis"
+        or _TENNIS_HINT_RE.search(combined_text)
+        or re.search(r"\b(?:diretta\s*tennis|early\s*rounds|tennis\s*channel)\b", t)
+        or is_tennis_multi
+    ):
+        if any(k in t for k in ("wimbledon", "roland garros", "australian open", "us open")):
+            return "tennis", ["Grandi Slam"]
+        if "davis" in t or "bjk" in t or "billie jean" in t:
+            return "tennis", ["Coppa Davis e BJK Cup"]
+        has_atp = "atp" in t
+        has_wta = "wta" in t
+        if has_atp and has_wta:
+            return "tennis", ["Challenger e Altri"]
+        if has_wta or is_women is True:
+            return "tennis", ["WTA"]
+        return "tennis", ["ATP"]
+
+    # 13. Generic Diretta Gol / Zona Gol / Zona DAZN / Multicampo / Simulcast
+    if silo_norm == "calcio_ita" or any(k in t for k in ("italia", "serie", "dazn", "sky")):
+        return "calcio_italiano", ["Serie A"]
+    if _EURO_COMP_HINT_RE.search(combined_text):
+        return "calcio_estero", ["Champions League"]
+    if silo_norm == "football":
+        return "calcio_estero", ["Altri Campionati Europei"]
+    return "calcio_italiano", ["Serie A"]
 
 # Canonical slug -> (catalog_id, genres) quick map for Level 1 when pre-validated
 _CANONICAL_SLUG_ROUTING: dict[str, tuple[str, list[str]]] = {
@@ -496,28 +708,9 @@ class GenreClassifier:
         country_norm = normalize_country(country)
 
         # Level 0: Early Simulcast routing (must emit only valid CATALOG_DEFINITIONS genres)
-        if _REDZONE_RE.search(combined_text):
-            return "football_americano", ["NFL"]
-
-        if _DIRETTA_GOL_RE.search(combined_text):
-            if _EURO_COMP_HINT_RE.search(combined_text) or silo_norm == "football":
-                return "calcio_estero", ["Champions League"]
-            return "calcio_italiano", ["Serie A"]
-
-        if _MULTICAMPO_RE.search(combined_text):
-            if silo_norm == "tennis" or _TENNIS_HINT_RE.search(combined_text):
-                low = combined_text.lower()
-                if any(k in low for k in ("wimbledon", "roland garros", "australian open", "us open")):
-                    return "tennis", ["Grandi Slam"]
-                if "davis" in low or "bjk" in low or "billie jean" in low:
-                    return "tennis", ["Coppa Davis e BJK Cup"]
-                if "wta" in low or is_women is True:
-                    return "tennis", ["WTA"]
-                return "tennis", ["ATP"]
-            if silo_norm in ("calcio_ita", "football"):
-                if silo_norm == "calcio_ita":
-                    return "calcio_italiano", ["Serie A"]
-                return "calcio_estero", ["Altri Campionati Europei"]
+        simulcast_res = _resolve_simulcast(combined_text, silo_norm, is_women)
+        if simulcast_res is not None:
+            return simulcast_res
 
         # Level 1: Validated Canonical Competition routing
         if canonical_competition and canonical_competition in _CANONICAL_SLUG_ROUTING:
@@ -538,6 +731,9 @@ class GenreClassifier:
                     return mapped_cat, list(mapped_genres)
 
         # Level 2 & Level 3: Sport Silo resolution + Sport Sub-classifiers
+        if not silo_norm or silo_norm in ("other", "altri_sport", "altri-sport"):
+            silo_norm = resolve_sport_silo(silo_norm, competition, title)
+
         comp_women, comp_youth = detect_demographics(competition, country)
         eff_women = comp_women if is_women is None else is_women
         eff_youth = comp_youth if is_youth is None else is_youth
@@ -547,6 +743,9 @@ class GenreClassifier:
             if is_italian:
                 if eff_women:
                     return "calcio_italiano", ["Calcio Femminile"]
+                comb_low = combined_text.lower()
+                if any(k in comb_low for k in ("next gen", "milan futuro", "atalanta u23")):
+                    return "calcio_italiano", ["Serie C"]
                 if eff_youth:
                     return "calcio_italiano", ["Primavera e Giovanili"]
                 comp_low = competition.lower()
@@ -597,12 +796,18 @@ class GenreClassifier:
             return "basket", ["Campionati Esteri ed NBL"]
 
         if silo_norm == "motori":
-            comp_low = competition.lower()
-            if "formula 1" in comp_low or re.search(r"\bf1\b", comp_low) or "formula e" in comp_low:
+            eval_low = combined_text.lower()
+            if (
+                "formula 1" in eval_low
+                or "formula 2" in eval_low
+                or "formula 3" in eval_low
+                or "formula e" in eval_low
+                or re.search(r"\bf[123e]\b", eval_low)
+            ):
                 return "motori", ["Formula 1"]
-            if any(k in comp_low for k in ("motogp", "moto gp", "moto2", "moto3", "superbike", "wsbk")):
+            if any(k in eval_low for k in ("motogp", "moto gp", "moto2", "moto3", "superbike", "wsbk")):
                 return "motori", ["MotoGP e Superbike"]
-            if any(k in comp_low for k in ("wrc", "rally", "dakar", "erc")):
+            if any(k in eval_low for k in ("wrc", "rally", "dakar", "erc")):
                 return "motori", ["Rally e WRC"]
             return "motori", ["NASCAR e IndyCar"]
 

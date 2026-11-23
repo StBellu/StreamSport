@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     FLASHSCORE_FSIGN: str = "SW9D1eZo"
     DEFAULT_EP_URL: str = ""
     DEFAULT_EP_PASS: str = ""
+    PUBLIC_URL: str = ""
 
     # Provider endpoints & cache TTLs
     STREAMFREE_DIRECTORY_URL: str = "https://strmfree.link/api/domains"

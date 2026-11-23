@@ -600,7 +600,7 @@ async def test_stremio_and_nuvio_routes_ram_only_and_stream_formatting(tmp_path:
             assert any("host=vavoo" in u and "api_password=secret123" in u for u in urls)
             assert any("/proxy/mpd/manifest.m3u8" in u and "clearkey=abcd1234%3Aef567890" in u for u in urls)
             assert any("/proxy/manifest.m3u8?url=https%3A%2F%2Fspon.example%2Fhd7" in u for u in urls)
-            assert any("host=dlstreams" in u for u in urls)
+            assert any(f"/{cfg_token}/daddylive/stream/10.m3u8" in u for u in urls)
             assert any("/proxy/manifest.m3u8?url=https%3A%2F%2Fstreamfree.example%2Flive.m3u8" in u and "h_Referer=" in u and "h_Origin=" in u for u in urls)
             assert any("host=fctv33" in u and "4424653%3A969541" in u for u in urls)
 
@@ -857,3 +857,115 @@ async def test_all_enable_toggles_false(tmp_path: Path) -> None:
     await orchestrator.aclose()
     await tsdb.aclose()
     await tennis_svc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_evolved_taxonomy_graphics_routes_and_legacy_config(tmp_path: Path) -> None:
+    import base64
+    from starlette.requests import Request
+    from app.graphics.thesportsdb_service import _leagues_compatible, format_thumb_url
+    from app.graphics.tennis_poster import _extract_surname, _is_player_match, _resolve_country_iso2
+    from app.routers._utils import compute_base_url
+    from app.taxonomy import (
+        DEFAULT_TEAM_MATCHER,
+        canonicalize_channel_name,
+        classify_event,
+        detect_channel_flag,
+        normalize_team_name,
+        resolve_canonical_channel,
+        server_tag_rank,
+    )
+    from app.taxonomy.classifier import resolve_sport_silo
+    from app.taxonomy.matcher import _string_similarity
+
+    # 1. Channels taxonomy
+    assert resolve_canonical_channel("Arena Sport 1 HD") is None
+    assert resolve_canonical_channel("DAZN 1 CA") is None
+    assert canonicalize_channel_name("Sky Sport Uno FHD .c") == "sky sport uno"
+    assert server_tag_rank("SKY .c") < server_tag_rank("SKY .s") < server_tag_rank("SKY .b")
+    assert detect_channel_flag("Sky Sports Premier League UK") == "🇬🇧"
+    assert detect_channel_flag("Sky Sport Calcio IT") == "🇮🇹"
+
+    # 2. Aliases, Matcher, Classifier
+    assert normalize_team_name("København") == "fc kobenhavn"
+    assert normalize_team_name("FC København") == "fc kobenhavn"
+    assert normalize_team_name("Bodø/Glimt") == "bodo glimt"
+    assert normalize_team_name("Juventus Next Gen") == "juventus next gen"
+    assert _string_similarity("ostia mare", "ostiamare") == 0.98
+    ms_res = DEFAULT_TEAM_MATCHER.match_score(
+        "F1 GP Monaco - Qualifiche",
+        "",
+        "Formula 1 Monaco Qualifying",
+        "",
+    )
+    assert ms_res.matched is True
+    assert classify_event(title="Diretta Gol Serie A", silo=SportSilo.CALCIO_ITA) == ("calcio_italiano", ["Serie A"])
+    assert classify_event(title="Konferenz Bundesliga", silo="") == ("calcio_estero", ["Bundesliga e Ligue 1"])
+    assert resolve_sport_silo("", "", "F2 Feature Race Imola") == "motori"
+
+    # 3. Graphics hardening
+    serie_a_match = _make_match(
+        "m-sa",
+        "Inter vs Milan",
+        date_ms=int(time.time() * 1000),
+        end_ms=int(time.time() * 1000) + 7200_000,
+        competition="Italian Serie A",
+        canonical_competition="serie-a",
+    )
+    assert _leagues_compatible(serie_a_match, "Italian Serie B") is False
+    assert _leagues_compatible(serie_a_match, "Italian Serie A") is True
+    assert format_thumb_url("https://www.thesportsdb.com/images/media/event/thumb/abc.jpg/small") == (
+        "https://www.thesportsdb.com/images/media/event/thumb/abc.jpg/medium"
+    )
+    assert _extract_surname("Etcheverry T. M.") == "ETCHEVERRY"
+    assert _is_player_match("Jannik Sinner", "Jannik Sinner") is True
+    assert _is_player_match("A. Muller", "Gilles Muller") is False
+    assert _resolve_country_iso2("Team Europe") is not None
+
+    banner = BannerService(settings=_test_settings(tmp_path, ENABLE_THESPORTSDB=False))
+    nostream_match = serie_a_match.model_copy(update={"poster": "https://cdn.example/nostream_placeholder.jpg"})
+    raw_poster = await banner._resolve_base_poster(nostream_match, db=None)
+    assert len(raw_poster) > 100  # Rendered dark canvas instead of fetching nostream placeholder
+
+    # 4. Legacy pipe-delimited UserConfig + PUBLIC_URL/_HOST_REGEX + SSRF 403 & DaddyLive 307
+    pipe_tok = base64.urlsafe_b64encode(b"https://legacy-ep.test|legacy_pw|stremio").rstrip(b"=").decode("ascii")
+    legacy_cfg = decode_config(pipe_tok, Settings())
+    assert legacy_cfg.ep_url == "https://legacy-ep.test"
+    assert legacy_cfg.ep_pass == "legacy_pw"
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/manifest.json",
+        "scheme": "http",
+        "server": ("internal.local", 8000),
+        "headers": [
+            (b"x-forwarded-proto", b"https"),
+            (b"x-forwarded-host", b"evil.host/steal@foo"),
+            (b"host", b"safe.example.org"),
+        ],
+        "app": create_app(settings_override=_test_settings(tmp_path)),
+    }
+    assert compute_base_url(Request(scope)) == "https://safe.example.org"
+
+    pub_app = create_app(settings_override=_test_settings(tmp_path, PUBLIC_URL="https://public.streamsport.test/"))
+    scope["app"] = pub_app
+    assert compute_base_url(Request(scope)) == "https://public.streamsport.test"
+
+    app = create_app(settings_override=_test_settings(tmp_path))
+    async with app.router.lifespan_context(app):
+        dl = next(p for p in app.state.orchestrator.providers if isinstance(p, DaddyLiveService))
+        dl._player_cache[("10", "https://ep.test")] = (
+            time.monotonic(),
+            "https://ep.test/extractor/video.m3u8?host=dlstreams&d=https%3A%2F%2Fdlhd.dad%2Fwatch.php%3Fid%3D10&redirect_stream=true",
+        )
+        cfg_tok = encode_config(UserConfig(ep_url="https://ep.test", ep_pass="pw1"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            r_ssrf = await client.get("/live/manifest.m3u8", params={"url": "http://127.0.0.1/internal"})
+            assert r_ssrf.status_code == 403
+
+            r_dl = await client.get(f"/{cfg_tok}/daddylive/stream/10.m3u8", follow_redirects=False)
+            assert r_dl.status_code == 307
+            assert "host=dlstreams" in r_dl.headers["location"]
+

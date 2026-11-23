@@ -19,6 +19,7 @@ from app.graphics.thesportsdb_service import TheSportsDBService
 from app.ingestion.diretta_service import DirettaService, extract_tennis_cities
 from app.ingestion.epg_service import (
     ItalianEPGService,
+    filter_conflicting_italian_channels,
     filter_ghost_epg_matches,
     reconcile_with_schedule,
 )
@@ -176,15 +177,27 @@ class PipelineScheduler:
             current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
             logger.info("Pipeline cycle started")
 
-            # 1. Official schedule ingestion
-            diretta_matches, active_tennis_cities = await self._diretta.fetch_schedule()
-            logger.info(
-                "Diretta ingestion completed: %d matches, %d active tennis cities",
-                len(diretta_matches),
-                len(active_tennis_cities),
-            )
+            # 1. Official schedule ingestion (preserve tennis cities on outage/0-match)
+            prev_snapshot = self._ram_cache.snapshot
+            diretta_matches, fetched_tennis_cities = await self._diretta.fetch_schedule()
+            diretta_failed = bool(getattr(self._diretta, "last_fetch_failed", False))
+            if (diretta_failed or (self._settings.ENABLE_DIRETTA and not diretta_matches)) and prev_snapshot.active_tennis_cities:
+                active_tennis_cities = fetched_tennis_cities or prev_snapshot.active_tennis_cities
+                logger.warning(
+                    "Diretta ingestion returned %d matches (failed=%s); preserving %d active tennis cities",
+                    len(diretta_matches),
+                    diretta_failed,
+                    len(active_tennis_cities),
+                )
+            else:
+                active_tennis_cities = fetched_tennis_cities
+                logger.info(
+                    "Diretta ingestion completed: %d matches, %d active tennis cities",
+                    len(diretta_matches),
+                    len(active_tennis_cities),
+                )
 
-            # 2. Italian EPG ingestion (throttled by EPG_SYNC_INTERVAL_SECONDS)
+            # 2. Italian EPG ingestion (throttled by EPG_SYNC_INTERVAL_SECONDS, with stale fallback)
             if self._settings.ENABLE_SKY_EPG or self._settings.ENABLE_TIVUSAT_EPG:
                 mono_now = time.monotonic()
                 if (
@@ -192,8 +205,15 @@ class PipelineScheduler:
                     or (mono_now - self._last_epg_sync_monotonic)
                     >= self._settings.EPG_SYNC_INTERVAL_SECONDS
                 ):
-                    self._epg_cache = await self._epg.fetch_epg(active_tennis_cities)
-                    self._last_epg_sync_monotonic = mono_now
+                    fresh_epg = await self._epg.fetch_epg(active_tennis_cities)
+                    if fresh_epg or not self._epg_cache:
+                        self._epg_cache = fresh_epg
+                        self._last_epg_sync_monotonic = mono_now
+                    else:
+                        logger.warning(
+                            "EPG fetch returned 0 programs; retaining %d stale EPG programs",
+                            len(self._epg_cache),
+                        )
                 epg_programs = list(self._epg_cache)
             else:
                 self._epg_cache = []
@@ -201,13 +221,29 @@ class PipelineScheduler:
 
             enriched, orphan_matches = reconcile_with_schedule(diretta_matches, epg_programs)
             combined_matches = [*enriched, *orphan_matches]
+            epg_discarded = max(0, len(epg_programs) - len(orphan_matches))
             logger.info(
-                "EPG reconciliation completed: %d EPG programs, %d orphan EPG candidates",
+                "EPG reconciliation completed: %d Diretta matches, %d EPG programs, %d orphan candidates created (%d non-orphan/matched/discarded)",
+                len(diretta_matches),
                 len(epg_programs),
                 len(orphan_matches),
+                epg_discarded,
             )
 
-            # 3. Concurrent stream harvesting & top-down attachment (+ ghost EPG filter)
+            # Stale fallback on total ingestion outage to avoid wiping active RAM/DB catalog
+            if (
+                self._settings.ENABLE_DIRETTA
+                and diretta_failed
+                and not combined_matches
+                and prev_snapshot.active_matches
+            ):
+                logger.warning(
+                    "Total ingestion outage detected (0 Diretta + 0 EPG); preserving %d stale RAM matches",
+                    len(prev_snapshot.active_matches),
+                )
+                return len(prev_snapshot.active_matches)
+
+            # 3. Concurrent stream harvesting & top-down attachment (+ conflict & ghost EPG filters)
             harvest_results = await self._orchestrator.harvest_all()
             for provider_name, res in harvest_results.items():
                 if res.error:
@@ -224,6 +260,7 @@ class PipelineScheduler:
                         len(res.linear_channels),
                     )
             matches = self._orchestrator.attach_streams(combined_matches, harvest_results)
+            matches = filter_conflicting_italian_channels(matches, epg_programs)
             matches = filter_ghost_epg_matches(matches)
             with_streams = sum(1 for m in matches if m.sources)
             logger.info(
@@ -317,3 +354,7 @@ class PipelineScheduler:
                 except asyncio.CancelledError:
                     pass
             self._task = None
+        for svc in (self._diretta, self._epg):
+            aclose = getattr(svc, "aclose", None)
+            if callable(aclose):
+                await aclose()

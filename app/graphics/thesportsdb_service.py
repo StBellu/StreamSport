@@ -139,16 +139,107 @@ def _split_event_teams(title: str) -> tuple[str, str]:
     return cleaned, ""
 
 
+def format_thumb_url(thumb: Optional[str]) -> Optional[str]:
+    """Upgrade TheSportsDB thumbnail URLs (`/small`, `/tiny`, `/preview`) to `/medium`."""
+    if not thumb:
+        return None
+    t = thumb.strip()
+    if not t:
+        return None
+    t = re.sub(r"/(?:small|tiny|preview)$", "", t, flags=re.IGNORECASE)
+    low = t.lower()
+    if "thesportsdb.com" in low and "/images/media/" in low and not low.endswith("/medium"):
+        t = f"{t}/medium"
+    return t
+
+
+_LEAGUE_COUNTRY_ALIASES: dict[str, str] = {
+    "italy": "ita", "italian": "ita", "italia": "ita",
+    "england": "eng", "english": "eng",
+    "spain": "esp", "spanish": "esp", "espana": "esp",
+    "germany": "ger", "german": "ger", "deutschland": "ger",
+    "france": "fra", "french": "fra",
+    "brazil": "bra", "brazilian": "bra", "brasil": "bra",
+    "argentina": "arg", "argentinian": "arg",
+    "ecuador": "ecu", "colombia": "col", "chile": "chi", "peru": "per",
+    "uruguay": "uru", "mexico": "mex", "usa": "usa", "egypt": "egy",
+    "turkey": "tur", "turkiye": "tur", "portugal": "por",
+    "netherlands": "ned", "dutch": "ned", "holland": "ned",
+    "belgium": "bel", "scotland": "sco", "greece": "gre",
+    "russia": "rus", "russian": "rus",
+}
+
+_GENERIC_SEARCH_WORDS: frozenset[str] = frozenset(
+    {
+        "fc", "ac", "as", "ss", "ssc", "us", "ud", "cd", "cf", "sc", "fk", "sk",
+        "real", "atletico", "sporting", "racing", "deportivo", "dinamo",
+        "inter", "union", "united", "city", "club", "san", "santa", "saint", "st",
+    }
+)
+
+
+def _extract_league_country(text: str) -> Optional[str]:
+    words = re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).split()
+    for w in words:
+        if w in _LEAGUE_COUNTRY_ALIASES:
+            return _LEAGUE_COUNTRY_ALIASES[w]
+    return None
+
+
+def _extract_division_token(text: str) -> Optional[str]:
+    t = re.sub(r"[-_]+", " ", (text or "").lower())
+    m_serie = re.search(r"\bserie\s*([a-d])\b", t)
+    if m_serie:
+        return f"serie_{m_serie.group(1)}"
+    m_ligue = re.search(r"\bligue\s*([1-3])\b", t)
+    if m_ligue:
+        return f"ligue_{m_ligue.group(1)}"
+    if re.search(r"\b(?:segunda|la\s*liga\s*2)\b", t):
+        return "div_2"
+    if re.search(r"\b(?:2\.\s*bundesliga|bundesliga\s*2)\b", t):
+        return "div_2"
+    m_div = re.search(r"\b(?:tier|division|league)\s*([1-4])\b", t)
+    if m_div:
+        return f"div_{m_div.group(1)}"
+    m_moto = re.search(r"\b(?:formula\s*([123e])|f([123e])|moto\s*(gp|[23]))\b", t)
+    if m_moto:
+        grp = m_moto.group(1) or m_moto.group(2) or m_moto.group(3)
+        return f"moto_{grp}"
+    return None
+
+
+def _extract_motorsport_series_key(text: str) -> str:
+    t = (text or "").lower()
+    patterns = (
+        ("f1", r"\b(?:formula\s*(?:1|one)|f1)\b"),
+        ("f2", r"\b(?:formula\s*2|f2)\b"),
+        ("f3", r"\b(?:formula\s*3|f3)\b"),
+        ("fe", r"\b(?:formula\s*e|f\.?e\.?)\b"),
+        ("motogp", r"\b(?:moto\s*gp)\b"),
+        ("moto2", r"\b(?:moto\s*2)\b"),
+        ("moto3", r"\b(?:moto\s*3)\b"),
+        ("wsbk", r"\b(?:world\s*sbk|wsbk|superbike)\b"),
+        ("wrc", r"\b(?:wrc|world\s*rally)\b"),
+        ("nascar", r"\bnascar\b"),
+        ("indycar", r"\bindy\s*car\b"),
+        ("wec", r"\b(?:wec|world\s*endurance)\b"),
+    )
+    for key, pat in patterns:
+        if re.search(pat, t):
+            return key
+    return ""
+
+
 def _league_tokens(name: str) -> set[str]:
     cleaned = re.sub(r"[^a-z0-9\s]", " ", (name or "").lower())
     return {
         tok for tok in cleaned.split()
-        if len(tok) >= 2 and tok not in _LEAGUE_STOPWORDS
+        if (len(tok) >= 2 or tok in {"a", "b", "c", "1", "2", "3"}) and tok not in _LEAGUE_STOPWORDS
     }
 
 
 def _leagues_compatible(match: Match, entry_league: str) -> bool:
-    """Gatekeeper 4: verify canonical/token compatibility between leagues."""
+    """Gatekeeper 4: verify canonical/division/country compatibility between leagues."""
     if not entry_league:
         return True
     match_leagues = [
@@ -157,8 +248,18 @@ def _leagues_compatible(match: Match, entry_league: str) -> bool:
     if not match_leagues:
         return True
 
+    entry_country = _extract_league_country(entry_league)
+    entry_div = _extract_division_token(entry_league)
     entry_tokens = _league_tokens(entry_league)
+
     for ml in match_leagues:
+        ml_country = _extract_league_country(ml)
+        if entry_country and ml_country and entry_country != ml_country:
+            return False
+        ml_div = _extract_division_token(ml)
+        if entry_div and ml_div and entry_div != ml_div:
+            return False
+
         ml_tokens = _league_tokens(ml)
         if not entry_tokens or not ml_tokens:
             return True
@@ -516,10 +617,10 @@ class TheSportsDBService:
         today_utc = datetime.now(timezone.utc).date()
         day_candidates = sorted({
             (today_utc + timedelta(days=delta)).strftime("%Y-%m-%d")
-            for delta in (-1, 0, 1)
+            for delta in (-1, 0, 1, 2)
         } | {
             (today_local + timedelta(days=delta)).strftime("%Y-%m-%d")
-            for delta in (-1, 0, 1)
+            for delta in (-1, 0, 1, 2)
         })
 
         indexed: dict[str, list[dict[str, Any]]] = {}
@@ -594,12 +695,15 @@ class TheSportsDBService:
         match_tokens = _gp_identity_tokens(f"{match.title} {match.competition} {match.stage}")
         if not match_tokens:
             return None
+        match_series = _extract_motorsport_series_key(
+            f"{match.title} {match.competition} {match.canonical_competition}"
+        )
 
         best_url: Optional[str] = None
         best_rank = (-1, 0)  # (is_explicit_race, shared_token_count)
 
         for entry in self._silo_candidates(SportSilo.MOTORI):
-            poster_url = str(entry.get("poster_url") or "")
+            poster_url = format_thumb_url(str(entry.get("poster_url") or "")) or ""
             if not poster_url:
                 continue
             entry_ms = int(entry.get("date_ms") or 0)
@@ -608,6 +712,10 @@ class TheSportsDBService:
                     continue
 
             entry_text = f"{entry.get('title', '')} {entry.get('league', '')}"
+            entry_series = _extract_motorsport_series_key(entry_text)
+            if match_series and entry_series and match_series != entry_series:
+                continue
+
             entry_tokens = _gp_identity_tokens(entry_text)
             shared = len(match_tokens & entry_tokens)
             if shared == 0:
@@ -698,93 +806,159 @@ class TheSportsDBService:
         joined = " ".join(hints).lower()
         return any(kw in joined for kw in keywords)
 
+    @staticmethod
+    def _build_search_queries(home: str, away: str, title: str) -> list[str]:
+        """Build up to 3 progressive query patterns (full, last-token, first-token)."""
+        if not home and not away:
+            q = strip_non_bmp(title).strip()
+            return [q] if q else []
+
+        def _sig_tokens(team: str) -> list[str]:
+            words = [w for w in re.sub(r"[^a-z0-9\s]", " ", strip_non_bmp(team).lower()).split() if len(w) >= 2]
+            filtered = [w for w in words if w not in _GENERIC_SEARCH_WORDS]
+            return filtered or words
+
+        queries: list[str] = []
+        seen: set[str] = set()
+
+        def _add(q: str) -> None:
+            clean = " ".join(q.split()).strip()
+            if clean and clean.lower() not in seen:
+                seen.add(clean.lower())
+                queries.append(clean)
+
+        _add(f"{home} {away}".strip())
+        h_toks = _sig_tokens(home)
+        a_toks = _sig_tokens(away)
+        if h_toks and a_toks:
+            _add(f"{h_toks[-1]} {a_toks[-1]}")
+            _add(f"{h_toks[0]} {a_toks[0]}")
+        elif h_toks:
+            _add(h_toks[-1])
+        return queries[:3]
+
     async def semantic_orphan_search(
         self,
         match: Match,
         db: Optional[DatabaseManager] = None,
     ) -> Optional[str]:
-        """Level 2 semantic search on `/browse?s={home}+{away}` with 1.2s throttling & SQLite cache."""
+        """Level 2 semantic search on `/browse?s=...` with 3 query patterns, date/demographics guards & SQLite cache."""
         if not self._settings.ENABLE_THESPORTSDB:
             return None
 
         home = (match.home_team.name if match.home_team else "").strip()
         away = (match.away_team.name if match.away_team else "").strip()
-        query_text = f"{home} {away}".strip() if (home or away) else match.title.strip()
-        query_text = strip_non_bmp(query_text)
-        if not query_text:
+        queries = self._build_search_queries(home, away, match.title)
+        if not queries:
             return None
 
-        cache_key = f"{match.silo.value}:{query_text.lower()}"
+        primary_query = queries[0]
+        cache_key = f"{match.silo.value}:{primary_query.lower()}"
         if db is not None:
             cached = await db.get_tsdb_cache(cache_key)
             if cached is not None:
                 if cached["status"] == "found" and cached.get("thumb_url"):
-                    return str(cached["thumb_url"])
+                    return format_thumb_url(str(cached["thumb_url"]))
                 if cached["status"] == "not_found":
                     age_ms = int(time.time() * 1000) - int(cached.get("checked_at") or 0)
                     if age_ms < _NOT_FOUND_TTL_MS:
                         return None
 
-        async with self._search_lock:
-            elapsed = time.monotonic() - self._last_search_monotonic
-            if elapsed < _SEARCH_THROTTLE_SECONDS:
-                await asyncio.sleep(_SEARCH_THROTTLE_SECONDS - elapsed)
+        match_date_utc = (
+            datetime.fromtimestamp(match.date / 1000.0, tz=timezone.utc).date()
+            if match.date > 0
+            else None
+        )
 
-            client = self._get_client()
-            search_url = f"{_TSDB_SEARCH_URL}?s={quote_plus(query_text)}"
-            try:
-                resp = await client.get(search_url)
-            except Exception as exc:
-                logger.warning("TheSportsDB search error for '%s': %s", query_text, exc)
-                return None
-            finally:
-                self._last_search_monotonic = time.monotonic()
-
-        if resp.status_code >= 400:
-            return None
-
-        soup = BeautifulSoup(resp.text, "html.parser")
         found_url: Optional[str] = None
+        rate_limited = False
 
-        candidates = soup.find_all(["tr", "div", "li"])
-        for node in candidates:
-            event_link = node.find("a", href=re.compile(r"/event/"))
-            if event_link is None:
-                continue
-            if not self._validate_svg_sport_icon(node, match.silo):
+        for query_text in queries:
+            async with self._search_lock:
+                elapsed = time.monotonic() - self._last_search_monotonic
+                if elapsed < _SEARCH_THROTTLE_SECONDS:
+                    await asyncio.sleep(_SEARCH_THROTTLE_SECONDS - elapsed)
+
+                client = self._get_client()
+                search_url = f"{_TSDB_SEARCH_URL}?s={quote_plus(query_text)}"
+                try:
+                    resp = await client.get(search_url)
+                except Exception as exc:
+                    logger.warning("TheSportsDB search error for '%s': %s", query_text, exc)
+                    continue
+                finally:
+                    self._last_search_monotonic = time.monotonic()
+
+            if resp.status_code == 429:
+                logger.warning("TheSportsDB search rate-limited (429) for '%s'", query_text)
+                rate_limited = True
+                break
+            if resp.status_code >= 400:
                 continue
 
-            card_title = strip_non_bmp(event_link.get_text(" ", strip=True))
-            cand_home, cand_away = _split_event_teams(card_title)
-            res = DEFAULT_TEAM_MATCHER.match_score(
-                home or match.title,
-                away,
-                cand_home,
-                cand_away,
-                alt_home_1=match.alt_home,
-                alt_away_1=match.alt_away,
-                date_1_ms=0,
-                date_2_ms=0,
-                is_women_1=match.is_women,
-                is_youth_1=match.is_youth,
-            )
-            if not res.matched or res.score < 0.75:
-                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+            seen_hrefs: set[str] = set()
 
-            for img in node.find_all("img"):
-                src = _normalize_tsdb_url(str(img.get("data-src") or img.get("src") or ""))
-                if _looks_like_poster_url(src) and "/images/media/" in src.lower():
-                    found_url = src
+            for event_link in soup.find_all("a", href=re.compile(r"/event/")):
+                event_href = _normalize_tsdb_url(str(event_link.get("href") or ""))
+                if not event_href or event_href in seen_hrefs:
+                    continue
+                seen_hrefs.add(event_href)
+
+                container = event_link.find_parent(["tr", "li", "div"]) or event_link
+                if not self._validate_svg_sport_icon(container, match.silo):
+                    continue
+
+                card_title = strip_non_bmp(event_link.get_text(" ", strip=True))
+                cand_women, cand_youth = detect_demographics(f"{card_title} {event_href}")
+                if cand_women != match.is_women or cand_youth != match.is_youth:
+                    continue
+
+                if match_date_utc is not None:
+                    node_text = f"{container.get_text(' ', strip=True)} {event_href}"
+                    date_m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", node_text)
+                    if date_m:
+                        try:
+                            cand_date = datetime.strptime(date_m.group(1), "%Y-%m-%d").date()
+                            if abs((cand_date - match_date_utc).days) > 1:
+                                continue
+                        except ValueError:
+                            pass
+
+                cand_home, cand_away = _split_event_teams(card_title)
+                res = DEFAULT_TEAM_MATCHER.match_score(
+                    home or match.title,
+                    away,
+                    cand_home,
+                    cand_away,
+                    alt_home_1=match.alt_home,
+                    alt_away_1=match.alt_away,
+                    date_1_ms=0,
+                    date_2_ms=0,
+                    is_women_1=match.is_women,
+                    is_youth_1=match.is_youth,
+                    is_women_2=cand_women,
+                    is_youth_2=cand_youth,
+                )
+                if not res.matched or res.score < 0.75:
+                    continue
+
+                for img in container.find_all("img"):
+                    src = _normalize_tsdb_url(str(img.get("data-src") or img.get("src") or ""))
+                    if _looks_like_poster_url(src) and "/images/media/" in src.lower():
+                        found_url = format_thumb_url(src)
+                        break
+
+                if not found_url:
+                    extracted = await self._extract_poster_from_event_page(event_href)
+                    found_url = format_thumb_url(extracted)
+                if found_url:
                     break
 
-            if not found_url:
-                event_href = _normalize_tsdb_url(str(event_link.get("href") or ""))
-                if event_href:
-                    found_url = await self._extract_poster_from_event_page(event_href)
             if found_url:
                 break
 
-        if db is not None:
+        if db is not None and not rate_limited:
             await db.upsert_tsdb_cache(
                 cache_key,
                 found_url,

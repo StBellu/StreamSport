@@ -379,8 +379,12 @@ class BannerService:
 
         tsdb = self._get_tsdb()
         poster_url = match.poster.strip()
+        if "nostream" in poster_url.lower():
+            poster_url = ""
         if not poster_url and self._settings.ENABLE_THESPORTSDB:
             poster_url = (await tsdb.resolve_poster_url(match, db=db)) or ""
+        if "nostream" in poster_url.lower():
+            poster_url = ""
 
         if poster_url:
             raw = await tsdb.fetch_poster_bytes(poster_url)

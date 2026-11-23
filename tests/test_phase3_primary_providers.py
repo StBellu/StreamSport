@@ -258,8 +258,8 @@ async def test_tvvoo_service_harvest_normalization_and_fallbacks(tmp_path: Path)
     assert ita_src.raw_url == "https://vavoo.to/vavoo-iptv/play/f1play"
     assert parse_qs(urlparse(ita_src.url).query)["url"][0] == ita_src.raw_url
 
-    assert "sky sports f1" in res.linear_channels
-    assert res.linear_channels["sky sports f1"][0].priority == 10
+    assert "sky sports f1 uk" in res.linear_channels
+    assert res.linear_channels["sky sports f1 uk"][0].priority == 10
     assert "sky sport bundesliga 1" in res.linear_channels
     assert res.linear_channels["sky sport bundesliga 1"][0].language == "DEU"
 
@@ -519,3 +519,181 @@ async def test_spon_service_mirror_fallback_and_enable_toggle() -> None:
     disabled_res = await disabled.safe_harvest()
     assert disabled_res.events == []
     assert disabled_res.error == ""
+
+
+@pytest.mark.asyncio
+async def test_tvvoo_geil_first_ssrf_and_lru_cap() -> None:
+    from app.providers.tvvoo_service import is_safe_vavoo_play_url
+
+    assert is_safe_vavoo_play_url("https://geil.app/live/play/1140356951") is True
+    assert is_safe_vavoo_play_url("https://vavoo.to/vavoo-iptv/play/abc") is True
+    assert is_safe_vavoo_play_url("http://127.0.0.1/live/play/1") is False
+    assert is_safe_vavoo_play_url("http://169.254.169.254/play/1") is False
+    assert is_safe_vavoo_play_url("https://evil.example/play/1") is False
+
+    mgr = LiveManifestManager(max_sessions=3)
+    assert mgr.MAX_SESSIONS == 1000
+
+    async def _fake_resolve(play_url: str, client_ip: str | None) -> tuple[str, float]:
+        return f"https://cdn.example/hls/{play_url.rsplit('/', 1)[-1]}/index.m3u8", time.time() + 1200
+
+    async def _fake_fetch(url: str) -> str:
+        return "#EXTM3U\n#EXTINF:2.0,\nseg0.ts\n"
+
+    mgr.resolve_play_url = _fake_resolve  # type: ignore[method-assign]
+    mgr._fetch_playlist_text = _fake_fetch  # type: ignore[method-assign]
+    for idx in range(5):
+        await mgr.get_live_manifest(f"https://geil.app/live/play/{idx}", None)
+    assert len(mgr._sessions) == 3
+    assert ("https://geil.app/live/play/0", "default") not in mgr._sessions
+    assert ("https://geil.app/live/play/4", "default") in mgr._sessions
+    await mgr.aclose()
+
+    ping_called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal ping_called
+        url = str(request.url)
+        if "/api/app/ping" in url:
+            ping_called = True
+        if request.url.host == "geil.app" and "/live/catalog/live/channels.json" in url:
+            if request.url.params.get("cursor") == "page2":
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "name": "SKY SPORT UNO HD .c",
+                                "url": "https://geil.app/live/play/uno1",
+                                "tags": ["Italy"],
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "name": "SKY SPORT UNO HD .s",
+                            "url": "https://geil.app/live/play/uno2",
+                            "tags": ["Italy"],
+                        }
+                    ],
+                    "nextCursor": "page2",
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = TvVooService(settings=Settings(ENABLE_TVVOO=True), client=client)
+        res = await svc.harvest()
+
+    assert ping_called is False
+    assert "sky sport uno" in res.linear_channels
+    assert len(res.linear_channels["sky sport uno"]) == 2
+    # .c mirror ranks before .s mirror
+    assert res.linear_channels["sky sport uno"][0].raw_url == "https://geil.app/live/play/uno1"
+
+
+@pytest.mark.asyncio
+async def test_mandrakodi_sky_jit_negative_cache_amstaff_b64_and_jwt_purge() -> None:
+    from app.providers.mandrakodi_service import (
+        MANDRAKODI_NUM_TESTS,
+        extract_jwt_iat,
+    )
+
+    assert "A1A159" not in MANDRAKODI_NUM_TESTS
+
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={"items": [{"title": "[COLOR red]JOB A1A159 HAVE PROBLEM[/COLOR]", "link": "ignore"}]},
+        )
+
+    settings = Settings(
+        ENABLE_MANDRAKODI=True,
+        MANDRAKODI_API_URL="https://mk.example/filter.php",
+        MANDRAKODI_PASSWORD="pw",
+        MANDRAKODI_DEVICE_ID="dev",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = MandraKodiService(settings=settings, client=client)
+        first = await svc.resolve_sky_channel("skysportuno")
+        second = await svc.resolve_sky_channel("sky@@skysportuno")
+
+    assert first is None and second is None
+    assert calls == 1  # Negative-cached after upstream error
+
+    def _b64url(obj: dict) -> str:
+        raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    now_sec = int(time.time())
+    stale_jwt = f"{_b64url({'alg': 'HS256'})}.{_b64url({'iat': now_sec - 8 * 3600})}.sig"
+    assert extract_jwt_iat(f"https://dazn.example/dash.mpd?token={stale_jwt}") == now_sec - 8 * 3600
+
+    b64_key = base64.b64encode(b"1122334455667788:aabbccddeeff0011").decode("ascii")
+    payload = {
+        "items": [
+            {
+                "title": "Inter vs Milan",
+                "myresolve": f"amstaff@@https://cdn.example/live/master-clr.isml/manifest.mpd|{b64_key}",
+            },
+            {
+                "title": "Napoli vs Roma",
+                "myresolve": f"amstaff@@https://cdn.example/live/old.mpd?token={stale_jwt}|aaa:bbb",
+            },
+            {
+                "title": "Juventus vs Lazio",
+                "myresolve": "amstaff@@https://cdn.example/live/no_drm-clr.isml/manifest.mpd|0000",
+            },
+        ]
+    }
+    res = svc.parse_payload(payload)
+    assert len(res.events) == 2
+    by_title = {ev.title: ev for ev in res.events}
+    assert "Napoli vs Roma" not in by_title  # stale JWT purged
+    assert by_title["Inter vs Milan"].streams[0].url == "https://cdn.example/live/master-clr.isml/manifest.m3u8"
+    assert by_title["Inter vs Milan"].streams[0].clearkey == ""
+    assert by_title["Juventus vs Lazio"].streams[0].url == "https://cdn.example/live/no_drm-clr.isml/manifest.m3u8"
+
+
+@pytest.mark.asyncio
+async def test_spon_cloudflare_html_poisoning_and_at_swap() -> None:
+    prog_valid = (
+        "\ufeff"
+        "HD7 ITALIAN\n"
+        "SUNDAY\n"
+        "20:45  NBA: Celtics @ Lakers | https://sportsonline.st/channels/hd/hd-7_alt.php\n"
+    )
+    now_utc = datetime(2026, 11, 22, 12, 0, tzinfo=timezone.utc)
+    events = parse_prog_txt(prog_valid, now_utc=now_utc)
+    assert len(events) == 1
+    assert events[0].home == "Lakers"
+    assert events[0].away == "Celtics"
+    assert events[0].streams[0].channel_name == "HD-7_ALT"
+
+    phase = {"poison": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if phase["poison"]:
+            return httpx.Response(200, text="<!DOCTYPE html><title>Just a moment...</title>")
+        return httpx.Response(200, text=prog_valid)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = SponService(settings=Settings(ENABLE_SPON=True), client=client)
+        res_ok = await svc.safe_harvest()
+        assert len(res_ok.events) == 1
+
+        # Expire cache TTL and return Cloudflare HTTP 200 HTML -> must preserve stale valid cache
+        svc._cache_time = 0.0
+        phase["poison"] = True
+        res_stale = await svc.safe_harvest()
+        assert len(res_stale.events) == 1
+        assert res_stale.events[0].home == "Lakers"
+

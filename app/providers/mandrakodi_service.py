@@ -23,6 +23,7 @@ from app.core.network import create_standard_client
 from app.models.domain import ProviderEvent, StreamSource
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult
 from app.providers.tvvoo_service import normalize_channel_name
+from app.taxonomy.channels import SKY_CHID_TO_CANONICAL
 from app.taxonomy.demographics import (
     detect_demographics,
     detect_demographics_from_stream_title,
@@ -33,7 +34,6 @@ logger = logging.getLogger(__name__)
 MANDRAKODI_NUM_TESTS: tuple[str, ...] = (
     "A1A165",
     "A1A165A",
-    "A1A159",
     "A1A103",
     "A1A105",
     "A1A156",
@@ -41,6 +41,12 @@ MANDRAKODI_NUM_TESTS: tuple[str, ...] = (
     "A1A134F",
     "A1A215",
 )
+
+_SKY_NEGATIVE_TTL_SECONDS = 300.0
+_SKY_DEFAULT_TTL_SECONDS = 6 * 3600.0
+_JWT_MAX_AGE_SECONDS = 6 * 3600.0
+_SUPERTENNIS_CACHE_TTL_SECONDS = 60.0
+_SUPERTENNIS_MIN_SEGMENT_BYTES = 250_000
 
 _SKY_FREESHOT_MAP: dict[str, str] = {
     "skysport24": "SkySport24IT",
@@ -110,6 +116,23 @@ _SPORT_HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:rugby|six\s+nations)\b", re.IGNORECASE), "rugby"),
     (re.compile(r"\b(?:serie\s*[ab]|champions|europa|conference|premier|liga|calcio|soccer)\b", re.IGNORECASE), "football"),
 )
+
+
+def extract_jwt_iat(url: str) -> Optional[int]:
+    """Extract the `iat` (issued-at) epoch claim from a JWT embedded in a DAZN MPD URL."""
+    if not url:
+        return None
+    jwt_match = re.search(r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+", url)
+    if not jwt_match:
+        return None
+    try:
+        payload_b64 = jwt_match.group(0).split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
+        raw_iat = payload.get("iat")
+        return int(raw_iat) if raw_iat is not None else None
+    except Exception:
+        return None
 
 
 def _xor_bytes(raw: bytes, key: str) -> bytes:
@@ -293,6 +316,11 @@ class MandraKodiService(BaseStreamProvider):
         super().__init__(settings)
         self._external_client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
+        self._sky_cache: dict[str, tuple[Optional[StreamSource], float]] = {}
+        self._sky_locks: dict[str, asyncio.Lock] = {}
+        self._st_ott_cache: list[StreamSource] = []
+        self._st_ott_cache_time: float = 0.0
+        self._st_ott_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -505,17 +533,38 @@ class MandraKodiService(BaseStreamProvider):
                 except Exception:
                     return None
             parts = decoded_val.split("|")
-            target_url = parts[0].strip()
+            target_url = parts[0].strip().rstrip("?")
             if not target_url:
                 return None
             clearkey = ""
+            ck_part = ""
             headers = dict(item_headers)
             if len(parts) >= 2:
-                ck_part = parts[1].strip()
-                if ck_part and ck_part != "0000" and ":" in ck_part:
-                    clearkey = ck_part
+                ck_part = parts[1].strip().strip("'\"")
+                if ck_part and ":" not in ck_part and len(ck_part) > 20:
+                    try:
+                        padded_ck = ck_part + "=" * (-len(ck_part) % 4)
+                        dec_ck = base64.b64decode(padded_ck).decode("utf-8", errors="ignore").strip()
+                        if dec_ck.startswith("{") or ":" in dec_ck:
+                            ck_part = dec_ck
+                    except Exception:
+                        pass
+                if ck_part.lower() not in ("0000", "0", "none", "clear", ""):
+                    clearkey = _normalize_clearkey(ck_part)
+                    if ":" not in clearkey:
+                        clearkey = ""
             if len(parts) >= 3 and parts[2].strip():
                 headers["User-Agent"] = parts[2].strip()
+
+            is_clear_stream = (
+                ck_part.lower() in ("0000", "0", "none", "clear", "")
+                and not clearkey
+            ) or "-clr.isml" in target_url.lower()
+            if is_clear_stream and (
+                "-clr.isml" in target_url.lower() or "mediaset.net" in target_url.lower()
+            ):
+                target_url = target_url.replace("/manifest.mpd", "/manifest.m3u8").replace(".mpd", ".m3u8")
+                clearkey = ""
 
             is_mpd = bool(clearkey or ".mpd" in target_url.lower())
             return StreamSource(
@@ -554,7 +603,7 @@ class MandraKodiService(BaseStreamProvider):
             if not val:
                 return None
             mapped = _SKY_FREESHOT_MAP.get(val.lower(), val)
-            sky_ch = _SKY_CHANNEL_NAMES.get(val.lower(), ch_key)
+            sky_ch = SKY_CHID_TO_CANONICAL.get(val.lower()) or _SKY_CHANNEL_NAMES.get(val.lower(), ch_key)
             return StreamSource(
                 provider=self.name,
                 title=title,
@@ -806,6 +855,15 @@ class MandraKodiService(BaseStreamProvider):
                         if 0 <= hh <= 23 and 0 <= mm <= 59:
                             dt_ev = now_rome.replace(hour=hh, minute=mm, second=0, microsecond=0)
                             start_ms = int(dt_ev.astimezone(timezone.utc).timestamp() * 1000)
+
+                now_ts = time.time()
+                jwt_iat = extract_jwt_iat(source.url)
+                if jwt_iat is not None:
+                    if (now_ts - jwt_iat) > _JWT_MAX_AGE_SECONDS:
+                        continue
+                    if start_ms > 0 and abs((start_ms / 1000.0) - now_ts) > _JWT_MAX_AGE_SECONDS:
+                        continue
+
                 is_women_t, is_youth_t = detect_demographics_from_stream_title(title)
                 is_women_c, is_youth_c = detect_demographics(competition)
                 key = (title.lower(), start_ms)
@@ -846,6 +904,198 @@ class MandraKodiService(BaseStreamProvider):
             linear_channels=linear_channels,
             raw_count=len(raw_items),
         )
+
+    async def resolve_sky_channel(self, channel_id: str) -> Optional[StreamSource]:
+        """Resolve a Sky Italia channel JIT via `numTest=A1A159&id=<chid>` with negative caching."""
+        sky_chid = channel_id.strip()
+        if sky_chid.lower().startswith("sky@@"):
+            sky_chid = sky_chid.split("@@", 1)[1].strip()
+        if not sky_chid:
+            return None
+
+        now = time.time()
+        cached = self._sky_cache.get(sky_chid)
+        if cached is not None and now < cached[1]:
+            return cached[0]
+
+        lock = self._sky_locks.setdefault(sky_chid, asyncio.Lock())
+        async with lock:
+            now = time.time()
+            cached = self._sky_cache.get(sky_chid)
+            if cached is not None and now < cached[1]:
+                return cached[0]
+
+            api_url = (self.settings.MANDRAKODI_API_URL or "").strip()
+            if not api_url:
+                self._sky_cache[sky_chid] = (None, now + _SKY_NEGATIVE_TTL_SECONDS)
+                return None
+
+            client = self._get_client()
+            try:
+                resp = await client.get(
+                    api_url,
+                    params={"numTest": "A1A159", "id": sky_chid},
+                    headers=self._build_request_headers(),
+                    timeout=12.0,
+                )
+                resp.raise_for_status()
+                raw_text = resp.text
+            except Exception as exc:
+                logger.warning("MandraKodi A1A159 resolve failed for %s: %s", sky_chid, exc)
+                self._sky_cache[sky_chid] = (None, now + _SKY_NEGATIVE_TTL_SECONDS)
+                return None
+
+            upper_raw = raw_text.upper()
+            if "HAVE PROBLEM" in upper_raw or raw_text.strip().lower() == "ignore":
+                self._sky_cache[sky_chid] = (None, now + _SKY_NEGATIVE_TTL_SECONDS)
+                return None
+
+            parsed: Any = None
+            try:
+                outer = json.loads(raw_text, strict=False)
+                if isinstance(outer, dict) and outer.get("data"):
+                    decrypted = self._decode_raw_payload(outer["data"])
+                    parsed = decrypted
+                else:
+                    parsed = self._decode_raw_payload(raw_text)
+            except json.JSONDecodeError:
+                parsed = self._decode_raw_payload(raw_text)
+
+            if isinstance(parsed, str):
+                upper_dec = parsed.upper()
+                if "HAVE PROBLEM" in upper_dec or parsed.strip().lower() == "ignore":
+                    self._sky_cache[sky_chid] = (None, now + _SKY_NEGATIVE_TTL_SECONDS)
+                    return None
+                try:
+                    parsed = json.loads(parsed, strict=False)
+                except json.JSONDecodeError:
+                    parsed = None
+
+            if not isinstance(parsed, dict):
+                self._sky_cache[sky_chid] = (None, now + _SKY_NEGATIVE_TTL_SECONDS)
+                return None
+
+            manifest = str(parsed.get("manifest") or parsed.get("mpd_url") or parsed.get("url") or "").strip()
+            if not manifest or manifest.lower() == "ignore" or "HAVE PROBLEM" in manifest.upper():
+                self._sky_cache[sky_chid] = (None, now + _SKY_NEGATIVE_TTL_SECONDS)
+                return None
+
+            clearkey = _normalize_clearkey(
+                parsed.get("clearkey"),
+                kid=str(parsed.get("kid") or ""),
+                key=str(parsed.get("key") or ""),
+            )
+            exp_ts = now + _SKY_DEFAULT_TTL_SECONDS
+            fine_str = str(parsed.get("fine") or "").strip()
+            if fine_str:
+                try:
+                    try:
+                        tz_rome: Any = ZoneInfo("Europe/Rome")
+                    except ZoneInfoNotFoundError:
+                        tz_rome = timezone.utc
+                    dt = datetime.strptime(fine_str, "%d/%m/%Y %H:%M:%S").replace(tzinfo=tz_rome)
+                    exp_ts = max(now + 60.0, dt.timestamp())
+                except Exception:
+                    pass
+
+            canonical = SKY_CHID_TO_CANONICAL.get(sky_chid.lower()) or normalize_channel_name(sky_chid)
+            src = StreamSource(
+                provider=self.name,
+                title=f"[MPD] {canonical.upper()}",
+                url=manifest,
+                quality="1080p50",
+                language="ITA",
+                priority=1,
+                requires_proxy=True,
+                proxy_host="mpd",
+                clearkey=clearkey,
+                channel_name=canonical,
+                raw_url=manifest,
+            )
+            self._sky_cache[sky_chid] = (src, exp_ts)
+            return src
+
+    async def get_active_supertennis_ott_streams(self) -> list[StreamSource]:
+        """Probe SuperTennis interactive OTT feeds (`supertennis 1..4`) using lightweight Range requests."""
+        now = time.time()
+        if self._st_ott_cache and (now - self._st_ott_cache_time) < _SUPERTENNIS_CACHE_TTL_SECONDS:
+            return list(self._st_ott_cache)
+
+        async with self._st_ott_lock:
+            now = time.time()
+            if self._st_ott_cache and (now - self._st_ott_cache_time) < _SUPERTENNIS_CACHE_TTL_SECONDS:
+                return list(self._st_ott_cache)
+
+            client = self._get_client()
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+            async def _probe_channel(ch_num: int) -> Optional[StreamSource]:
+                manifest_url = (
+                    f"https://421b2081187a40368f24e4fb496bfc26.msvdn.net/channel{ch_num}/manifest.mpd"
+                )
+                try:
+                    resp = await client.get(
+                        manifest_url,
+                        headers=headers,
+                        follow_redirects=True,
+                        timeout=2.5,
+                    )
+                    if resp.status_code != 200:
+                        return None
+                    text = resp.text
+                    rep_match = re.search(
+                        r'<Representation width="[0-9]+" height="[0-9]+"[^>]*id="([^"]+)"', text
+                    )
+                    time_match = re.search(r'<S t="([0-9]+)"', text)
+                    media_match = re.search(r'media="([^"]+)"', text)
+                    if not (rep_match and time_match and media_match):
+                        return None
+
+                    seg_rel = (
+                        media_match.group(1)
+                        .replace("$RepresentationID$", rep_match.group(1))
+                        .replace("$Time$", time_match.group(1))
+                    )
+                    seg_url = str(resp.url).rsplit("/", 1)[0] + "/" + seg_rel
+                    seg_resp = await client.get(
+                        seg_url,
+                        headers={**headers, "Range": "bytes=0-250000"},
+                        timeout=2.5,
+                    )
+                    if seg_resp.status_code not in (200, 206):
+                        return None
+
+                    content_range = seg_resp.headers.get("content-range", "")
+                    total_size = (
+                        int(content_range.split("/")[-1])
+                        if "/" in content_range
+                        else len(seg_resp.content)
+                    )
+                    if total_size <= _SUPERTENNIS_MIN_SEGMENT_BYTES:
+                        return None
+
+                    ch_key = f"supertennis {ch_num}"
+                    return StreamSource(
+                        provider=self.name,
+                        title=f"[MPD] SuperTennis OTT {ch_num}",
+                        url=manifest_url,
+                        quality="720p50",
+                        language="ITA",
+                        priority=1,
+                        requires_proxy=True,
+                        proxy_host="mpd",
+                        channel_name=ch_key,
+                        raw_url=manifest_url,
+                    )
+                except Exception as exc:
+                    logger.debug("SuperTennis OTT %d probe failed: %s", ch_num, exc)
+                    return None
+
+            probed = await asyncio.gather(*(_probe_channel(i) for i in range(1, 5)))
+            active = [src for src in probed if src is not None]
+            self._st_ott_cache = active
+            self._st_ott_cache_time = time.time()
+            return list(active)
 
     async def _fetch_num_test(self, client: httpx.AsyncClient, api_url: str, num_test: str) -> ProviderHarvestResult:
         resp = await client.get(
@@ -918,6 +1168,15 @@ class MandraKodiService(BaseStreamProvider):
 
         if not merged_linear and not merged_events and len(errors) == len(MANDRAKODI_NUM_TESTS):
             return ProviderHarvestResult(provider=self.name, error="; ".join(errors[:3]))
+
+        st_ott_streams = await self.get_active_supertennis_ott_streams()
+        for src in st_ott_streams:
+            ch_key = src.channel_name
+            bucket = merged_linear.setdefault(ch_key, [])
+            dedup = (ch_key, src.url, src.clearkey)
+            if dedup not in seen_linear:
+                seen_linear.add(dedup)
+                bucket.append(src)
 
         for sources in merged_linear.values():
             sources.sort(key=lambda s: (0 if s.language == "ITA" else 1, 0 if s.clearkey else 1, s.priority))

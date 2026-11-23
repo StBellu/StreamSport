@@ -80,11 +80,20 @@ def decode_config(raw: Optional[str], settings: Optional[Settings] = None) -> Us
             resolved_settings,
         )
 
-    # URL-safe Base64 JSON format
+    # URL-safe Base64 JSON or legacy pipe-delimited `epUrl|epPass|client`
     try:
         padded = token + "=" * (-len(token) % 4)
-        decoded_bytes = base64.urlsafe_b64decode(padded.encode("ascii"))
-        data = json.loads(decoded_bytes.decode("utf-8"))
+        decoded_text = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        if "|" in decoded_text and not decoded_text.lstrip().startswith("{"):
+            parts = [p.strip() for p in decoded_text.split("|")]
+            return _apply_defaults(
+                UserConfig(
+                    ep_url=parts[0] if parts else "",
+                    ep_pass=parts[1] if len(parts) > 1 else "",
+                ),
+                resolved_settings,
+            )
+        data = json.loads(decoded_text)
         if isinstance(data, dict):
             normalized = {
                 "ep_url": str(data.get("ep_url") or data.get("epUrl") or ""),

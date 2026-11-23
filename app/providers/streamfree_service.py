@@ -19,6 +19,7 @@ from app.core.network import create_doh_client
 from app.models.domain import ProviderEvent, StreamSource
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult
 from app.taxonomy import detect_demographics_from_stream_title
+from app.taxonomy.channels import canonicalize_channel_name
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,54 @@ CHROME_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 RESOLVE_CACHE_TTL_SECONDS = 300.0
+MAX_FUTURE_WINDOW_MS = 3 * 24 * 3600 * 1000
+MAX_PAST_WINDOW_MS = 4 * 3600 * 1000
+
+STREAMFREE_CANONICAL_CHANNELS: dict[str, dict[str, str]] = {
+    "sky sports f1 uk": {
+        "key": "skyf1",
+        "name": "Sky Sports F1 UK",
+        "category": "racing",
+        "lang": "en",
+    },
+    "sky sports tennis uk": {
+        "key": "skysportstennis",
+        "name": "Sky Sports Tennis UK",
+        "category": "tennis",
+        "lang": "en",
+    },
+    "redzone": {
+        "key": "redzone",
+        "name": "NFL RedZone US",
+        "category": "football",
+        "lang": "en",
+    },
+    "nfl redzone": {
+        "key": "redzone",
+        "name": "NFL RedZone US",
+        "category": "football",
+        "lang": "en",
+    },
+    "willow": {
+        "key": "willow",
+        "name": "Willow Cricket",
+        "category": "cricket",
+        "lang": "en",
+    },
+    "willow cricket": {
+        "key": "willow",
+        "name": "Willow Cricket",
+        "category": "cricket",
+        "lang": "en",
+    },
+    "sky sports cricket uk": {
+        "key": "skysportscricket",
+        "name": "Sky Sports Cricket UK",
+        "category": "cricket",
+        "lang": "en",
+    },
+}
+
 _MATCH_ENDPOINTS: tuple[str, ...] = (
     "/streams",
     "/api/v1/matches",
@@ -357,24 +406,56 @@ def _parse_html_matches(html: str, mirror: str) -> list[ProviderEvent]:
     return events
 
 
-def parse_streamfree_matches(payload: Any, mirror_url: str) -> list[ProviderEvent]:
+def _is_24_7_event(title: str, start_ms: int) -> bool:
+    if start_ms <= 0:
+        return True
+    lower = (title or "").lower()
+    return any(tok in lower for tok in ("channel", "24/7", "redzone"))
+
+
+def _within_temporal_window(start_ms: int, now_ms: int, is_24_7: bool) -> bool:
+    if is_24_7 or start_ms <= 0:
+        return True
+    if start_ms > now_ms + MAX_FUTURE_WINDOW_MS:
+        return False
+    if now_ms - start_ms > MAX_PAST_WINDOW_MS:
+        return False
+    return True
+
+
+def parse_streamfree_matches(
+    payload: Any,
+    mirror_url: str,
+    *,
+    now_ms: Optional[int] = None,
+) -> list[ProviderEvent]:
     """Parse StreamFree schedule (JSON API or HTML) into `ProviderEvent` records.
 
     Always emits `/player/{cat}/{slug}` URLs without resolving ephemeral `_0x`
     tokens, delegating just-in-time extraction to EasyProxy (`host=streamfree`).
     """
     mirror = _normalize_mirror_url(mirror_url) or FALLBACK_MIRROR
+    events: list[ProviderEvent] = []
     if isinstance(payload, (dict, list)):
-        return _parse_json_matches(payload, mirror)
-    text = str(payload or "").strip()
-    if not text:
-        return []
-    if text[0] in ("{", "["):
-        try:
-            return _parse_json_matches(json.loads(text), mirror)
-        except json.JSONDecodeError:
-            pass
-    return _parse_html_matches(text, mirror)
+        events = _parse_json_matches(payload, mirror)
+    else:
+        text = str(payload or "").strip()
+        if not text:
+            return []
+        if text[0] in ("{", "["):
+            try:
+                events = _parse_json_matches(json.loads(text), mirror)
+            except json.JSONDecodeError:
+                events = _parse_html_matches(text, mirror)
+        else:
+            events = _parse_html_matches(text, mirror)
+
+    if now_ms is None:
+        return events
+    return [
+        ev for ev in events
+        if _within_temporal_window(ev.start_ms, now_ms, _is_24_7_event(ev.title, ev.start_ms))
+    ]
 
 
 class StreamFreeService(BaseStreamProvider):
@@ -402,6 +483,11 @@ class StreamFreeService(BaseStreamProvider):
     def enabled(self) -> bool:
         """Return True when StreamFree harvesting is enabled in Settings."""
         return bool(self.settings.ENABLE_STREAMFREE)
+
+    @property
+    def active_mirror(self) -> str:
+        """Return the currently active StreamFree mirror origin."""
+        return self._active_mirror
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._external_client is not None:
@@ -450,36 +536,19 @@ class StreamFreeService(BaseStreamProvider):
             logger.debug("StreamFree mirror discovery failed, using fallback: %s", exc)
         return primary_fallback
 
-    async def resolve_stream_url(
+    async def _fetch_sources_and_route(
         self,
-        stream_key: str,
-        category: str = "soccer",
-        domain: Optional[str] = None,
-    ) -> list[dict[str, str]]:
-        """Resolve signed `.m3u8` URLs for `stream_key` via sources + routing + `_0x` (300s cache)."""
-        key = (stream_key or "").strip()
-        if not key:
-            return []
-
-        cat = (category or "soccer").strip().lower()
-        cache_key = (key, cat)
-        now = time.monotonic()
-        cached = self._resolve_cache.get(cache_key)
-        if cached and now - cached[0] < RESOLVE_CACHE_TTL_SECONDS:
-            return cached[1]
-
-        client = self._get_client()
-        mirror = _normalize_mirror_url(domain or "") or self._active_mirror
-        if not mirror:
-            mirror = await self.discover_mirror(client)
-
+        client: httpx.AsyncClient,
+        mirror: str,
+        key: str,
+        cat: str,
+    ) -> tuple[list[dict[str, Any]], str]:
         api_headers = {
             "User-Agent": CHROME_USER_AGENT,
             "Accept": "application/json, text/html, */*",
             "Referer": f"{mirror}/player/{cat}/{key}",
             "Origin": mirror,
         }
-
         sources_req = client.get(f"{mirror}/api/v1/sources/{key}", headers=api_headers)
         route_req = client.get(f"{mirror}/get-stream-key/{key}", headers=api_headers)
         sources_resp, route_resp = await asyncio.gather(
@@ -504,6 +573,64 @@ class StreamFreeService(BaseStreamProvider):
                     server_name = str(route_data.get("server_name") or "").strip().lower()
             except Exception:
                 pass
+
+        return sources_list, server_name
+
+    async def resolve_stream_url(
+        self,
+        stream_key: str,
+        category: str = "soccer",
+        domain: Optional[str] = None,
+    ) -> list[dict[str, str]]:
+        """Resolve signed `.m3u8` URLs for `stream_key` via sources + routing + `_0x` (300s cache)."""
+        key = (stream_key or "").strip()
+        if not key:
+            return []
+
+        cat = (category or "soccer").strip().lower()
+        cache_key = (key, cat)
+        now = time.monotonic()
+        cached = self._resolve_cache.get(cache_key)
+        if cached and now - cached[0] < RESOLVE_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        client = self._get_client()
+        candidate_mirrors: list[str] = []
+        requested = _normalize_mirror_url(domain or "")
+        if requested:
+            candidate_mirrors.append(requested)
+        if self._active_mirror and self._active_mirror not in candidate_mirrors:
+            candidate_mirrors.append(self._active_mirror)
+
+        mirror = ""
+        sources_list: list[dict[str, Any]] = []
+        server_name = ""
+
+        for cand in candidate_mirrors:
+            sources_list, server_name = await self._fetch_sources_and_route(
+                client, cand, key, cat
+            )
+            if sources_list:
+                mirror = cand
+                break
+
+        if not sources_list:
+            discovered = await self.discover_mirror(client)
+            if discovered and discovered not in candidate_mirrors:
+                sources_list, server_name = await self._fetch_sources_and_route(
+                    client, discovered, key, cat
+                )
+                if sources_list:
+                    mirror = discovered
+
+        if not mirror:
+            mirror = self._active_mirror or requested or FALLBACK_MIRROR
+        elif mirror != self._active_mirror and (not requested or mirror != requested):
+            self._active_mirror = mirror
+
+        live_sources = [s for s in sources_list if s.get("live", True)]
+        if live_sources:
+            sources_list = live_sources
 
         if server_name == "externalcdn":
             route_prefix = "/live-externalcdn"
@@ -574,7 +701,7 @@ class StreamFreeService(BaseStreamProvider):
                     {
                         "m3u8_url": m3u8_url,
                         "embed_url": embed_url,
-                        "origin": f"https://{embed_host}" if embed_host else embed_origin,
+                        "origin": embed_origin,
                         "quality": src_quality or variant,
                     }
                 )
@@ -583,19 +710,59 @@ class StreamFreeService(BaseStreamProvider):
             self._resolve_cache[cache_key] = (now, resolved)
         return resolved
 
-    async def harvest(self) -> ProviderHarvestResult:
+    @staticmethod
+    def _build_linear_channels(
+        events: list[ProviderEvent],
+        mirror: str,
+    ) -> dict[str, list[StreamSource]]:
+        linear: dict[str, list[StreamSource]] = {}
+        base = mirror.rstrip("/")
+
+        for ev in events:
+            if not _is_24_7_event(ev.title, ev.start_ms):
+                continue
+            key = canonicalize_channel_name(ev.title) or ev.title.strip().lower()
+            if key and ev.streams:
+                linear.setdefault(key, []).extend(ev.streams)
+
+        for canon_key, info in STREAMFREE_CANONICAL_CHANNELS.items():
+            if canon_key in linear:
+                continue
+            player_url = _build_player_url(base, info["category"], info["key"])
+            if not player_url:
+                continue
+            linear[canon_key] = [
+                StreamSource(
+                    provider="streamfree",
+                    title=f"{info['name']} (1080p FHD)",
+                    url=player_url,
+                    quality="1080p FHD",
+                    language=info.get("lang", "en"),
+                    priority=5,
+                    requires_proxy=True,
+                    proxy_host="streamfree",
+                    channel_name=info["name"],
+                    raw_url=info["key"],
+                )
+            ]
+        return linear
+
+    async def harvest(self, *, now_ms: Optional[int] = None) -> ProviderHarvestResult:
         """Discover active mirror and fetch StreamFree live matches."""
         if not self.enabled:
             return ProviderHarvestResult(provider=self.name)
 
         client = self._get_client()
         discovered = await self.discover_mirror(client)
+        if discovered:
+            self._active_mirror = discovered
         candidate_mirrors = [discovered] + [
             m for m in self._fallback_mirrors() if m != discovered
         ]
 
         events: list[ProviderEvent] = []
         last_error = ""
+        effective_now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
 
         for mirror in candidate_mirrors:
             headers = {
@@ -610,7 +777,9 @@ class StreamFreeService(BaseStreamProvider):
                     resp = await client.get(url, headers=headers)
                     if resp.status_code != 200 or not resp.text.strip():
                         continue
-                    parsed = parse_streamfree_matches(resp.text, mirror)
+                    parsed = parse_streamfree_matches(
+                        resp.text, mirror, now_ms=effective_now_ms
+                    )
                     if parsed:
                         self._active_mirror = mirror
                         events = parsed
@@ -621,9 +790,14 @@ class StreamFreeService(BaseStreamProvider):
             if events:
                 break
 
+        active = self._active_mirror or discovered or FALLBACK_MIRROR
+        linear_channels = self._build_linear_channels(events, active)
+        raw_count = len(events) + sum(len(v) for v in linear_channels.values())
+
         return ProviderHarvestResult(
             provider=self.name,
             events=events,
-            raw_count=len(events),
+            linear_channels=linear_channels,
+            raw_count=raw_count,
             error=last_error if not events else "",
         )

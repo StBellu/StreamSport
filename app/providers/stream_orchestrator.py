@@ -17,10 +17,21 @@ from app.core.user_config import UserConfig
 from app.models.domain import Match, ProviderEvent, SportSilo, StreamSource
 from app.models.stremio import StreamItem
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult
-from app.providers.daddylive_service import MAX_CHANNELS_PER_EVENT, DaddyLiveService
+from app.providers.daddylive_service import (
+    MAX_CHANNELS_PER_EVENT,
+    DaddyLiveService,
+    _extract_channel_id,
+)
 from app.providers.fctv33_service import Fctv33Service
+from app.providers.mandrakodi_service import MandraKodiService
 from app.providers.streamfree_service import StreamFreeService
-from app.taxonomy import DEFAULT_TEAM_MATCHER, detect_demographics_from_stream_title
+from app.taxonomy import (
+    DEFAULT_TEAM_MATCHER,
+    SKY_CHID_TO_CANONICAL,
+    canonicalize_channel_name,
+    detect_channel_flag,
+    detect_demographics_from_stream_title,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +56,8 @@ _LIVE_WINDOW_MINUTES: dict[SportSilo, int] = {
 _DEFAULT_LIVE_WINDOW_MINUTES = 150
 
 _EVENT_SPLIT_RE = re.compile(r"\s+(?:vs\.?|v\.?|@|–|—|-)\s+", re.IGNORECASE)
-_CHANNEL_NOISE_RE = re.compile(
-    r"(?:\b(?:hd|fhd|uhd|sd|4k|it|ita|italia|uk|en|eng|vip|live|plus)\b|"
-    r"\(\s*(?:it|ita|uk|en|eng|hd|fhd)\s*\)|"
-    r"\[\s*(?:it|ita|uk|en|eng|hd|fhd)\s*\])",
-    re.IGNORECASE,
-)
+_VALID_DLHD_CID_RE = re.compile(r"^[0-9a-zA-Z_-]{1,32}$")
+_FCTV33_URL_ID_RE = re.compile(r"^fctv33://(\d+)(?:/(\d+))?(?:.*[?&]sportType=(\d+))?", re.IGNORECASE)
 _IT_BROADCASTER_RE = re.compile(
     r"\b(?:sky\s*sport|dazn|rai\s*(?:1|2|3|sport)?|canale\s*5|italia\s*1|rete\s*4|"
     r"tv8|nove|cielo|mediaset|supertennis|solocalcio|equtv|zona\s*dazn)\b",
@@ -65,35 +72,8 @@ _DLHD_EN_RE = re.compile(
     r"\b(?:en|eng|uk|usa|us|english|tnt|bt\s*sport|espn|fox|cbs|nbc|sky\s*sports)\b",
     re.IGNORECASE,
 )
-
-_CHANNEL_ALIASES: dict[str, str] = {
-    "sky sport 1": "sky sport uno",
-    "sky sport uno": "sky sport uno",
-    "sky calcio": "sky sport calcio",
-    "sky calcio 1": "sky sport calcio",
-    "canale5": "canale 5",
-    "italia1": "italia 1",
-    "rete4": "rete 4",
-    "rai1": "rai 1",
-    "rai2": "rai 2",
-    "rai3": "rai 3",
-    "rai sport": "rai sport",
-    "raisport": "rai sport",
-    "solo calcio": "solocalcio",
-    "tv 8": "tv8",
-    "20": "20 mediaset",
-    "mediaset 20": "20 mediaset",
-    "venti": "20 mediaset",
-    "dazn1": "dazn 1",
-    "dazn2": "dazn 2",
-    "dazn3": "dazn 3",
-    "dazn4": "dazn 4",
-    "sport 24": "sky sport 24",
-    "sport uno": "sky sport uno",
-    "sport arena": "sky sport arena",
-    "sport max": "sky sport max",
-    "sport tennis": "sky sport tennis",
-    "sport calcio": "sky sport calcio",
+_CANONICAL_TO_SKY_CHID: dict[str, str] = {
+    canonical: chid for chid, canonical in SKY_CHID_TO_CANONICAL.items()
 }
 
 _PROXY_HOST_DEFAULTS: dict[str, str] = {
@@ -160,18 +140,26 @@ _ROME_TZ: tzinfo = _load_rome_tz()
 
 
 def normalize_channel_name(name: str) -> str:
-    """Normalize linear TV broadcaster names for deterministic channel matching."""
-    raw = re.sub(r"[^\w\s]", " ", (name or "").lower())
-    raw = re.sub(r"\s+", " ", raw).strip()
-    if raw in _CHANNEL_ALIASES:
-        return _CHANNEL_ALIASES[raw]
-    cleaned = _CHANNEL_NOISE_RE.sub(" ", raw)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return _CHANNEL_ALIASES.get(cleaned, cleaned) or raw
+    """Normalize linear TV broadcaster names via the shared canonical channel taxonomy."""
+    return canonicalize_channel_name(name)
+
+
+def _format_stream_name(base_label: str, src: StreamSource) -> str:
+    """Prefix a country flag on `StreamItem.name` when detectable."""
+    flag = detect_channel_flag(
+        f"{src.channel_name or ''} {src.title or ''}".strip(),
+        src.language or "",
+    )
+    if not flag or flag in base_label:
+        return base_label
+    parts = base_label.split(" ", 1)
+    if len(parts) == 2 and parts[0] and not parts[0][0].isalnum():
+        return f"{parts[0]} {flag} {parts[1]}"
+    return f"{flag} {base_label}"
 
 
 def _is_italian_channel(src: StreamSource) -> bool:
-    if (src.language or "").strip().lower() == "it":
+    if (src.language or "").strip().lower() in ("it", "ita"):
         return True
     combined = f"{src.channel_name} {src.title}"
     return bool(_IT_BROADCASTER_RE.search(combined))
@@ -180,7 +168,7 @@ def _is_italian_channel(src: StreamSource) -> bool:
 def _source_sort_key(src: StreamSource) -> tuple[int, int, int]:
     """Return strict hierarchy sort key for `Match.sources`:
     1: tvvoo (IT first), 2: mandrakodi, 3: spon (ITA/HD7/HD8 first),
-    4: daddylive (IT -> EN -> other), 5: streamfree, 6: fctv33, 7: acestream.
+    4: daddylive (IT -> EN -> other), 5: streamfree, 6: fctv33 (IT first), 7: acestream.
     """
     if src.is_acestream:
         return (7, 0, src.priority)
@@ -206,6 +194,10 @@ def _source_sort_key(src: StreamSource) -> tuple[int, int, int]:
             sub_rank = 1
         else:
             sub_rank = 2
+    elif provider == "fctv33":
+        lang = (src.language or "").lower()
+        combined = f"{src.channel_name} {src.title}"
+        sub_rank = 0 if (lang in ("it", "ita") or _DLHD_IT_RE.search(combined)) else 1
 
     return (tier, sub_rank, src.priority)
 
@@ -316,16 +308,19 @@ class StreamOrchestrator:
                 if norm_key:
                     index.setdefault(norm_key, []).extend(sources)
                 for src in sources:
-                    if src.channel_name:
-                        alt_key = normalize_channel_name(src.channel_name)
-                        if alt_key and alt_key != norm_key:
-                            index.setdefault(alt_key, []).append(src)
+                    ch_name = src.channel_name
+                    if not ch_name or ch_name == raw_key or ch_name == norm_key:
+                        continue
+                    alt_key = normalize_channel_name(ch_name)
+                    if alt_key and alt_key != norm_key:
+                        index.setdefault(alt_key, []).append(src)
         return index
 
     def _match_linear_channels(
         self,
         match: Match,
         linear_index: dict[str, list[StreamSource]],
+        lookup_cache: Optional[dict[str, list[StreamSource]]] = None,
     ) -> list[StreamSource]:
         if not match.broadcasters or not linear_index:
             return []
@@ -334,17 +329,26 @@ class StreamOrchestrator:
             key = normalize_channel_name(broadcaster)
             if not key:
                 continue
-            candidates = linear_index.get(key)
-            if not candidates and len(key) >= 4:
-                # Word-boundary fallback for compound labels without matching e.g. "rai 1" -> "rai 10"
-                pat = re.compile(rf"(?<!\w){re.escape(key)}(?!\w)")
-                for idx_key, idx_sources in linear_index.items():
-                    if pat.search(idx_key) or (
-                        len(idx_key) >= 4
-                        and re.search(rf"(?<!\w){re.escape(idx_key)}(?!\w)", key)
-                    ):
-                        candidates = idx_sources
-                        break
+            if lookup_cache is not None and key in lookup_cache:
+                candidates = lookup_cache[key]
+            else:
+                candidates = linear_index.get(key) or []
+                if not candidates and len(key) >= 4:
+                    # Word-boundary fallback for compound labels without matching e.g. "rai 1" -> "rai 10"
+                    pat: Optional[re.Pattern[str]] = None
+                    for idx_key, idx_sources in linear_index.items():
+                        if key in idx_key:
+                            if pat is None:
+                                pat = re.compile(rf"(?<!\w){re.escape(key)}(?!\w)")
+                            if pat.search(idx_key):
+                                candidates = idx_sources
+                                break
+                        elif len(idx_key) >= 4 and idx_key in key:
+                            if re.search(rf"(?<!\w){re.escape(idx_key)}(?!\w)", key):
+                                candidates = idx_sources
+                                break
+                if lookup_cache is not None:
+                    lookup_cache[key] = candidates
             if candidates:
                 attached.extend(candidates)
         return attached
@@ -453,12 +457,15 @@ class StreamOrchestrator:
             return []
 
         linear_index = self._build_linear_index(harvest_results)
+        broadcaster_cache: dict[str, list[StreamSource]] = {}
         event_matches = self._match_provider_events(matches, harvest_results)
 
         updated: list[Match] = []
         for idx, match in enumerate(matches):
             combined_sources: list[StreamSource] = list(match.sources)
-            combined_sources.extend(self._match_linear_channels(match, linear_index))
+            combined_sources.extend(
+                self._match_linear_channels(match, linear_index, lookup_cache=broadcaster_cache)
+            )
             combined_sources.extend(event_matches.get(idx, ()))
 
             final_sources = self._finalize_sources(combined_sources)
@@ -489,6 +496,7 @@ class StreamOrchestrator:
         *,
         config_segment: str = "",
         now_ms: Optional[int] = None,
+        use_daddylive_jit: bool = False,
     ) -> list[StreamItem]:
         """Format Stremio `StreamItem` list respecting live window, countdown, and EasyProxy."""
         current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
@@ -543,7 +551,7 @@ class StreamOrchestrator:
             if src.is_acestream:
                 acestream_items.append(
                     StreamItem(
-                        name="🔗 AceStream",
+                        name=_format_stream_name("🔗 AceStream", src),
                         title=src.title,
                         externalUrl=src.url,
                     )
@@ -561,7 +569,7 @@ class StreamOrchestrator:
                     )
                     items.append(
                         StreamItem(
-                            name="⚡ TvVoo",
+                            name=_format_stream_name("⚡ TvVoo", src),
                             title=f"[⚡] {src.title} (No-Freeze)",
                             url=manifest_url,
                         )
@@ -575,7 +583,7 @@ class StreamOrchestrator:
                         )
                         items.append(
                             StreamItem(
-                                name="🛰️ TvVoo EP",
+                                name=_format_stream_name("🛰️ TvVoo EP", src),
                                 title=f"[🛰️ EP] {src.title}",
                                 url=ep_stream_url,
                             )
@@ -595,7 +603,7 @@ class StreamOrchestrator:
                     )
                     items.append(
                         StreamItem(
-                            name="🔐 MandraKodi",
+                            name=_format_stream_name("🔐 MandraKodi", src),
                             title=src.title,
                             url=mpd_url,
                         )
@@ -607,7 +615,7 @@ class StreamOrchestrator:
             if not src.requires_proxy:
                 items.append(
                     StreamItem(
-                        name=f"📺 {provider.upper() or 'DIRECT'}",
+                        name=_format_stream_name(f"📺 {provider.upper() or 'DIRECT'}", src),
                         title=src.title,
                         url=src.url,
                     )
@@ -617,6 +625,18 @@ class StreamOrchestrator:
             if not ep_url:
                 missing_easyproxy = True
                 continue
+
+            if provider == "daddylive" and use_daddylive_jit:
+                cid = _extract_channel_id(src.raw_url or src.url)
+                if cid and _VALID_DLHD_CID_RE.match(cid):
+                    items.append(
+                        StreamItem(
+                            name=_format_stream_name("🛰️ DADDYLIVE", src),
+                            title=src.title,
+                            url=f"{base}{prefix}/daddylive/stream/{cid}.m3u8",
+                        )
+                    )
+                    continue
 
             if provider == "spon":
                 hdr_qs = _build_easyproxy_headers_qs(src.headers, quote_plus_vals=True)
@@ -632,30 +652,31 @@ class StreamOrchestrator:
                 )
             else:
                 proxy_host = src.proxy_host or _PROXY_HOST_DEFAULTS.get(provider, "")
+                d_target = ((src.raw_url or "").strip() or src.url) if provider == "fctv33" else src.url
                 if proxy_host in ("hls", "mpd"):
                     hdr_qs = _build_easyproxy_headers_qs(src.headers)
                     stream_url = (
                         f"{ep_url}/proxy/{proxy_host}/manifest.m3u8"
-                        f"?d={quote(src.url, safe='')}{pass_qs}{hdr_qs}"
+                        f"?d={quote(d_target, safe='')}{pass_qs}{hdr_qs}"
                     )
                 elif proxy_host:
                     hdr_qs = _build_easyproxy_headers_qs(src.headers)
                     stream_url = (
                         f"{ep_url}/extractor/video.m3u8"
                         f"?host={quote(proxy_host, safe='')}"
-                        f"&d={quote(src.url, safe='')}"
+                        f"&d={quote(d_target, safe='')}"
                         f"&redirect_stream=true{pass_qs}{hdr_qs}"
                     )
                 else:
                     hdr_qs = _build_easyproxy_headers_qs(src.headers, quote_plus_vals=True)
                     stream_url = (
                         f"{ep_url}/proxy/manifest.m3u8"
-                        f"?url={quote_plus(src.url)}{pass_qs}{hdr_qs}"
+                        f"?url={quote_plus(d_target)}{pass_qs}{hdr_qs}"
                     )
 
             items.append(
                 StreamItem(
-                    name=f"🛰️ {provider.upper() or 'PROXY'}",
+                    name=_format_stream_name(f"🛰️ {provider.upper() or 'PROXY'}", src),
                     title=src.title,
                     url=stream_url,
                 )
@@ -673,6 +694,53 @@ class StreamOrchestrator:
         items.extend(acestream_items)
         return items
 
+    def _find_fctv33_jit_target(
+        self,
+        match: Match,
+        fctv_service: Fctv33Service,
+    ) -> Optional[tuple[str, int]]:
+        for src in match.sources:
+            if (src.provider or "").strip().lower() != "fctv33":
+                continue
+            m = _FCTV33_URL_ID_RE.match(src.url or "")
+            if m:
+                mid, sid, stype = m.group(1), m.group(2), int(m.group(3) or 1)
+                if not sid or sid == "0":
+                    return mid, stype
+
+        if not fctv_service.known_matches:
+            return None
+
+        h1 = match.home_team.name if match.home_team else match.title
+        a1 = match.away_team.name if match.away_team else ""
+        best_target: Optional[tuple[str, int]] = None
+        best_score = 0.0
+        for cand in fctv_service.known_matches:
+            c_title = cand.get("title") or ""
+            cw, cy = detect_demographics_from_stream_title(c_title)
+            if cand.get("competition"):
+                comp_w, comp_y = detect_demographics_from_stream_title(cand["competition"])
+                cw = cw or comp_w
+                cy = cy or comp_y
+            res = DEFAULT_TEAM_MATCHER.match_score(
+                h1,
+                a1,
+                cand.get("home") or "",
+                cand.get("away") or "",
+                alt_home_1=match.alt_home or (match.competition if not a1 else ""),
+                alt_away_1=match.alt_away,
+                date_1_ms=match.date,
+                date_2_ms=int(cand.get("start_ms") or 0),
+                is_women_1=match.is_women,
+                is_youth_1=match.is_youth,
+                is_women_2=cw,
+                is_youth_2=cy,
+            )
+            if res.matched and res.score > best_score:
+                best_score = res.score
+                best_target = (str(cand["match_id"]), int(cand.get("sport_type") or 1))
+        return best_target
+
     async def build_stremio_streams_async(
         self,
         match: Match,
@@ -682,79 +750,167 @@ class StreamOrchestrator:
         config_segment: str = "",
         now_ms: Optional[int] = None,
     ) -> list[StreamItem]:
-        """Resolve dynamic StreamFree `_0x` endpoints on-demand before formatting streams."""
+        """Resolve JIT StreamFree, MandraKodi Sky, FCTV33 detail, and DaddyLive routes."""
         current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
         window_ms = _live_window_ms(match.silo)
         if match.date > 0 and current_ms > match.date + window_ms:
             return []
 
         ep_url = (user_cfg.ep_url or "").strip().rstrip("/")
-        sf_service: Optional[StreamFreeService] = next(
-            (p for p in self._providers if isinstance(p, StreamFreeService)),
+        sf_service = next(
+            (p for p in self._providers if isinstance(p, StreamFreeService) and p.enabled),
+            None,
+        )
+        mk_service = next(
+            (p for p in self._providers if isinstance(p, MandraKodiService) and p.enabled),
+            None,
+        )
+        dl_service = next(
+            (p for p in self._providers if isinstance(p, DaddyLiveService) and p.enabled),
+            None,
+        )
+        fctv_service = next(
+            (p for p in self._providers if isinstance(p, Fctv33Service) and p.enabled),
             None,
         )
         is_pre_match = match.date > 0 and current_ms < (match.date - PRE_MATCH_WINDOW_MS)
 
-        if not ep_url or sf_service is None or is_pre_match:
+        if not ep_url or is_pre_match:
             return self.build_stremio_streams(
                 match,
                 user_cfg,
                 base_url,
                 config_segment=config_segment,
                 now_ms=current_ms,
+                use_daddylive_jit=False,
             )
 
-        sf_indices = [
-            idx
-            for idx, src in enumerate(match.sources)
-            if (src.provider or "").strip().lower() == "streamfree"
-            and ".m3u8" not in src.url.lower()
-            and (src.raw_url or "/player/" in src.url)
-        ]
-        if not sf_indices:
-            return self.build_stremio_streams(
-                match,
-                user_cfg,
-                base_url,
-                config_segment=config_segment,
-                now_ms=current_ms,
-            )
+        # 1. StreamFree dynamic _0x JIT tasks
+        sf_indices = (
+            [
+                idx
+                for idx, src in enumerate(match.sources)
+                if (src.provider or "").strip().lower() == "streamfree"
+                and ".m3u8" not in src.url.lower()
+                and (src.raw_url or "/player/" in src.url)
+            ]
+            if sf_service is not None
+            else []
+        )
 
-        async def _resolve_one(src: StreamSource) -> list[dict[str, str]]:
-            raw_key = (src.raw_url or "").strip()
-            category = (src.channel_name or "soccer").strip().lower()
+        async def _resolve_sf_one(src: StreamSource) -> list[dict[str, str]]:
+            assert sf_service is not None
             parsed = urlsplit(src.url)
-            domain = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else None
-            if not raw_key and "/player/" in (parsed.path or ""):
+            path_cat = ""
+            path_key = ""
+            if "/player/" in (parsed.path or ""):
                 parts = [p for p in parsed.path.split("/") if p]
                 if len(parts) >= 3:
-                    category, raw_key = parts[1], parts[2]
+                    path_cat, path_key = parts[1], parts[2]
+            category = (path_cat or src.channel_name or "soccer").strip().lower()
+            raw_key = (path_key or src.raw_url or "").strip()
             if not raw_key:
                 return []
+            parsed_domain = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else None
+            domain = sf_service.active_mirror or parsed_domain
             return await sf_service.resolve_stream_url(raw_key, category, domain=domain)
 
-        resolved_batches = await asyncio.gather(
-            *(_resolve_one(match.sources[idx]) for idx in sf_indices),
+        # 2. MandraKodi Sky A1A159 JIT + SuperTennis OTT tasks (with FreeShot already on match.sources)
+        sky_chids: list[str] = []
+        probe_supertennis = False
+        if mk_service is not None:
+            existing_mk_mpd = {
+                normalize_channel_name(s.channel_name or s.title)
+                for s in match.sources
+                if (s.provider or "").lower() == "mandrakodi" and s.proxy_host == "mpd"
+            }
+            if (mk_service.settings.MANDRAKODI_API_URL or "").strip():
+                for broadcaster in match.broadcasters:
+                    canon = normalize_channel_name(broadcaster)
+                    chid = _CANONICAL_TO_SKY_CHID.get(canon)
+                    if chid and canon not in existing_mk_mpd and chid not in sky_chids:
+                        sky_chids.append(chid)
+            if match.silo == SportSilo.TENNIS and any(
+                normalize_channel_name(b) == "supertennis" for b in match.broadcasters
+            ):
+                probe_supertennis = True
+
+        # 3. FCTV33 JIT /api/match/detail if match lacks concrete FCTV33 streams
+        has_concrete_fctv = any(
+            (s.provider or "").strip().lower() == "fctv33"
+            and (
+                ":" in (s.raw_url or "")
+                or (":" in (s.url or "") and not s.url.lower().startswith("fctv33://"))
+                or (
+                    (_m := _FCTV33_URL_ID_RE.match(s.url or "")) is not None
+                    and bool(_m.group(2))
+                    and _m.group(2) != "0"
+                )
+            )
+            for s in match.sources
+        )
+        fctv_target = (
+            self._find_fctv33_jit_target(match, fctv_service)
+            if (fctv_service is not None and not has_concrete_fctv)
+            else None
+        )
+
+        # Execute all independent JIT resolutions concurrently
+        sf_task = asyncio.gather(
+            *(_resolve_sf_one(match.sources[idx]) for idx in sf_indices),
+            return_exceptions=True,
+        )
+        mk_sky_task = asyncio.gather(
+            *(mk_service.resolve_sky_channel(chid) for chid in sky_chids),  # type: ignore[union-attr]
+            return_exceptions=True,
+        )
+        st_ott_task = (
+            mk_service.get_active_supertennis_ott_streams()  # type: ignore[union-attr]
+            if probe_supertennis
+            else asyncio.sleep(0, result=[])
+        )
+        fctv_task = (
+            fctv_service.resolve_match_streams(fctv_target[0], sport_type=fctv_target[1])  # type: ignore[union-attr]
+            if fctv_target is not None
+            else asyncio.sleep(0, result=[])
+        )
+
+        resolved_batches, mk_sky_results, st_ott_results, fctv_results = await asyncio.gather(
+            sf_task,
+            mk_sky_task,
+            st_ott_task,
+            fctv_task,
             return_exceptions=True,
         )
 
         new_sources: list[StreamSource] = []
-        idx_map = dict(zip(sf_indices, resolved_batches))
+        idx_map = (
+            dict(zip(sf_indices, resolved_batches))
+            if isinstance(resolved_batches, list)
+            else {}
+        )
         for idx, src in enumerate(match.sources):
             outcome = idx_map.get(idx)
             if isinstance(outcome, list) and outcome:
                 seen_urls: set[str] = set()
                 added = 0
+                ch_label = (src.channel_name or "").strip()
+                flag = detect_channel_flag(ch_label, src.language or "") or "🇬🇧"
                 for entry in outcome:
                     m3u8_url = (entry.get("m3u8_url") or "").strip()
                     if not m3u8_url or m3u8_url in seen_urls:
                         continue
                     seen_urls.add(m3u8_url)
                     qual = (entry.get("quality") or src.quality or "FHD").strip()
+                    title = (
+                        f"{flag} [StreamFree] {ch_label} [{qual}]"
+                        if ch_label
+                        else f"{flag} [StreamFree] {qual}"
+                    )
                     new_sources.append(
                         StreamSource(
                             provider="streamfree",
-                            title=f"[StreamFree] {qual}",
+                            title=title,
                             url=m3u8_url,
                             quality=qual,
                             language=src.language,
@@ -775,6 +931,28 @@ class StreamOrchestrator:
             else:
                 new_sources.append(src)
 
+        extra_sources: list[StreamSource] = []
+        if isinstance(mk_sky_results, list):
+            for item in mk_sky_results:
+                if isinstance(item, StreamSource):
+                    extra_sources.append(item)
+        if isinstance(st_ott_results, list):
+            for item in st_ott_results:
+                if isinstance(item, StreamSource):
+                    extra_sources.append(item)
+        if isinstance(fctv_results, list) and fctv_results:
+            new_sources = [
+                s
+                for s in new_sources
+                if not ((s.provider or "").strip().lower() == "fctv33")
+            ]
+            for item in fctv_results:
+                if isinstance(item, StreamSource):
+                    extra_sources.append(item)
+
+        if extra_sources:
+            new_sources = self._finalize_sources(new_sources + extra_sources)
+
         resolved_match = match.model_copy(update={"sources": new_sources})
         return self.build_stremio_streams(
             resolved_match,
@@ -782,4 +960,5 @@ class StreamOrchestrator:
             base_url,
             config_segment=config_segment,
             now_ms=current_ms,
+            use_daddylive_jit=bool(dl_service is not None),
         )

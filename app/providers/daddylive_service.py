@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Sequence
 from urllib.parse import quote, urljoin, urlsplit
 
@@ -18,6 +19,7 @@ from app.core.network import create_doh_client
 from app.models.domain import ProviderEvent, StreamSource
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult
 from app.taxonomy import detect_demographics_from_stream_title
+from app.taxonomy.channels import canonicalize_channel_name
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,38 @@ PLAYER_TEMPLATES: tuple[str, ...] = (
     "player/stream-{id}.php",
 )
 PLAYER_CACHE_TTL_SECONDS = 60.0
+BLOCKED_DOMAINS: frozenset[str] = frozenset({"dlive.sx", "dlhd.sx"})
+
+DADDYLIVE_CANONICAL_CHANNELS: dict[str, dict[str, str]] = {
+    # Linear Sky Sport IT
+    "sky sport uno": {"id": "461", "name": "Sky Sport UNO Italy"},
+    "sky sport calcio": {"id": "870", "name": "Sky Sport Calcio Italy"},
+    "sky sport tennis": {"id": "576", "name": "Sky Sport Tennis Italy"},
+    "sky sport arena": {"id": "462", "name": "Sky Sport Arena Italy"},
+    "sky sport basket": {"id": "875", "name": "Sky Sport Basket Italy"},
+    "sky sport max": {"id": "460", "name": "Sky Sport MAX Italy"},
+    "sky sport f1": {"id": "577", "name": "Sky Sport F1 Italy"},
+    "sky sport motogp": {"id": "575", "name": "Sky Sport MotoGP Italy"},
+    "sky sport golf": {"id": "574", "name": "Sky Sports Golf Italy"},
+    "sky sport 24": {"id": "869", "name": "Sky Sport 24 Italy"},
+    # Sky Calcio Contemporanea (LCN 251-254)
+    "sky sport 251": {"id": "871", "name": "Sky Calcio 1 (251) Italy"},
+    "sky sport 252": {"id": "872", "name": "Sky Calcio 2 (252) Italy"},
+    "sky sport 253": {"id": "873", "name": "Sky Calcio 3 (253) Italy"},
+    "sky sport 254": {"id": "874", "name": "Sky Calcio 4 (254) Italy"},
+    # DAZN & Eurosport
+    "dazn 1": {"id": "877", "name": "DAZN ZONA Italy"},
+    "eurosport 1": {"id": "878", "name": "EuroSport 1 Italy"},
+    "eurosport 2": {"id": "879", "name": "EuroSport 2 Italy"},
+    # Rai & Mediaset FTA
+    "rai sport": {"id": "882", "name": "Rai Sport Italy"},
+    "rai 1": {"id": "850", "name": "Rai 1 Italy"},
+    "rai 2": {"id": "851", "name": "Rai 2 Italy"},
+    "rai 3": {"id": "852", "name": "Rai 3 Italy"},
+    "rai 4": {"id": "853", "name": "Rai 4 Italy"},
+    "italia 1": {"id": "854", "name": "Italia 1 Italy"},
+    "20 mediaset": {"id": "857", "name": "20 Mediaset Italy"},
+}
 
 _SCHEDULE_PATHS: tuple[str, ...] = (
     "/index.php",
@@ -56,8 +90,14 @@ _CHANNELS_PATHS: tuple[str, ...] = (
     "/api/channels",
 )
 
+_EXTRA_ID_RE = re.compile(r"(?:watchextra\.php\?id=|^extra_)(\d+)", re.IGNORECASE)
+_STREAMED_ID_RE = re.compile(r"(?:watchstreamed\.php\?id=|^streamed_)(\d+)", re.IGNORECASE)
 _CHANNEL_ID_RE = re.compile(
-    r"(?:watchextra\.php\?id=|watch\.php\?id=|[?&]id=|stream-|/watch/|channel_id=)(\d+)(?:\.php)?",
+    r"(?:watch\.php\?id=|[?&]id=|stream-|/watch/|channel_id=)(\d+)(?:\.php)?",
+    re.IGNORECASE,
+)
+_JUNK_CHANNEL_RE = re.compile(
+    r"\b(?:channel\s+not\s+listed|just\s+ask\s+in\s+chat|no\s+stream(?:s)?|no\s+channel)\b",
     re.IGNORECASE,
 )
 _EMOJI_RE = re.compile(r"[\U00010000-\U0010ffff\u2600-\u27bf\ufe0f]+")
@@ -119,7 +159,10 @@ _SPORT_HINT_MAP: dict[str, str] = {
 def normalize_daddylive_channel_key(name: str) -> str:
     """Normalize a 24/7 channel name for cross-matching with Diretta/EPG broadcasters."""
     cleaned = re.sub(r"\bid\s*:?\s*\d+\b", " ", name or "", flags=re.IGNORECASE)
-    cleaned = _CHANNEL_SUFFIX_NOISE_RE.sub(" ", cleaned)
+    cleaned = canonicalize_channel_name(cleaned)
+    if cleaned:
+        return cleaned
+    cleaned = _CHANNEL_SUFFIX_NOISE_RE.sub(" ", name or "")
     cleaned = re.sub(r"[^\w\s]", " ", cleaned.lower())
     return re.sub(r"\s+", " ", cleaned).strip()
 
@@ -160,8 +203,23 @@ def _extract_channel_id(raw_value: Any) -> str:
         return ""
     if text.isdigit():
         return text
+    extra_m = _EXTRA_ID_RE.search(text)
+    if extra_m:
+        return f"extra_{extra_m.group(1)}"
+    streamed_m = _STREAMED_ID_RE.search(text)
+    if streamed_m:
+        return f"streamed_{streamed_m.group(1)}"
     match = _CHANNEL_ID_RE.search(text)
     return match.group(1) if match else ""
+
+
+def _build_watch_url(base_url: str, channel_id: str) -> str:
+    base = base_url.rstrip("/")
+    if channel_id.startswith("extra_"):
+        return f"{base}/watchextra.php?id={channel_id[6:]}"
+    if channel_id.startswith("streamed_"):
+        return f"{base}/watchstreamed.php?id={channel_id[9:]}"
+    return f"{base}/watch.php?id={channel_id}"
 
 
 def _parse_date_header(date_text: str, reference_dt: datetime) -> datetime:
@@ -224,6 +282,8 @@ def _parse_start_ms(
             minute = int(tm.group(2))
             if 0 <= hour <= 23 and 0 <= minute <= 59:
                 dt = date_base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if hour < 6:
+                    dt += timedelta(days=1)
                 return int(dt.timestamp() * 1000)
     return 0
 
@@ -255,6 +315,8 @@ def _build_channel_sources(
     seen_ids: set[str] = set()
 
     for idx, (ch_id, ch_name) in enumerate(raw_channels):
+        if _JUNK_CHANNEL_RE.search(ch_name or ""):
+            continue
         cid = _extract_channel_id(ch_id)
         if not cid or cid in seen_ids:
             continue
@@ -266,7 +328,7 @@ def _build_channel_sources(
     deduped.sort(key=lambda item: (item[0], item[1]))
     sources: list[StreamSource] = []
     for _, _, cid, label, lang in deduped[:MAX_CHANNELS_PER_EVENT]:
-        watch_url = f"{base}/watch.php?id={cid}"
+        watch_url = _build_watch_url(base, cid)
         display_title = f"{label} ({lang.upper()})" if lang else label
         sources.append(
             StreamSource(
@@ -712,7 +774,7 @@ def parse_daddylive_channels(
     def _add_entry(cid: str, label: str) -> None:
         clean_id = _extract_channel_id(cid)
         clean_label = re.sub(r"\s+", " ", (label or "").strip())
-        if not clean_id or not clean_label:
+        if not clean_id or not clean_label or _JUNK_CHANNEL_RE.search(clean_label):
             return
         norm_key = normalize_daddylive_channel_key(clean_label)
         if not norm_key:
@@ -722,7 +784,7 @@ def parse_daddylive_channels(
             return
         seen.add(clean_id)
         lang = detect_channel_language(clean_label)
-        watch_url = f"{base}/watch.php?id={clean_id}"
+        watch_url = _build_watch_url(base, clean_id)
         channels.setdefault(norm_key, []).append(
             StreamSource(
                 provider="daddylive",
@@ -792,6 +854,19 @@ class DaddyLiveService(BaseStreamProvider):
         )
         self._active_mirror: str = self._mirrors[0] if self._mirrors else DEFAULT_MIRRORS[0]
         self._player_cache: dict[tuple[str, str], tuple[float, str]] = {}
+        self._player_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_channel_lock(self, cid: str) -> asyncio.Lock:
+        lock = self._player_locks.get(cid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._player_locks[cid] = lock
+        return lock
+
+    @staticmethod
+    def _is_blocked_mirror(origin: str) -> bool:
+        netloc = urlsplit(origin).netloc.lower() or origin.lower()
+        return any(blocked in netloc for blocked in BLOCKED_DOMAINS)
 
     @property
     def enabled(self) -> bool:
@@ -855,10 +930,15 @@ class DaddyLiveService(BaseStreamProvider):
         except Exception as exc:
             logger.debug("DaddyLive status checker failed, falling back to DEFAULT_MIRRORS: %s", exc)
 
+        if discovered and self._is_blocked_mirror(discovered):
+            logger.debug("Ignoring blocked DaddyLive mirror: %s", discovered)
+            discovered = ""
+
+        safe_mirrors = [m for m in self._mirrors if not self._is_blocked_mirror(m)]
         if discovered:
-            ordered = [discovered] + [m for m in self._mirrors if m != discovered]
+            ordered = [discovered] + [m for m in safe_mirrors if m != discovered]
             return tuple(ordered)
-        return self._mirrors
+        return tuple(safe_mirrors) or self._mirrors
 
     async def _fetch_first_valid(
         self,
@@ -900,37 +980,77 @@ class DaddyLiveService(BaseStreamProvider):
         if cached and now - cached[0] < PLAYER_CACHE_TTL_SECONDS:
             return cached[1]
 
-        client = self._get_client()
-        domain = (self._active_mirror or DEFAULT_MIRRORS[0]).rstrip("/")
-        headers = {"User-Agent": CHROME_USER_AGENT, "Referer": f"{domain}/"}
+        async with self._get_channel_lock(cid):
+            now = time.monotonic()
+            cached = self._player_cache.get(cache_key)
+            if cached and now - cached[0] < PLAYER_CACHE_TTL_SECONDS:
+                return cached[1]
 
-        def _format_target(player_url: str) -> str:
-            if not ep_base:
-                return player_url
-            return (
-                f"{ep_base}/extractor/video.m3u8?host=dlstreams"
-                f"&d={quote(player_url, safe='')}&redirect_stream=true"
-                f"&api_password={quote(ep_pass or '', safe='')}"
-            )
+            client = self._get_client()
+            domain = (self._active_mirror or DEFAULT_MIRRORS[0]).rstrip("/")
+            headers = {"User-Agent": CHROME_USER_AGENT, "Referer": f"{domain}/"}
 
-        first_fallback = _format_target(f"{domain}/{PLAYER_TEMPLATES[0].format(id=cid)}")
-        for template in PLAYER_TEMPLATES:
-            player_url = f"{domain}/{template.format(id=cid)}"
-            target_url = _format_target(player_url)
-            try:
-                resp = await client.get(
-                    target_url,
-                    headers=headers,
-                    follow_redirects=False,
-                    timeout=6.0,
+            def _format_target(player_url: str) -> str:
+                if not ep_base:
+                    return player_url
+                return (
+                    f"{ep_base}/extractor/video.m3u8?host=dlstreams"
+                    f"&d={quote(player_url, safe='')}&redirect_stream=true"
+                    f"&api_password={quote(ep_pass or '', safe='')}"
                 )
-                if resp.status_code in (200, 302, 307):
-                    self._player_cache[cache_key] = (now, target_url)
-                    return target_url
-            except Exception as exc:
-                logger.debug("DaddyLive player probe failed for %s: %s", target_url, exc)
 
-        return first_fallback
+            if cid.startswith("extra_"):
+                candidate_paths: tuple[str, ...] = (f"watchextra.php?id={cid[6:]}",)
+            elif cid.startswith("streamed_"):
+                candidate_paths = (f"watchstreamed.php?id={cid[9:]}",)
+            else:
+                candidate_paths = tuple(template.format(id=cid) for template in PLAYER_TEMPLATES)
+
+            first_fallback = _format_target(f"{domain}/{candidate_paths[0]}")
+            for rel_path in candidate_paths:
+                player_url = f"{domain}/{rel_path}"
+                target_url = _format_target(player_url)
+                try:
+                    resp = await client.get(
+                        target_url,
+                        headers=headers,
+                        follow_redirects=False,
+                        timeout=6.0,
+                    )
+                    if resp.status_code in (200, 302, 307):
+                        self._player_cache[cache_key] = (time.monotonic(), target_url)
+                        return target_url
+                except Exception as exc:
+                    logger.debug("DaddyLive player probe failed for %s: %s", target_url, exc)
+
+            self._player_cache[cache_key] = (time.monotonic(), first_fallback)
+            return first_fallback
+
+    @staticmethod
+    def _merge_canonical_channels_fallback(
+        linear_channels: dict[str, list[StreamSource]],
+        base_url: str,
+    ) -> None:
+        base = base_url.rstrip("/")
+        for canon_key, info in DADDYLIVE_CANONICAL_CHANNELS.items():
+            if canon_key in linear_channels:
+                continue
+            cid = info["id"]
+            label = info["name"]
+            watch_url = _build_watch_url(base, cid)
+            linear_channels[canon_key] = [
+                StreamSource(
+                    provider="daddylive",
+                    title=f"{label} (IT)",
+                    url=watch_url,
+                    language="it",
+                    priority=4,
+                    requires_proxy=True,
+                    proxy_host="dlstreams",
+                    channel_name=label,
+                    raw_url=watch_url,
+                )
+            ]
 
     async def harvest(self) -> ProviderHarvestResult:
         """Scrape DaddyLive active mirror schedule and 24/7 TV channels."""
@@ -941,6 +1061,7 @@ class DaddyLiveService(BaseStreamProvider):
         events: list[ProviderEvent] = []
         linear_channels: dict[str, list[StreamSource]] = {}
         errors: list[str] = []
+        scraped_any = False
 
         mirrors = await self._discover_mirrors(client)
         for mirror in mirrors:
@@ -955,13 +1076,17 @@ class DaddyLiveService(BaseStreamProvider):
 
                 if events or linear_channels:
                     self._active_mirror = mirror
+                    scraped_any = True
                     break
             except Exception as exc:
                 errors.append(f"{mirror}: {exc}")
                 logger.warning("DaddyLive mirror %s failed: %s", mirror, exc)
 
+        fallback_mirror = self._active_mirror or (mirrors[0] if mirrors else DEFAULT_MIRRORS[0])
+        self._merge_canonical_channels_fallback(linear_channels, fallback_mirror)
+
         raw_count = len(events) + sum(len(v) for v in linear_channels.values())
-        error_msg = "; ".join(errors) if (not events and not linear_channels and errors) else ""
+        error_msg = "; ".join(errors) if (not scraped_any and errors) else ""
         return ProviderHarvestResult(
             provider=self.name,
             events=events,

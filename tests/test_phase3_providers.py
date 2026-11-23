@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
@@ -279,6 +280,7 @@ def test_streamfree_mirror_and_parse_no_0x_extraction() -> None:
 @pytest.mark.asyncio
 async def test_streamfree_service_harvest_discovers_mirror() -> None:
     seen_urls: list[str] = []
+    upcoming_ms = int(time.time() * 1000) + 30 * 60_000
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen_urls.append(str(request.url))
@@ -293,7 +295,7 @@ async def test_streamfree_service_harvest_discovers_mirror() -> None:
                             "category": "basketball",
                             "slug": "lakers-vs-celtics",
                             "title": "Los Angeles Lakers vs Boston Celtics",
-                            "start_ms": 1795381200000,
+                            "start_ms": upcoming_ms,
                         }
                     ]
                 },
@@ -305,6 +307,8 @@ async def test_streamfree_service_harvest_discovers_mirror() -> None:
         res = await svc.harvest()
         assert len(res.events) == 1
         assert res.events[0].streams[0].url == "https://sf-mirror.test/player/basketball/lakers-vs-celtics"
+        assert "sky sports f1 uk" in res.linear_channels
+        assert res.linear_channels["sky sports f1 uk"][0].url == "https://sf-mirror.test/player/racing/skyf1"
         assert all("/embed/" not in u and "get-stream-key" not in u for u in seen_urls)
 
 
@@ -837,3 +841,166 @@ def test_orchestrator_stremio_formatting_and_countdown() -> None:
         now_ms=kickoff_ms + 136 * 60_000,
     )
     assert expired_items == []
+
+
+@pytest.mark.asyncio
+async def test_daddylive_rollover_special_ids_blocked_domains_and_cascade() -> None:
+    from app.providers.daddylive_service import _extract_channel_id
+
+    assert _extract_channel_id("https://dlhd.dad/watchextra.php?id=99") == "extra_99"
+    assert _extract_channel_id("https://dlhd.dad/watchstreamed.php?id=77") == "streamed_77"
+
+    schedule = {
+        "2026-11-22": {
+            "Basketball": [
+                {
+                    "time": "22:00",
+                    "event": "Knicks vs Heat",
+                    "channels": [
+                        {"channel_name": "ESPN", "channel_id": "https://dlhd.dad/watchextra.php?id=99"},
+                        {"channel_name": "Channel not listed", "channel_id": "0"},
+                    ],
+                },
+                {
+                    "time": "01:30",
+                    "event": "Lakers vs Nuggets",
+                    "channels": [{"channel_name": "NBA TV", "channel_id": "44"}],
+                },
+            ]
+        }
+    }
+    events = parse_daddylive_schedule(json.dumps(schedule), base_url="https://dlhd.dad")
+    assert len(events) == 2
+    assert events[0].streams[0].url == "https://dlhd.dad/watchextra.php?id=99"
+    assert _extract_channel_id(events[0].streams[0].url) == "extra_99"
+    assert events[1].start_ms > events[0].start_ms  # 01:30 rolled over to +1 broadcast day
+
+    probe_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        u = str(request.url)
+        if request.url.path == "/" or "domains" in u:
+            return httpx.Response(200, text='<a href="https://dlive.sx/">b</a><a href="https://dlhd-live.test/">ok</a>')
+        probe_calls.append(u)
+        if "stream-51.php" in u:
+            return httpx.Response(307, headers={"Location": "https://cdn.example/live.m3u8"})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = DaddyLiveService(Settings(ENABLE_DADDYLIVE=True), client=client)
+        mirrors = await svc._discover_mirrors(client)
+        assert "https://dlive.sx" not in mirrors
+        first = await svc.resolve_working_player_url("51", ep_url="https://ep.test", ep_pass="pw")
+        second = await svc.resolve_working_player_url("51", ep_url="https://ep.test", ep_pass="pw")
+
+    assert "stream-51.php" in first
+    assert first == second
+    ep_probes = [u for u in probe_calls if "ep.test" in u]
+    assert len(ep_probes) == 2  # cached after finding working Player 1 Alt
+
+
+@pytest.mark.asyncio
+async def test_streamfree_live_true_and_fctv33_jit_detail() -> None:
+    from app.providers.fctv33_service import is_junk_event
+
+    assert is_junk_event("football", "UEFA Youth League U19", "Barcelona U19 vs Ajax U19") is True
+    assert is_junk_event("football", "Premier Reserve League", "Chelsea Reserve vs Arsenal Reserve") is True
+    assert is_junk_event("football", "Serie A", "Inter vs Milan") is False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/sources/live-key":
+            return httpx.Response(
+                200,
+                json={
+                    "sources": [
+                        {"url": "https://cdn.sf.test/embed/soccer/dead", "quality": "SD", "live": False},
+                        {"url": "https://cdn.sf.test/embed/soccer/live720", "quality": "HD", "live": True},
+                    ]
+                },
+            )
+        if path == "/get-stream-key/live-key":
+            return httpx.Response(200, json={"server_name": "cdn"})
+        if path == "/embed/soccer/live720":
+            return httpx.Response(
+                200,
+                text='<script>const _0x = {"live720": {"_t":"t","_ta":"a","_e":1,"_s":"s","_sa":"sa"}};</script>',
+            )
+        if path == "/api/match/detail":
+            stream_msg = _pb_field_varint(1, 555) + _pb_field_str(3, "DAZN 1 ITA") + _pb_field_varint(9, 2001)
+            payload = _pb_field_bytes(2, stream_msg)
+            return httpx.Response(200, content=_pb_field_bytes(10, payload))
+        return httpx.Response(404)
+
+    now_ms = int(time.time() * 1000)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sf = StreamFreeService(Settings(ENABLE_STREAMFREE=True), client=client)
+        dl = DaddyLiveService(Settings(ENABLE_DADDYLIVE=True), client=client)
+        fctv = Fctv33Service(Settings(ENABLE_FCTV33=True), client=client)
+        fctv._known_matches_by_sport[1] = [
+            {
+                "match_id": 998877,
+                "sport_type": 1,
+                "home": "Inter",
+                "away": "Milan",
+                "title": "Inter vs Milan",
+                "competition": "Serie A",
+                "start_ms": now_ms,
+            }
+        ]
+        orch = StreamOrchestrator([sf, dl, fctv])
+        match = Match(
+            id="diretta-jit-1",
+            title="Inter - Milan",
+            category="calcio_italiano",
+            silo=SportSilo.CALCIO_ITA,
+            date=now_ms,
+            end_date=now_ms + 120 * 60_000,
+            home_team=TeamInfo(name="Inter"),
+            away_team=TeamInfo(name="Milan"),
+            sources=[
+                StreamSource(
+                    provider="daddylive",
+                    title="DAZN 1 IT",
+                    url="https://dlhd.dad/watch.php?id=877",
+                    language="it",
+                    proxy_host="dlstreams",
+                    channel_name="dazn 1",
+                    raw_url="877",
+                ),
+                StreamSource(
+                    provider="streamfree",
+                    title="Sky Sports Main Event",
+                    url="https://strmfree.pk/player/soccer/live-key",
+                    channel_name="Sky Sports Main Event",
+                    raw_url="live-key",
+                    proxy_host="streamfree",
+                ),
+            ],
+        )
+        items = await orch.build_stremio_streams_async(
+            match,
+            UserConfig(ep_url="https://ep.test", ep_pass="pw"),
+            "https://addon.test",
+            config_segment="cfg1",
+            now_ms=now_ms,
+        )
+
+    urls = [it.url or "" for it in items]
+    decoded_proxied = [
+        parse_qs(urlsplit(u).query).get("url", [""])[0]
+        for u in urls
+    ]
+    assert any(u == "https://addon.test/cfg1/daddylive/stream/877.m3u8" for u in urls)
+    assert any("live720/index.m3u8" in d for d in decoded_proxied)
+    assert all("dead/index.m3u8" not in d for d in decoded_proxied)
+    sf_items = [
+        it
+        for it in items
+        if "live720" in parse_qs(urlsplit(it.url or "").query).get("url", [""])[0]
+    ]
+    assert "Sky Sports Main Event" in (sf_items[0].title or "")
+    fctv_items = [it for it in items if "host=fctv33" in (it.url or "")]
+    assert len(fctv_items) == 1
+    assert parse_qs(urlsplit(fctv_items[0].url or "").query)["d"] == ["998877:555"]
+

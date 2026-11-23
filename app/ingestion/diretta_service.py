@@ -56,16 +56,39 @@ OTT_EXCLUDE: tuple[str, ...] = (
     "now tv",
     "sky go",
     "amazon prime",
+    "prime video",
     "raiplay",
     "mediaset infinity",
+    "infinity+",
     "timvision",
     "discovery+",
     "onefootball",
+    "fifa+",
     "uefa.tv",
+    "red bull tv",
     "youtube",
     "twitch",
     "apple tv",
     "dazn app",
+    "diretta gol",
+    "diretta goal",
+    "mosaico",
+    "zona gol",
+    "mls season pass",
+    "nba global league pass",
+    "nhl.tv",
+    "fiba tv",
+    "euroleague tv",
+    "mlb.tv",
+    "sportitalia",
+    "solocalcio",
+    "milan tv",
+    "inter tv",
+    "juventus",
+    "lazio",
+    "roma",
+    "torino",
+    "napoli",
 )
 
 _BROADCASTER_REGION_SUFFIX_RE = re.compile(
@@ -462,6 +485,25 @@ class DirettaService:
     ) -> None:
         self._settings = settings or get_settings()
         self._client = client
+        self._owned_client: Optional[httpx.AsyncClient] = None
+        self._last_tennis_cities: frozenset[str] = frozenset()
+        self.last_fetch_failed: bool = False
+        self.last_failed_feeds: int = 0
+        self.last_total_feeds: int = 0
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return the injected or lazily created shared HTTP client."""
+        if self._client is not None:
+            return self._client
+        if self._owned_client is None or self._owned_client.is_closed:
+            self._owned_client = create_standard_client(timeout=20.0)
+        return self._owned_client
+
+    async def aclose(self) -> None:
+        """Close the owned HTTP client if one was created."""
+        if self._owned_client is not None and not self._owned_client.is_closed:
+            await self._owned_client.aclose()
+            self._owned_client = None
 
     def build_headers(self, lang: str = "it") -> dict[str, str]:
         """Build mandatory Flashscore/Diretta HTTP request headers."""
@@ -487,12 +529,17 @@ class DirettaService:
         day: int,
         *,
         lang: str,
-    ) -> list[dict[str, Any]]:
+        semaphore: Optional[asyncio.Semaphore] = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
         url = self.build_feed_url(sport_id, day, lang=lang)
         try:
-            resp = await client.get(url, headers=self.build_headers(lang=lang))
+            if semaphore is not None:
+                async with semaphore:
+                    resp = await client.get(url, headers=self.build_headers(lang=lang))
+            else:
+                resp = await client.get(url, headers=self.build_headers(lang=lang))
             resp.raise_for_status()
-            return parse_flashscore_feed(resp.text)
+            return parse_flashscore_feed(resp.text), False
         except Exception as exc:
             logger.warning(
                 "Flashscore feed fetch failed (sport=%s day=%s lang=%s): %s",
@@ -501,7 +548,7 @@ class DirettaService:
                 lang,
                 exc,
             )
-            return []
+            return [], True
 
     def _build_match(
         self,
@@ -798,10 +845,16 @@ class DirettaService:
     ) -> tuple[list[Match], frozenset[str]]:
         """Fetch and fuse IT+EN Flashscore feeds into admitted `Match` objects."""
         if not self._settings.ENABLE_DIRETTA:
+            self.last_fetch_failed = False
+            self.last_failed_feeds = 0
+            self.last_total_feeds = 0
             return [], frozenset()
 
         target_sports = [sid for sid in (sport_ids or SPORT_IDS.keys()) if sid in SPORT_IDS]
         if not target_sports:
+            self.last_fetch_failed = False
+            self.last_failed_feeds = 0
+            self.last_total_feeds = 0
             return [], frozenset()
 
         now_ms = (
@@ -810,47 +863,84 @@ class DirettaService:
             else int(time.time() * 1000)
         )
 
-        async def _run_with_client(client: httpx.AsyncClient) -> tuple[list[Match], frozenset[str]]:
-            tasks: list[tuple[int, int, str, Any]] = []
-            coros = []
-            for sid in target_sports:
-                for day in days:
-                    tasks.append((sid, day, "it", None))
-                    coros.append(self._fetch_feed_events(client, sid, day, lang="it"))
-                    tasks.append((sid, day, "en", None))
-                    coros.append(self._fetch_feed_events(client, sid, day, lang="en"))
+        client = self._get_client()
+        semaphore = asyncio.Semaphore(10)
+        tasks: list[tuple[int, int, str]] = []
+        coros = []
+        for sid in target_sports:
+            for day in days:
+                tasks.append((sid, day, "it"))
+                coros.append(
+                    self._fetch_feed_events(client, sid, day, lang="it", semaphore=semaphore)
+                )
+                tasks.append((sid, day, "en"))
+                coros.append(
+                    self._fetch_feed_events(client, sid, day, lang="en", semaphore=semaphore)
+                )
 
-            results = await asyncio.gather(*coros)
-            feeds_by_key: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
-            for (sid, day, lang, _), parsed in zip(tasks, results):
-                feeds_by_key[(sid, day, lang)] = parsed
+        results = await asyncio.gather(*coros)
+        feeds_by_key: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
+        failed_feeds = 0
+        for (sid, day, lang), (parsed, failed) in zip(tasks, results):
+            feeds_by_key[(sid, day, lang)] = parsed
+            if failed:
+                failed_feeds += 1
 
-            all_matches: list[Match] = []
-            seen_match_ids: set[str] = set()
-            tennis_cities: set[str] = set()
+        total_feeds = len(tasks)
+        all_matches: list[Match] = []
+        seen_match_ids: set[str] = set()
+        tennis_cities: set[str] = set()
 
-            for sid in target_sports:
-                for day in days:
-                    it_evs = feeds_by_key.get((sid, day, "it"), [])
-                    en_evs = feeds_by_key.get((sid, day, "en"), [])
-                    day_matches = self._fuse_sport_day(
-                        sid,
-                        day,
-                        it_evs,
-                        en_evs,
-                        now_ms=now_ms,
-                        tennis_cities=tennis_cities,
-                    )
-                    for m in day_matches:
-                        if m.id not in seen_match_ids:
-                            seen_match_ids.add(m.id)
-                            all_matches.append(m)
+        for sid in target_sports:
+            for day in days:
+                it_evs = feeds_by_key.get((sid, day, "it"), [])
+                en_evs = feeds_by_key.get((sid, day, "en"), [])
+                day_matches = self._fuse_sport_day(
+                    sid,
+                    day,
+                    it_evs,
+                    en_evs,
+                    now_ms=now_ms,
+                    tennis_cities=tennis_cities,
+                )
+                for m in day_matches:
+                    if m.id not in seen_match_ids:
+                        seen_match_ids.add(m.id)
+                        all_matches.append(m)
 
-            all_matches.sort(key=lambda m: (m.date, m.title))
+        all_matches.sort(key=lambda m: (m.date, m.title))
+        self.last_failed_feeds = failed_feeds
+        self.last_total_feeds = total_feeds
+        self.last_fetch_failed = (failed_feeds == total_feeds) or (
+            not all_matches and failed_feeds > 0
+        )
+
+        if all_matches:
+            if tennis_cities:
+                self._last_tennis_cities = frozenset(tennis_cities)
             return all_matches, frozenset(tennis_cities)
 
-        if self._client is not None:
-            return await _run_with_client(self._client)
+        if self.last_fetch_failed and self._last_tennis_cities:
+            logger.warning(
+                "Flashscore ingestion returned 0 matches (%d/%d feeds failed); preserving %d previous tennis cities",
+                failed_feeds,
+                total_feeds,
+                len(self._last_tennis_cities),
+            )
+            return [], self._last_tennis_cities
 
-        async with create_standard_client(timeout=20.0) as client:
-            return await _run_with_client(client)
+        return [], frozenset(tennis_cities)
+
+    async def ingest_all(
+        self,
+        *,
+        days: tuple[int, ...] = FEED_DAYS,
+        sport_ids: Optional[Iterable[int]] = None,
+        now_utc: Optional[datetime] = None,
+    ) -> tuple[list[Match], frozenset[str]]:
+        """Alias for `fetch_schedule` returning `(matches, active_tennis_cities)`."""
+        return await self.fetch_schedule(
+            days=days,
+            sport_ids=sport_ids,
+            now_utc=now_utc,
+        )

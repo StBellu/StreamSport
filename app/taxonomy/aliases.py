@@ -169,6 +169,10 @@ _ALIAS_GROUP_DEFINITIONS: tuple[tuple[str, ...], ...] = (
     ("palermo", "palermo fc"),
     ("bari", "ssc bari"),
     ("brescia", "brescia calcio"),
+    # --- Italy (Serie C B-teams, kept distinct from senior clubs) ---
+    ("juventus next gen", "juve next gen", "juventus u23"),
+    ("milan futuro", "ac milan futuro", "milan u23"),
+    ("atalanta u23", "atalanta under 23"),
     # --- England ---
     ("manchester city", "man city", "mancity"),
     ("manchester united", "man utd", "man united", "manutd"),
@@ -225,6 +229,18 @@ _ALIAS_GROUP_DEFINITIONS: tuple[tuple[str, ...], ...] = (
     ("besiktas", "besiktas jk"),
     ("olympiacos", "olympiakos", "olympiacos piraeus"),
     ("crvena zvezda", "red star", "red star belgrade"),
+    ("stade rennais", "rennes"),
+    ("ofi crete", "ofi"),
+    ("nec nijmegen", "nec", "nijmegen"),
+    ("bodo glimt", "bodø/glimt", "fk bodo glimt"),
+    ("fc kobenhavn", "kobenhavn", "copenhagen", "fc copenhagen"),
+    ("malmo ff", "malmo", "malmö"),
+    ("lks lodz", "łks łódź"),
+    # --- Basket cross-city aliases ---
+    ("cb canarias", "canarias", "tenerife", "la laguna tenerife"),
+    ("derthona basket", "derthona", "tortona"),
+    ("joventut badalona", "joventut", "badalona"),
+    ("unicaja malaga", "unicaja", "malaga", "baloncesto malaga"),
     # --- MLS / US / NBA / Motorsports ---
     ("inter miami", "inter miami cf"),
     ("los angeles fc", "lafc"),
@@ -261,11 +277,34 @@ _WHITESPACE_RE = re.compile(r"\s+")
 # Strip trailing demographic/bracket annotations such as "(W)" or "[U21]" on team names.
 _TRAILING_TAG_RE = re.compile(r"\s*[\(\[]\s*(?:w|women|donne|f|u\d{2})\s*[\)\]]\s*$", re.IGNORECASE)
 
+# Non-NFKD European characters that unicodedata.normalize("NFKD", ...) does not decompose.
+_CHAR_TRANSLITERATIONS: dict[str, str] = {
+    "ø": "o",
+    "Ø": "O",
+    "æ": "ae",
+    "Æ": "AE",
+    "œ": "oe",
+    "Œ": "OE",
+    "ß": "ss",
+    "ð": "d",
+    "Ð": "D",
+    "þ": "th",
+    "Þ": "TH",
+    "ł": "l",
+    "Ł": "L",
+    "đ": "d",
+    "Đ": "D",
+    "ı": "i",
+    "İ": "I",
+}
+_CHAR_TRANS_TABLE = str.maketrans(_CHAR_TRANSLITERATIONS)
+
 
 def _basic_clean(name: str) -> str:
     if not name:
         return ""
     cleaned = _TRAILING_TAG_RE.sub("", name)
+    cleaned = cleaned.translate(_CHAR_TRANS_TABLE)
     normalized = unicodedata.normalize("NFKD", cleaned)
     ascii_text = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     ascii_text = ascii_text.lower().replace("&", " and ")

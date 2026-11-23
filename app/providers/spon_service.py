@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -85,10 +86,17 @@ _SCHEDULE_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 _TEAM_SPLIT_RE = re.compile(r"\s+(?:x|vs\.?|v\.?|–|—)\s+", re.IGNORECASE)
+_AT_TEAM_SPLIT_RE = re.compile(r"\s+@\s+")
 _URL_RE = re.compile(r"https?://[^\s|]+", re.IGNORECASE)
 _CHANNEL_CODE_FROM_URL_RE = re.compile(
-    r"/([a-z]{1,4}\d{1,3})(?:\.(?:php|html?))?(?:[?#].*)?$",
+    r"/([a-z0-9_-]+)(?:\.(?:php|html?))?(?:[?#].*)?$",
     re.IGNORECASE,
+)
+_HTML_POISON_PREFIXES: tuple[str, ...] = ("<!doctype", "<html", "<script")
+_CF_CHALLENGE_MARKERS: tuple[str, ...] = (
+    "just a moment",
+    "cf-browser-verification",
+    "attention required! | cloudflare",
 )
 
 
@@ -176,6 +184,20 @@ def _resolve_day_header_date(day_name: str, tail: str, ref_date: date) -> date:
     return ref_date + timedelta(days=delta)
 
 
+def _is_valid_prog_text(text: str) -> bool:
+    """Reject empty payloads, HTML error pages, and Cloudflare 200 challenge responses."""
+    cleaned = (text or "").lstrip("\ufeff").strip()
+    if not cleaned:
+        return False
+    lower = cleaned.lower()
+    if lower.startswith(_HTML_POISON_PREFIXES):
+        return False
+    if any(marker in lower for marker in _CF_CHALLENGE_MARKERS):
+        return False
+    upper = cleaned.upper()
+    return "LAST UPDATE" in upper or any(day in upper for day in _WEEKDAY_MAP)
+
+
 def _split_competition_and_teams(raw_title: str) -> tuple[str, str, str]:
     title = re.sub(r"\s+", " ", raw_title).strip()
     competition = ""
@@ -183,19 +205,26 @@ def _split_competition_and_teams(raw_title: str) -> tuple[str, str, str]:
 
     if ":" in title:
         prefix, rest = title.split(":", 1)
-        if not _TEAM_SPLIT_RE.search(prefix) and rest.strip():
+        if not _TEAM_SPLIT_RE.search(prefix) and not _AT_TEAM_SPLIT_RE.search(prefix) and rest.strip():
             competition = prefix.strip()
             match_part = rest.strip()
 
     parts = _TEAM_SPLIT_RE.split(match_part, maxsplit=1)
     if len(parts) == 2:
         return competition, parts[0].strip(), parts[1].strip()
+    at_parts = _AT_TEAM_SPLIT_RE.split(match_part, maxsplit=1)
+    if len(at_parts) == 2:
+        # US notation "Away @ Home" -> swap to (home, away)
+        return competition, at_parts[1].strip(), at_parts[0].strip()
     return competition, "", ""
 
 
 def parse_prog_txt(text: str, now_utc: Optional[datetime] = None) -> list[ProviderEvent]:
     """Parse Sportsonline `prog.txt` text into normalized `ProviderEvent` records."""
-    if not text or not text.strip():
+    if not text:
+        return []
+    text = text.lstrip("\ufeff")
+    if not text.strip():
         return []
 
     ref_utc = now_utc or datetime.now(timezone.utc)
@@ -362,6 +391,7 @@ class SponService(BaseStreamProvider):
             self._prog_urls = tuple(dict.fromkeys(u for u in candidates if u))
         self._cache_result: Optional[ProviderHarvestResult] = None
         self._cache_expires_at: float = 0.0
+        self._fetch_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -386,38 +416,47 @@ class SponService(BaseStreamProvider):
         if ttl > 0 and self._cache_result is not None and now_mono < self._cache_expires_at:
             return self._cache_result
 
-        client = self._get_client()
-        last_error = ""
-        prog_text = ""
+        async with self._fetch_lock:
+            now_mono = time.monotonic()
+            if ttl > 0 and self._cache_result is not None and now_mono < self._cache_expires_at:
+                return self._cache_result
 
-        for url in self._prog_urls:
-            try:
-                resp = await client.get(
-                    url,
-                    headers={"Accept": "text/plain, */*"},
-                    timeout=15.0,
-                )
-                if resp.status_code != 200:
-                    last_error = f"HTTP {resp.status_code} from {url}"
-                    continue
-                if resp.text.strip():
-                    prog_text = resp.text
-                    break
-                last_error = f"Empty response from {url}"
-            except Exception as exc:
-                last_error = f"{url}: {exc}"
-                logger.warning("SponService fetch failed for %s: %s", url, exc)
+            client = self._get_client()
+            last_error = ""
+            prog_text = ""
 
-        if not prog_text:
-            return ProviderHarvestResult(provider=self.name, error=last_error or "All SPON mirrors failed")
+            for url in self._prog_urls:
+                try:
+                    resp = await client.get(
+                        url,
+                        headers={"Accept": "text/plain, */*"},
+                        timeout=15.0,
+                    )
+                    if resp.status_code != 200:
+                        last_error = f"HTTP {resp.status_code} from {url}"
+                        continue
+                    cleaned = resp.text.lstrip("\ufeff")
+                    if _is_valid_prog_text(cleaned):
+                        prog_text = cleaned
+                        break
+                    last_error = f"Invalid or HTML/Cloudflare response from {url}"
+                except Exception as exc:
+                    last_error = f"{url}: {exc}"
+                    logger.warning("SponService fetch failed for %s: %s", url, exc)
 
-        events = parse_prog_txt(prog_text)
-        result = ProviderHarvestResult(
-            provider=self.name,
-            events=events,
-            raw_count=len(events),
-        )
-        if ttl > 0:
-            self._cache_result = result
-            self._cache_expires_at = time.monotonic() + ttl
-        return result
+            if not prog_text:
+                if self._cache_result is not None:
+                    logger.warning("SponService using stale cache after mirror failure: %s", last_error)
+                    return self._cache_result
+                return ProviderHarvestResult(provider=self.name, error=last_error or "All SPON mirrors failed")
+
+            events = parse_prog_txt(prog_text)
+            result = ProviderHarvestResult(
+                provider=self.name,
+                events=events,
+                raw_count=len(events),
+            )
+            if ttl > 0:
+                self._cache_result = result
+                self._cache_expires_at = time.monotonic() + ttl
+            return result

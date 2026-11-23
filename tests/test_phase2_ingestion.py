@@ -441,3 +441,147 @@ async def test_tivusat_only_epg_and_date_parsing() -> None:
     # 20:30 CET (UTC+1 on Nov 22) == 19:30 UTC
     expected_start_ms = int(datetime(2026, 11, 22, 19, 30, tzinfo=timezone.utc).timestamp() * 1000)
     assert progs[0].start_ms == expected_start_ms
+
+
+@pytest.mark.asyncio
+async def test_diretta_ott_exclude_and_outage_retains_tennis_cities() -> None:
+    from app.ingestion.diretta_service import OTT_EXCLUDE
+
+    for expected in (
+        "sportitalia", "solocalcio", "milan tv", "inter tv",
+        "juventus", "lazio", "roma", "torino", "napoli",
+    ):
+        assert expected in OTT_EXCLUDE
+
+    phase = {"fail": False}
+    now_utc = datetime(2026, 11, 22, 12, 0, tzinfo=timezone.utc)
+    ts_sec = int(now_utc.timestamp()) + 3600
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if phase["fail"]:
+            return httpx.Response(503)
+        if "f_2_0_3_it_1" in str(request.url):
+            return httpx.Response(
+                200,
+                text=(
+                    "SA÷2¬~"
+                    f"ZA÷ATP - SINGOLARE: Torino (Italia), cemento¬ZY÷Mondo¬ZAE÷Finale~"
+                    f"AA÷t1¬AD÷{ts_sec}¬AE÷Sinner J.¬WU÷sinner-jannik-111¬"
+                    "AF÷Alcaraz C.¬WV÷alcaraz-carlos-222~"
+                ),
+            )
+        return httpx.Response(200, text="")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = DirettaService(settings=Settings(ENABLE_DIRETTA=True), client=client)
+        _, first_cities = await svc.fetch_schedule(days=(0,), sport_ids=(2,), now_utc=now_utc)
+        assert "torino" in first_cities
+        phase["fail"] = True
+        _, second_cities = await svc.fetch_schedule(days=(0,), sport_ids=(2,), now_utc=now_utc)
+        assert svc.last_fetch_failed is True
+        assert "torino" in second_cities
+
+
+def test_epg_semantic_slug_bridge_and_strict_orphan_allowlist() -> None:
+    from app.ingestion.epg_service import (
+        _parse_sky_semantic_url,
+        filter_conflicting_italian_channels,
+    )
+
+    comp, is_mag = _parse_sky_semantic_url("https://guidatv.sky.it/sport/serie-a/inter-milan")
+    assert comp == "Serie A" and is_mag is False
+    _, mag_flag = _parse_sky_semantic_url("https://guidatv.sky.it/programmi-tv/approfondimento/sky-sport-24-speciale")
+    assert mag_flag is True
+
+    base_ms = int(datetime(2026, 11, 22, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    tennis_match = Match(
+        id="diretta-tennis-roma",
+        title="Jannik Sinner - Carlos Alcaraz",
+        category="tennis",
+        silo=SportSilo.TENNIS,
+        genres=["ATP Masters"],
+        date=base_ms + 30 * 60_000,
+        end_date=base_ms + 150 * 60_000,
+        competition="ATP Masters 1000 Roma",
+        home_team=TeamInfo(name="Jannik Sinner"),
+        away_team=TeamInfo(name="Carlos Alcaraz"),
+        source_origin="diretta",
+    )
+    epg_list = [
+        # Tournament Session Bridge match (ATP Roma -> Sky Sport Tennis)
+        EPGProgram(
+            id="sky_t1",
+            channel_id="11237",
+            channel_name="Sky Sport Tennis",
+            title="ATP Masters 1000 Roma",
+            competition_hint="ATP Masters 1000 Roma",
+            start_ms=base_ms,
+            end_ms=base_ms + 180 * 60_000,
+            sport_hint="Tennis",
+            is_live=True,
+            source="sky",
+        ),
+        # Unmatched non-allowlisted generalist 1v1 football -> must NOT become orphan
+        EPGProgram(
+            id="sky_gen1",
+            channel_id="899",
+            channel_name="Rai 1",
+            title="Film: Vita in diretta",
+            start_ms=base_ms,
+            end_ms=base_ms + 120 * 60_000,
+            sport_hint="",
+            is_live=True,
+            source="sky",
+        ),
+        # Simulcast -> allowlisted orphan
+        EPGProgram(
+            id="sky_sim1",
+            channel_id="9113",
+            channel_name="Sky Sport Calcio",
+            title="Diretta Gol Serie A",
+            start_ms=base_ms,
+            end_ms=base_ms + 120 * 60_000,
+            sport_hint="Calcio",
+            is_live=True,
+            is_simulcast=True,
+            source="sky",
+        ),
+    ]
+    enriched, orphans = reconcile_with_schedule([tennis_match], epg_list)
+    assert "Sky Sport Tennis" in enriched[0].broadcasters
+    orphan_titles = [o.title for o in orphans]
+    assert "Diretta Gol Serie A" in orphan_titles
+    assert all("Vita in diretta" not in t for t in orphan_titles)
+
+    # Channel conflict resolution: Sky Sport Uno purged when EPG confirms a different live match
+    conflict_match = Match(
+        id="m-conflict",
+        title="Milan - Fiorentina",
+        category="calcio_ita",
+        silo=SportSilo.CALCIO_ITA,
+        date=base_ms,
+        end_date=base_ms + 100 * 60_000,
+        broadcasters=["DAZN 1"],
+        sources=[
+            StreamSource(
+                provider="tvvoo",
+                title="Sky Sport Uno HD",
+                url="http://x/uno",
+                channel_name="sky sport uno",
+            )
+        ],
+    )
+    epg_uno = EPGProgram(
+        id="ep-uno",
+        channel_id="9097",
+        channel_name="Sky Sport Uno",
+        title="UEFA Champions League: Arsenal - Bayern Monaco",
+        start_ms=base_ms,
+        end_ms=base_ms + 120 * 60_000,
+        sport_hint="Calcio",
+        is_live=True,
+        source="sky",
+    )
+    resolved = filter_conflicting_italian_channels([conflict_match], [epg_uno])
+    assert resolved[0].sources == []
+

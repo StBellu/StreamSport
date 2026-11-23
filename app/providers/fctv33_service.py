@@ -30,6 +30,7 @@ CHROME_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 SFVER_CACHE_TTL_SECONDS = 600.0
+DETAIL_CACHE_TTL_SECONDS = 90.0
 LIVE_WINDOW_MS = 90 * 60 * 1000
 DEFAULT_STREAM_DIGIT = "foth"
 DEFAULT_SITE_TYPE = 2001
@@ -249,6 +250,181 @@ def _normalize_timestamp_ms(val: Optional[int]) -> int:
     return 0
 
 
+_ASIAN_EXOTIC_VOLLEY_COUNTRIES: frozenset[str] = frozenset({
+    "south korea", "korea", "philippines", "thailand",
+    "vietnam", "indonesia", "malaysia", "taiwan",
+})
+_ASIAN_EXOTIC_BASKET_COUNTRIES: frozenset[str] = frozenset({
+    "china", "south korea", "korea", "philippines", "taiwan", "japan",
+    "vietnam", "thailand", "indonesia", "malaysia", "singapore", "india",
+    "mongolia", "asian", "africa", "rwanda", "uganda", "kenya", "senegal", "angola",
+})
+_EXOTIC_CLUB_COUNTRIES: frozenset[str] = frozenset({
+    "myanmar", "vietnam", "cambodia", "laos", "indonesia", "thailand",
+    "mauritania", "antigua", "antigua and barbuda", "suriname", "st. kitts",
+    "st. kitts and nevis", "saint kitts", "maldives", "nepal", "bangladesh",
+    "bhutan", "mongolia", "fiji", "tahiti", "uganda", "rwanda", "burundi",
+    "somalia", "djibouti", "eritrea", "sudan", "south sudan", "gambia",
+    "liberia", "sierra leone", "guinea-bissau", "tanzania", "kenya",
+    "zambia", "zimbabwe",
+})
+
+
+def is_junk_event(
+    sport_hint: str,
+    competition: str,
+    title: str,
+    country: str = "",
+) -> bool:
+    """Filter out youth, reserve, amateur, and minor exotic FCTV33 events."""
+    silo = (sport_hint or "").strip().lower()
+    comp = (competition or "").strip().lower()
+    cntry = (country or "").strip().lower()
+    ttl = (title or "").strip().lower()
+    comp_or_title = comp or ttl
+
+    if silo == "tennis":
+        if re.search(
+            r"(risultati\s*in\s*tempo\s*reale|tennis:\s*atp|atp\s*&\s*wta|schedule\s*only|placeholder)",
+            comp_or_title,
+        ):
+            return True
+        if re.search(r"\b(table\s*tennis|ping\s*pong|tt\s*cup|setka\s*cup)\b", comp_or_title):
+            return True
+        return False
+
+    if silo in ("motorsport", "motor-sports"):
+        return bool(
+            re.search(r"\b(tractor\s*pull|lawn\s*mower|demolition\s*derby|figure\s*8)\b", comp_or_title)
+        )
+
+    if silo in ("fighting", "fight"):
+        if re.search(
+            r"\b(muay\s*mun\s*sanan\s*mueang|the\s*global\s*fight|new\s*power\s*muay\s*thai|rajadamnern\s*knockout)\b",
+            comp_or_title,
+        ):
+            return True
+        if re.search(r"\bep\.\s*\d+\b", comp_or_title) and not re.search(
+            r"\b(ufc|wwe|aew|one\s*championship)\b", comp_or_title
+        ):
+            return True
+        return False
+
+    if silo == "american-football":
+        return bool(
+            re.search(
+                r"\b(fcs|ncaa\s*fcs|division\s*(?:ii|iii|1-aa|i-aa)|d-?[23]|naia|juco|high\s*school)\b",
+                comp_or_title,
+            )
+        )
+
+    if silo == "baseball":
+        return bool(
+            re.search(
+                r"\b(milb|triple-a|double-a|single-a|class\s*a|rookie|minor\s*league|phoenix\s*league|college\s*baseball|ncaa)\b",
+                comp_or_title,
+            )
+        )
+
+    if silo == "hockey":
+        return bool(
+            re.search(r"\b(ahl|echl|ohl|whl|qmjhl|ushl|junior|college\s*hockey|ncaa)\b", comp_or_title)
+        )
+
+    if silo in ("volleyball", "volley"):
+        full_text = f"{comp} {ttl} {cntry}"
+        if re.search(r"\b(italia|italy|superlega|serie\s*a[123]?|coppa\s*italia)\b", full_text):
+            return False
+        if re.search(r"\b(college\s*volleyball|ncaa|district|universiade|amateur)\b", comp_or_title):
+            return True
+        is_asian_comp = bool(
+            re.search(
+                r"\b(kovo\s*cup|kovo|premier\s*volleyball|pvl|pro\s*challenge|v-league\s*korea|thailand\s*league|spikers\s*turf)\b",
+                comp_or_title,
+            )
+        )
+        if cntry in _ASIAN_EXOTIC_VOLLEY_COUNTRIES or is_asian_comp:
+            if not re.search(r"\b(vnl|nations\s*league|world\s*championship|olympic|cev|champions\s*league)\b", comp_or_title):
+                return True
+        return False
+
+    if silo == "basketball":
+        full_text = f"{comp} {ttl} {cntry}"
+        if re.search(
+            r"\b(u-?1[0-9]|u-?2[01]|under\s*1[0-9]|under\s*2[01]|sub-?1[0-9]|sub-?20|junior|high\s*school)\b",
+            comp_or_title,
+        ):
+            if not re.search(r"\b(italia|italy|lba|serie\s*a)\b", full_text):
+                return True
+        if re.search(
+            r"\b(division\s*(?:ii|iii|1-aa|i-aa)|d-?[23]|naia|juco|mpbl|zone\s*5|amateur|development\s*league)\b",
+            comp_or_title,
+        ):
+            return True
+        is_women = bool(re.search(r"\b(women(?:['’]s)?|femminile|femenil|damen|ladies|wnbl|wbla)\b", comp_or_title)) or "women" in cntry
+        if is_women:
+            is_wnba = bool(re.search(r"\bwnba\b", comp_or_title)) or "women's national basketball association" in comp
+            is_it_women = bool(re.search(r"\b(serie\s*a[12]?|coppa\s*italia|lba|italia|italy)\b", full_text))
+            is_top_fiba = bool(re.search(r"\b(fiba\s*world\s*cup|eurobasket|olympic)\b", comp_or_title)) and "asia" not in comp_or_title
+            if not (is_wnba or is_it_women or is_top_fiba):
+                return True
+        is_asian_comp = bool(
+            re.search(
+                r"\b(cba|chinese\s*basketball|kbl|korean\s*basketball|pba|philippine\s*basketball|governors\s*cup|commissioner\s*s\s*cup|t1\s*league|tpbl|plg|b\.league|road\s*to\s*b\.?a\.?l\.?|champions\s*clubs|basketball\s*africa\s*league|bal)\b",
+                comp_or_title,
+            )
+        )
+        if cntry in _ASIAN_EXOTIC_BASKET_COUNTRIES or is_asian_comp:
+            is_top_fiba = bool(re.search(r"\b(fiba\s*(?:world\s*cup|qualifier)|olympic)\b", comp_or_title)) and not bool(
+                re.search(r"\b(club|asia|bal|league)\b", comp_or_title)
+            )
+            if not is_top_fiba:
+                return True
+        if re.search(r"\b(aba\s*league\s*2|israeli\s*national\s*league)\b", comp_or_title):
+            return True
+        return False
+
+    if silo == "football":
+        if re.search(r"\b(college\s*soccer|ncaa)\b", comp_or_title):
+            return True
+        if re.search(
+            r"\b(j[23]\s*league|k\s*league\s*[234]|torneo\s*betplay|colombia(?:n)?\s*torneo\s*betplay|liga\s*de\s*expansi[oó]n|usl\s*league\s*(?:one|two)|mls\s*next\s*pro|s[eé]rie\s*[cd]\s*brazil|primera\s*b\s*(?:nacional|chile|colombia|metropolitana)?)\b",
+            comp_or_title,
+        ):
+            return True
+        if re.search(r"\b(u-?\d{1,2}|under\s*\d{1,2}|sub-?\d{1,2}|soeratin|juvenil|cadete|allievi|giovanissimi)\b", comp_or_title):
+            is_it_youth = bool(
+                re.search(
+                    r"\b(italia|italy|primavera|juventus|milan|inter|roma|atalanta|fiorentina|lazio|napoli|torino)\b",
+                    f"{comp} {ttl}",
+                )
+            )
+            is_u21_major = (
+                bool(re.search(r"\b(u-?21|under\s*21)\b", comp_or_title))
+                and bool(re.search(r"\b(euro|uefa|qualif)\b", comp_or_title))
+                and "women" not in comp_or_title
+            )
+            if not is_it_youth and not is_u21_major:
+                return True
+        if re.search(r"\b(reserve|reserves|amateur|development\s*league)\b", comp_or_title):
+            return True
+        if re.search(r"\b(afcon|world cup|qualifier|nations league|copa america|asian cup|gold cup|futsal afcon)\b", comp_or_title):
+            return False
+        is_women = bool(re.search(r"\b(women(?:['’]s)?|femminile|femenil|dames|frauen|ladies)\b", comp_or_title))
+        if is_women:
+            is_top_women = bool(re.search(r"\b(serie a|coppa italia|italia|italy|champions|uwcl|world cup|nations league|euro)\b", comp_or_title))
+            is_it_team = bool(re.search(r"\b(juventus|roma|inter|milan|fiorentina|sassuolo|como|lazio|sampdoria)\b", ttl))
+            if not is_top_women and not is_it_team:
+                return True
+        if cntry in _EXOTIC_CLUB_COUNTRIES:
+            return True
+        for ex in _EXOTIC_CLUB_COUNTRIES:
+            if re.search(rf"\b{re.escape(ex)}\b", comp_or_title):
+                return True
+
+    return False
+
+
 def build_fctv33_stream_url(
     match_id: str,
     stream_id: str,
@@ -352,7 +528,7 @@ def parse_fctv33_match_message(
                 priority=6,
                 requires_proxy=True,
                 proxy_host="fctv33",
-                raw_url=st_url,
+                raw_url=f"{match_id}:{sid}",
             )
         )
 
@@ -374,7 +550,7 @@ def parse_fctv33_match_message(
                     priority=6,
                     requires_proxy=True,
                     proxy_host="fctv33",
-                    raw_url=st_url,
+                    raw_url=f"{match_id}:{direct_sid}",
                 )
             )
 
@@ -382,6 +558,9 @@ def parse_fctv33_match_message(
         return None
 
     title = f"{home} vs {away}" if away else home
+    sport_hint = SPORT_TYPE_TO_HINT.get(sport_type, "others")
+    if is_junk_event(sport_hint, competition, title):
+        return None
     is_women, is_youth = detect_demographics_from_stream_title(title)
     if competition and (not is_women or not is_youth):
         comp_w, comp_y = detect_demographics_from_stream_title(competition)
@@ -682,6 +861,19 @@ class Fctv33Service(BaseStreamProvider):
         self._owned_client: Optional[httpx.AsyncClient] = None
         self._sport_types: tuple[int, ...] = tuple(sport_types or DEFAULT_SPORT_TYPES)
         self._sfver_cache: Optional[tuple[float, str]] = None
+        self._detail_cache: dict[tuple[int, int], tuple[float, list[StreamSource]]] = {}
+        self._detail_sem: Optional[asyncio.Semaphore] = None
+        self._known_matches_by_sport: dict[int, list[dict[str, Any]]] = {}
+
+    @property
+    def known_matches(self) -> list[dict[str, Any]]:
+        """Non-junk catalog metadata from recent harvests for JIT detail lookup."""
+        return [m for items in self._known_matches_by_sport.values() for m in items]
+
+    def _get_detail_sem(self) -> asyncio.Semaphore:
+        if self._detail_sem is None:
+            self._detail_sem = asyncio.Semaphore(8)
+        return self._detail_sem
 
     @property
     def enabled(self) -> bool:
@@ -859,6 +1051,35 @@ class Fctv33Service(BaseStreamProvider):
                 )
         return []
 
+    async def resolve_match_streams(
+        self,
+        match_id: str,
+        sport_type: int = 1,
+    ) -> list[StreamSource]:
+        """On-demand JIT `/api/match/detail` resolution with 90s TTL cache and shared DoH client."""
+        raw_id = str(match_id or "").strip()
+        if raw_id.startswith("fctv33-"):
+            raw_id = raw_id[7:]
+        if not raw_id.isdigit():
+            return []
+
+        mid = int(raw_id)
+        stype = int(sport_type or 1)
+        cache_key = (mid, stype)
+        now = time.monotonic()
+        cached = self._detail_cache.get(cache_key)
+        if cached and now - cached[0] < DETAIL_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        client = self._get_client()
+        api_base = (self.settings.FCTV33_API_BASE or DEFAULT_DATA_API_BASE).rstrip("/")
+        streams = await self._fetch_match_detail_streams(
+            client, api_base, mid, stype, self._get_detail_sem()
+        )
+        if streams:
+            self._detail_cache[cache_key] = (time.monotonic(), streams)
+        return streams
+
     async def _fetch_live_sport_events(
         self,
         client: httpx.AsyncClient,
@@ -878,6 +1099,27 @@ class Fctv33Service(BaseStreamProvider):
         matches, active_ids = parse_fctv33_live_catalog(
             resp.content, sport_type=sport_type
         )
+        if not matches:
+            return []
+
+        sport_hint = SPORT_TYPE_TO_HINT.get(sport_type, "others")
+        matches = [
+            m
+            for m in matches
+            if not is_junk_event(sport_hint, m["competition"], m["title"])
+        ]
+        self._known_matches_by_sport[sport_type] = [
+            {
+                "match_id": m["match_id"],
+                "sport_type": sport_type,
+                "home": m["home"],
+                "away": m["away"],
+                "title": m["title"],
+                "competition": m["competition"],
+                "start_ms": m["start_ms"],
+            }
+            for m in matches
+        ]
         if not matches:
             return []
 

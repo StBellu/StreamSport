@@ -7,6 +7,8 @@ import io
 import logging
 import os
 import re
+import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
@@ -66,7 +68,24 @@ _GENERIC_STAGE_MARKERS = (
     "diretta",
 )
 
-# Country name (EN & IT) + ISO3 -> ISO2 lowercase for ESPN 500px flag CDN.
+_MISSING_ATHLETE_TTL_SECONDS = 6 * 3600.0
+_MISSING_ATHLETES: dict[str, float] = {}
+
+_SURNAME_PARTICLES: frozenset[str] = frozenset(
+    {"de", "la", "del", "da", "di", "van", "von", "der", "den", "ten", "ter", "el", "al"}
+)
+
+_SPECIAL_TEAM_ENTITIES: dict[str, str] = {
+    "pacific oceania": "PAC",
+    "team europe": "EUR",
+    "europa": "EUR",
+    "europe": "EUR",
+    "team world": "WLD",
+    "resto del mondo": "WLD",
+    "world": "WLD",
+}
+
+# Country name (EN & IT) + ISO3 -> ISO2 lowercase for ESPN 500px flag CDN (130+ entries).
 _COUNTRY_TO_ISO2: dict[str, str] = {
     "italy": "it", "italia": "it", "ita": "it", "it": "it",
     "spain": "es", "spagna": "es", "esp": "es", "es": "es",
@@ -75,6 +94,7 @@ _COUNTRY_TO_ISO2: dict[str, str] = {
     "germany": "de", "germania": "de", "ger": "de", "deu": "de", "de": "de",
     "australia": "au", "aus": "au", "au": "au",
     "great britain": "gb", "united kingdom": "gb", "gran bretagna": "gb", "regno unito": "gb", "gbr": "gb", "uk": "gb", "gb": "gb",
+    "england": "gb-eng", "inghilterra": "gb-eng", "eng": "gb-eng",
     "serbia": "rs", "srb": "rs", "rs": "rs",
     "canada": "ca", "can": "ca", "ca": "ca",
     "argentina": "ar", "arg": "ar", "ar": "ar",
@@ -98,7 +118,8 @@ _COUNTRY_TO_ISO2: dict[str, str] = {
     "bulgaria": "bg", "bul": "bg", "bg": "bg",
     "chile": "cl", "cile": "cl", "chi": "cl", "cl": "cl",
     "colombia": "co", "col": "co", "co": "co",
-    "south korea": "kr", "corea del sud": "kr", "korea": "kr", "kor": "kr", "kr": "kr",
+    "south korea": "kr", "corea del sud": "kr", "korea": "kr", "korea republic": "kr", "corea": "kr", "kor": "kr", "kr": "kr",
+    "north korea": "kp", "corea del nord": "kp", "prk": "kp", "kp": "kp",
     "india": "in", "ind": "in", "in": "in",
     "slovakia": "sk", "slovacchia": "sk", "svk": "sk", "sk": "sk",
     "slovenia": "si", "slo": "si", "si": "si",
@@ -106,18 +127,83 @@ _COUNTRY_TO_ISO2: dict[str, str] = {
     "portugal": "pt", "portogallo": "pt", "por": "pt", "pt": "pt",
     "finland": "fi", "finlandia": "fi", "fin": "fi", "fi": "fi",
     "latvia": "lv", "lettonia": "lv", "lat": "lv", "lv": "lv",
+    "lithuania": "lt", "lituania": "lt", "ltu": "lt", "lt": "lt",
     "estonia": "ee", "est": "ee", "ee": "ee",
     "russia": "ru", "rus": "ru", "ru": "ru",
     "belarus": "by", "bielorussia": "by", "blr": "by", "by": "by",
-    "taiwan": "tw", "chinese taipei": "tw", "tpe": "tw", "tw": "tw",
+    "taiwan": "tw", "chinese taipei": "tw", "taipei cinese": "tw", "tpe": "tw", "tpo": "tw", "tw": "tw",
+    "hong kong": "hk", "hkg": "hk", "hk": "hk",
+    "thailand": "th", "thailandia": "th", "tha": "th", "th": "th",
+    "indonesia": "id", "ina": "id", "id": "id",
+    "philippines": "ph", "filippine": "ph", "phi": "ph", "ph": "ph",
+    "vietnam": "vn", "vie": "vn", "vn": "vn",
+    "malaysia": "my", "malesia": "my", "mas": "my", "my": "my",
+    "singapore": "sg", "sin": "sg", "sg": "sg",
+    "pakistan": "pk", "pak": "pk", "pk": "pk",
+    "uzbekistan": "uz", "uzb": "uz", "uz": "uz",
+    "georgia": "ge", "geo": "ge", "ge": "ge",
+    "armenia": "am", "arm": "am", "am": "am",
+    "azerbaijan": "az", "azerbaigian": "az", "aze": "az", "az": "az",
     "mexico": "mx", "messico": "mx", "mex": "mx", "mx": "mx",
     "peru": "pe", "perù": "pe", "per": "pe", "pe": "pe",
+    "uruguay": "uy", "uru": "uy", "uy": "uy",
+    "paraguay": "py", "par": "py", "py": "py",
+    "ecuador": "ec", "ecu": "ec", "ec": "ec",
+    "bolivia": "bo", "bol": "bo", "bo": "bo",
+    "venezuela": "ve", "ven": "ve", "ve": "ve",
+    "puerto rico": "pr", "porto rico": "pr", "pur": "pr", "pr": "pr",
+    "dominican republic": "do", "repubblica dominicana": "do", "dom": "do", "do": "do",
+    "costa rica": "cr", "crc": "cr", "cr": "cr",
+    "el salvador": "sv", "esa": "sv", "sv": "sv",
+    "barbados": "bb", "brb": "bb", "bb": "bb",
     "new zealand": "nz", "nuova zelanda": "nz", "nzl": "nz", "nz": "nz",
+    "fiji": "fj", "figi": "fj", "fij": "fj", "fj": "fj",
+    "samoa": "ws", "wsm": "ws", "ws": "ws",
+    "papua new guinea": "pg", "papua nuova guinea": "pg", "png": "pg", "pg": "pg",
     "south africa": "za", "sudafrica": "za", "rsa": "za", "za": "za",
     "tunisia": "tn", "tun": "tn", "tn": "tn",
+    "morocco": "ma", "marocco": "ma", "mar": "ma", "ma": "ma",
+    "algeria": "dz", "alg": "dz", "dz": "dz",
     "egypt": "eg", "egitto": "eg", "egy": "eg", "eg": "eg",
+    "ivory coast": "ci", "cote d ivoire": "ci", "costa d avorio": "ci", "civ": "ci", "ci": "ci",
     "israel": "il", "israele": "il", "isr": "il", "il": "il",
-    "turkey": "tr", "turchia": "tr", "tur": "tr", "tr": "tr",
+    "turkey": "tr", "turchia": "tr", "turkiye": "tr", "tur": "tr", "tr": "tr",
+    "saudi arabia": "sa", "arabia saudita": "sa", "ksa": "sa", "sa": "sa",
+    "united arab emirates": "ae", "emirati arabi uniti": "ae", "uae": "ae", "ae": "ae",
+    "qatar": "qa", "qat": "qa", "qa": "qa",
+    "jordan": "jo", "giordania": "jo", "jor": "jo", "jo": "jo",
+    "lebanon": "lb", "libano": "lb", "lib": "lb", "lb": "lb",
+    "syria": "sy", "siria": "sy", "syr": "sy", "sy": "sy",
+    "iran": "ir", "irn": "ir", "ir": "ir",
+    "iraq": "iq", "irq": "iq", "iq": "iq",
+    "kuwait": "kw", "kuw": "kw", "kw": "kw",
+    "oman": "om", "oma": "om", "om": "om",
+    "bahrain": "bh", "bahrein": "bh", "bhr": "bh", "bh": "bh",
+    "palestine": "ps", "palestina": "ps", "ple": "ps", "ps": "ps",
+    "ireland": "ie", "irlanda": "ie", "irl": "ie", "ie": "ie",
+    "luxembourg": "lu", "lussemburgo": "lu", "lux": "lu", "lu": "lu",
+    "bosnia and herzegovina": "ba", "bosnia herzegovina": "ba", "bosnia ed erzegovina": "ba", "bih": "ba", "ba": "ba",
+    "north macedonia": "mk", "macedonia del nord": "mk", "macedonia": "mk", "mkd": "mk", "mk": "mk",
+    "moldova": "md", "moldavia": "md", "mda": "md", "md": "md",
+    "cyprus": "cy", "cipro": "cy", "cyp": "cy", "cy": "cy",
+    "malta": "mt", "mlt": "mt", "mt": "mt",
+    "monaco": "mc", "mon": "mc", "mc": "mc",
+    "tajikistan": "tj", "tagikistan": "tj", "tjk": "tj", "tj": "tj",
+    "turkmenistan": "tm", "tkm": "tm", "tm": "tm",
+    "kyrgyzstan": "kg", "kirghizistan": "kg", "kgz": "kg", "kg": "kg",
+    "bangladesh": "bd", "ban": "bd", "bd": "bd",
+    "nepal": "np", "nep": "np", "np": "np",
+    "sri lanka": "lk", "sri": "lk", "lk": "lk",
+    "myanmar": "mm", "mya": "mm", "mm": "mm",
+    "cambodia": "kh", "cambogia": "kh", "cam": "kh", "kh": "kh",
+    "laos": "la", "lao": "la", "la": "la",
+    "maldives": "mv", "maldive": "mv", "mdv": "mv", "mv": "mv",
+    "mongolia": "mn", "mgl": "mn", "mn": "mn",
+    "bhutan": "bt", "bhu": "bt", "bt": "bt",
+    "brunei": "bn", "brunei darussalam": "bn", "bru": "bn", "bn": "bn",
+    "yemen": "ye", "yem": "ye", "ye": "ye",
+    "macau": "mo", "macao": "mo", "mac": "mo", "mo": "mo",
+    "guam": "gu", "gum": "gu", "gu": "gu",
 }
 
 
@@ -177,34 +263,114 @@ def _deabbreviate_player_name(name: str, slug: str) -> str:
     return clean
 
 
+def _unaccent(text: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", text or "")
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+
+def _is_player_match(query: str, candidate_name: str) -> bool:
+    """Strict athlete identity verification (surname + initial + particle support)."""
+    q = _unaccent(re.sub(r"[\(\)\[\]]", "", query or "")).strip().lower()
+    c = _unaccent(candidate_name or "").strip().lower()
+    if not q or not c:
+        return False
+    if q == c:
+        return True
+
+    q_tokens = [t for t in re.split(r"[\s.\-]+", q) if t]
+    c_tokens = [t for t in re.split(r"[\s.\-]+", c) if t]
+    if not q_tokens or not c_tokens:
+        return False
+
+    q_initials = [t[0] for t in q_tokens if len(t) == 1]
+    q_words = [t for t in q_tokens if len(t) > 1]
+    c_words = [t for t in c_tokens if len(t) > 1]
+    if not q_words or not c_words:
+        return False
+
+    q_sig = [w for w in q_words if w not in _SURNAME_PARTICLES]
+    c_sig = [w for w in c_words if w not in _SURNAME_PARTICLES]
+    if not q_sig or not c_sig:
+        return False
+
+    if set(q_sig) == set(c_sig):
+        return True
+    if len(c_sig) >= 2 and set(c_sig).issubset(set(q_sig)):
+        return True
+    if len(q_sig) >= 2 and set(q_sig).issubset(set(c_sig)):
+        return True
+
+    # Trailing initials ("Etcheverry T. M." / "Herbert P.H.") -> surname is first word.
+    q_sur = q_words[0] if len(q_tokens[-1]) == 1 else q_words[-1]
+    c_sur = c_words[0] if len(c_tokens[-1]) == 1 else c_words[-1]
+
+    if q_sur not in c_words and c_sur not in q_words:
+        return False
+
+    if q_initials:
+        c_given_inits = [t[0] for t in c_tokens if t != c_sur and t not in _SURNAME_PARTICLES]
+        if q_initials[0] not in c_given_inits:
+            return False
+    elif len(q_words) > 1:
+        q_given = [t for t in q_words if t != q_sur and t not in _SURNAME_PARTICLES]
+        c_given = [t for t in c_words if t != c_sur and t not in _SURNAME_PARTICLES]
+        if q_given and c_given:
+            if not ({t[0] for t in q_given} & {t[0] for t in c_given}):
+                return False
+
+    return True
+
+
 def _extract_surname(player_name: str) -> str:
-    """Extract clean uppercase surname for the lower-third broadcast banner."""
+    """Extract clean uppercase surname (handles particles and trailing double initials)."""
     clean = strip_non_bmp(player_name).strip()
     if not clean:
         return ""
     tokens = clean.split()
     if len(tokens) == 1:
         return tokens[0].upper()
-    # Format: "Sinner J." or "Alcaraz C."
-    if len(tokens[-1]) <= 3 and tokens[-1].endswith("."):
-        return " ".join(tokens[:-1]).upper()
-    # Format: "J. Sinner" or "Ja. Sinner"
-    if len(tokens[0]) <= 3 and tokens[0].endswith("."):
-        return " ".join(tokens[1:]).upper()
-    # Format: "Jannik Sinner" or "Alex De Minaur"
-    return " ".join(tokens[1:]).upper() if len(tokens) <= 3 else tokens[-1].upper()
+
+    # Strip trailing initials such as "Etcheverry T. M." or "Sinner J."
+    while len(tokens) > 1 and (
+        (len(tokens[-1]) <= 3 and tokens[-1].endswith("."))
+        or (len(tokens[-1]) == 1 and tokens[-1].isalpha())
+    ):
+        tokens.pop()
+    if len(tokens) == 1:
+        return tokens[0].upper()
+
+    # Strip leading initials such as "J. Sinner" or "T. M. Etcheverry"
+    while len(tokens) > 1 and (
+        (len(tokens[0]) <= 3 and tokens[0].endswith("."))
+        or (len(tokens[0]) == 1 and tokens[0].isalpha())
+    ):
+        tokens.pop(0)
+    if len(tokens) == 1:
+        return tokens[0].upper()
+
+    # Preserve compound surname particles ("Alex De Minaur", "Botic Van De Zandschulp")
+    surname_parts = [tokens[-1]]
+    for tok in reversed(tokens[:-1]):
+        if tok.lower() in _SURNAME_PARTICLES:
+            surname_parts.insert(0, tok)
+        else:
+            break
+    return " ".join(surname_parts).upper()
 
 
 def _resolve_country_iso2(team_name: str, country_hint: str = "") -> Optional[str]:
     for raw in (team_name, country_hint):
-        cleaned = re.sub(r"[^a-z\s]", " ", (raw or "").lower()).strip()
+        cleaned = re.sub(r"[^a-z\s]", " ", _unaccent(raw).lower()).strip()
         cleaned = " ".join(cleaned.split())
         if not cleaned:
             continue
+        if cleaned in _SPECIAL_TEAM_ENTITIES:
+            return _SPECIAL_TEAM_ENTITIES[cleaned]
         if cleaned in _COUNTRY_TO_ISO2:
             return _COUNTRY_TO_ISO2[cleaned]
-        # Strip trailing gender/team markers such as "Italy W" or "Team Europe"
         stripped = re.sub(r"\b(?:w|women|men|team)\b", "", cleaned).strip()
+        if stripped in _SPECIAL_TEAM_ENTITIES:
+            return _SPECIAL_TEAM_ENTITIES[stripped]
         if stripped in _COUNTRY_TO_ISO2:
             return _COUNTRY_TO_ISO2[stripped]
     return None
@@ -212,7 +378,7 @@ def _resolve_country_iso2(team_name: str, country_hint: str = "") -> Optional[st
 
 def _is_country_tie(match: Match) -> Optional[tuple[str, str]]:
     comp = f"{match.competition} {match.canonical_competition} {match.alt_league}".lower()
-    if not any(kw in comp for kw in ("davis cup", "coppa davis", "bjk", "billie jean king", "united cup")):
+    if not any(kw in comp for kw in ("davis cup", "coppa davis", "bjk", "billie jean king", "united cup", "laver cup")):
         return None
     if not match.home_team or not match.away_team:
         return None
@@ -294,39 +460,53 @@ def load_fallback_silhouette_bytes(is_women: bool, assets_dir: Optional[Path] = 
     return path.read_bytes()
 
 
+def _build_player_queries(query_name: str) -> list[str]:
+    clean = strip_non_bmp(query_name).strip()
+    if not clean:
+        return []
+    queries = [clean]
+    surname = _extract_surname(clean).title()
+    if surname and surname.lower() != clean.lower():
+        queries.append(surname)
+    return queries
+
+
 async def _fetch_espn_cutout(
     query_name: str,
     client: httpx.AsyncClient,
 ) -> Optional[tuple[str, bytes]]:
-    search_url = f"https://site.web.api.espn.com/apis/search/v2?query={quote_plus(query_name)}&type=player"
-    try:
-        resp = await client.get(search_url)
-        if resp.status_code != 200:
-            return None
-        payload = resp.json()
-    except Exception:
-        return None
-
     best_url = ""
     best_score = 0.0
-    for block in payload.get("results", []) or []:
-        if block.get("type") not in (None, "player"):
+    for q in _build_player_queries(query_name):
+        search_url = f"https://site.web.api.espn.com/apis/search/v2?query={quote_plus(q)}&type=player"
+        try:
+            resp = await client.get(search_url)
+            if resp.status_code != 200:
+                continue
+            payload = resp.json()
+        except Exception:
             continue
-        for item in block.get("contents", []) or []:
-            sport_hint = f"{item.get('subtitle', '')} {item.get('sport', '')} {item.get('description', '')}".lower()
-            if sport_hint and not any(k in sport_hint for k in ("tennis", "atp", "wta")):
+
+        for block in payload.get("results", []) or []:
+            if block.get("type") not in (None, "player"):
                 continue
-            cand_name = str(item.get("displayName") or item.get("name") or "").strip()
-            score = fuzz.token_set_ratio(query_name.lower(), cand_name.lower())
-            if score < 70:
-                continue
-            img_obj = item.get("image") or {}
-            img_url = img_obj.get("default") if isinstance(img_obj, dict) else str(img_obj)
-            if not img_url or "a.espncdn.com" not in img_url:
-                continue
-            if score > best_score:
-                best_score = score
-                best_url = img_url
+            for item in block.get("contents", []) or []:
+                sport_hint = f"{item.get('subtitle', '')} {item.get('sport', '')} {item.get('description', '')}".lower()
+                if sport_hint and not any(k in sport_hint for k in ("tennis", "atp", "wta")):
+                    continue
+                cand_name = str(item.get("displayName") or item.get("name") or "").strip()
+                if not _is_player_match(query_name, cand_name):
+                    continue
+                score = fuzz.token_set_ratio(query_name.lower(), cand_name.lower())
+                img_obj = item.get("image") or {}
+                img_url = img_obj.get("default") if isinstance(img_obj, dict) else str(img_obj)
+                if not img_url or "a.espncdn.com" not in img_url:
+                    continue
+                if score > best_score:
+                    best_score = score
+                    best_url = img_url
+        if best_url:
+            break
 
     if not best_url:
         return None
@@ -349,34 +529,40 @@ async def _fetch_espn_cutout(
 
 async def _fetch_atp_cutout(query_name: str) -> Optional[tuple[str, bytes]]:
     """Query ATP Tour player finder via Safari 15.5 impersonation and reject 4729B silhouettes."""
-    find_url = f"https://www.atptour.com/-/www/players/find/byname/{quote(query_name)}/en"
     try:
         async with CurlAsyncSession(impersonate="safari15_5", timeout=15) as session:
-            resp = await session.get(find_url)
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-            if not isinstance(data, list) or not data:
-                return None
-
             best_pid = ""
-            best_score = 0.0
-            for entry in data:
-                if not isinstance(entry, dict):
+            best_score = -1.0
+            for q in _build_player_queries(query_name):
+                find_url = f"https://www.atptour.com/-/www/players/find/byname/{quote(q)}/en"
+                resp = await session.get(find_url)
+                if resp.status_code != 200:
                     continue
-                pid = str(entry.get("PlayerId") or entry.get("playerId") or "").strip()
-                full = str(
-                    entry.get("PlayerName")
-                    or f"{entry.get('FirstName', '')} {entry.get('LastName', '')}"
-                ).strip()
-                if not pid:
+                data = resp.json()
+                if not isinstance(data, list) or not data:
                     continue
-                score = fuzz.token_set_ratio(query_name.lower(), full.lower())
-                if score > best_score:
-                    best_score = score
-                    best_pid = pid
 
-            if not best_pid or best_score < 65:
+                for entry in data:
+                    if not isinstance(entry, dict):
+                        continue
+                    pid = str(entry.get("PlayerId") or entry.get("playerId") or "").strip()
+                    full = str(
+                        entry.get("PlayerName")
+                        or f"{entry.get('FirstName', '')} {entry.get('LastName', '')}"
+                    ).strip()
+                    if not pid or not _is_player_match(query_name, full):
+                        continue
+                    score = float(fuzz.token_set_ratio(query_name.lower(), full.lower()))
+                    status = str(entry.get("Active") or entry.get("strStatus") or "").strip().lower()
+                    if status in ("a", "active"):
+                        score += 50.0
+                    if score > best_score:
+                        best_score = score
+                        best_pid = pid
+                if best_pid:
+                    break
+
+            if not best_pid:
                 return None
 
             candidate_urls = (
@@ -407,32 +593,41 @@ async def _fetch_wta_cutout(
     query_name: str,
     client: httpx.AsyncClient,
 ) -> Optional[tuple[str, bytes]]:
-    """Query WTA API & profile HTML for CloudFront `-Torso_` cutouts."""
-    api_url = f"https://api.wtatennis.com/tennis/players?name={quote(query_name)}"
-    try:
-        resp = await client.get(api_url)
-        if resp.status_code != 200:
-            return None
-        payload = resp.json()
-    except Exception:
-        return None
-
-    players = payload if isinstance(payload, list) else payload.get("content", []) or []
+    """Query WTA API & profile HTML for CloudFront `-Torso_` cutouts with `?height=600`."""
     best_player: Optional[dict[str, Any]] = None
-    best_score = 0.0
-    for item in players:
-        if not isinstance(item, dict):
-            continue
-        full = str(
-            item.get("fullName")
-            or f"{item.get('firstName', '')} {item.get('lastName', '')}"
-        ).strip()
-        score = fuzz.token_set_ratio(query_name.lower(), full.lower())
-        if score > best_score:
-            best_score = score
-            best_player = item
+    best_score = -1.0
 
-    if not best_player or best_score < 65:
+    for q in _build_player_queries(query_name):
+        api_url = f"https://api.wtatennis.com/tennis/players?name={quote(q)}"
+        try:
+            resp = await client.get(api_url)
+            if resp.status_code != 200:
+                continue
+            payload = resp.json()
+        except Exception:
+            continue
+
+        players = payload if isinstance(payload, list) else payload.get("content", []) or []
+        for item in players:
+            if not isinstance(item, dict):
+                continue
+            full = str(
+                item.get("fullName")
+                or f"{item.get('firstName', '')} {item.get('lastName', '')}"
+            ).strip()
+            if not _is_player_match(query_name, full):
+                continue
+            score = float(fuzz.token_set_ratio(query_name.lower(), full.lower()))
+            status = str(item.get("strStatus") or item.get("status") or "").strip().lower()
+            if status in ("a", "active"):
+                score += 50.0
+            if score > best_score:
+                best_score = score
+                best_player = item
+        if best_player:
+            break
+
+    if not best_player:
         return None
 
     pid = str(best_player.get("id") or best_player.get("playerId") or "").strip()
@@ -461,6 +656,11 @@ async def _fetch_wta_cutout(
     if not match_url:
         return None
     torso_url = match_url.group(0)
+    low_url = torso_url.lower()
+    if any(bad in low_url for bad in ("home-share", "banner", "tile", "landscape")):
+        return None
+    if "?" not in torso_url:
+        torso_url = f"{torso_url}?height=600"
 
     try:
         img_resp = await client.get(torso_url)
@@ -514,6 +714,11 @@ async def fetch_athlete_cutout(
             await db.delete_tennis_athlete(cache_slug)
 
     if query_name:
+        neg_key = f"{gender_label}:{cache_slug or query_name.lower()}"
+        neg_exp = _MISSING_ATHLETES.get(neg_key)
+        if neg_exp is not None and time.monotonic() < neg_exp:
+            return load_fallback_silhouette_bytes(is_women, assets_dir=assets_dir)
+
         # Step 2: ESPN Search API.
         espn_res = await _fetch_espn_cutout(query_name, client)
         if espn_res is not None:
@@ -537,6 +742,8 @@ async def fetch_athlete_cutout(
                 if db is not None and cache_slug:
                     await db.upsert_tennis_athlete(cache_slug, "wta", img_url, gender_label)
                 return img_bytes
+
+        _MISSING_ATHLETES[neg_key] = time.monotonic() + _MISSING_ATHLETE_TTL_SECONDS
 
     # Step 4: Local fallback silhouettes (never persisted to DB cache).
     return load_fallback_silhouette_bytes(is_women, assets_dir=assets_dir)
@@ -687,6 +894,19 @@ def _render_stage_card_sync(bg_path: Path, title: str, competition: str, stage: 
     return image_to_jpeg_bytes(canvas, quality=90)
 
 
+def _crop_flag_image(img: Image.Image) -> Image.Image:
+    """Trim transparent padding around ESPN flag PNGs and 3px outer anti-aliased edges."""
+    rgba = img.convert("RGBA")
+    bbox = rgba.getbbox()
+    if bbox:
+        left, top, right, bottom = bbox
+        if (right - left) > 24 and (bottom - top) > 24:
+            rgba = rgba.crop((left + 3, top + 3, right - 3, bottom - 3))
+        else:
+            rgba = rgba.crop(bbox)
+    return rgba
+
+
 def _render_country_tie_sync(
     bg_path: Path,
     left_flag_bytes: Optional[bytes],
@@ -722,8 +942,9 @@ def _render_country_tie_sync(
         if flag_bytes:
             try:
                 with Image.open(io.BytesIO(flag_bytes)) as src:
+                    trimmed = _crop_flag_image(src)
                     card = ImageOps.fit(
-                        src.convert("RGBA"),
+                        trimmed,
                         (flag_w, flag_h),
                         method=Image.Resampling.LANCZOS,
                     )

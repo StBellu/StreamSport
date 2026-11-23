@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Optional
 from urllib.parse import quote, unquote
 
@@ -16,11 +17,13 @@ from app.core.network import is_safe_public_ip
 from app.core.ram_cache import RAMCacheManager
 from app.core.user_config import decode_config
 from app.graphics import BANNER_HEIGHT, BANNER_WIDTH, BannerService, render_dark_canvas
-from app.providers.tvvoo_service import TvVooService
+from app.providers.daddylive_service import DaddyLiveService
+from app.providers.tvvoo_service import TvVooService, is_safe_vavoo_play_url
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+_DADDYLIVE_CID_RE = re.compile(r"^[0-9a-zA-Z_-]{1,32}$")
 
 
 def extract_client_ip(request: Request) -> Optional[str]:
@@ -51,6 +54,14 @@ async def _handle_live_manifest(
     *,
     config: Optional[str] = None,
 ) -> Response:
+    if not is_safe_vavoo_play_url(url):
+        return Response(
+            content="Forbidden stream target",
+            status_code=403,
+            media_type="text/plain",
+            headers={"Cache-Control": "no-store"},
+        )
+
     tvvoo: TvVooService = request.app.state.tvvoo
     settings: Settings = request.app.state.settings
     client_ip = extract_client_ip(request)
@@ -122,6 +133,89 @@ async def _handle_poster(request: Request, match_id: str) -> Response:
         media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=60"},
     )
+
+
+def _resolve_daddylive_service(request: Request) -> Optional[DaddyLiveService]:
+    direct = getattr(request.app.state, "daddylive", None)
+    if isinstance(direct, DaddyLiveService):
+        return direct
+    orchestrator = getattr(request.app.state, "orchestrator", None)
+    providers = getattr(orchestrator, "providers", ()) if orchestrator else ()
+    for provider in providers:
+        if isinstance(provider, DaddyLiveService):
+            return provider
+    return None
+
+
+async def _handle_daddylive_stream(
+    request: Request,
+    channel_id: str,
+    *,
+    config: Optional[str] = None,
+) -> Response:
+    clean_cid = unquote(channel_id).strip()
+    if not _DADDYLIVE_CID_RE.match(clean_cid):
+        return Response(
+            content="ID canale DaddyLive non valido",
+            status_code=400,
+            media_type="text/plain",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    settings: Settings = request.app.state.settings
+    user_cfg = decode_config(config, settings)
+    ep_url = (user_cfg.ep_url or "").strip().rstrip("/")
+    if not ep_url:
+        return Response(
+            content="EasyProxy non configurato per DaddyLive",
+            status_code=400,
+            media_type="text/plain",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    daddylive = _resolve_daddylive_service(request)
+    if daddylive is None:
+        return Response(
+            content="Servizio DaddyLive non disponibile",
+            status_code=503,
+            media_type="text/plain",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    resolved_url = await daddylive.resolve_working_player_url(
+        clean_cid,
+        ep_url=ep_url,
+        ep_pass=user_cfg.ep_pass,
+    )
+    if resolved_url:
+        return RedirectResponse(
+            url=resolved_url,
+            status_code=307,
+            headers={
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+    return Response(
+        content="Nessun player DaddyLive funzionante al momento per questo canale",
+        status_code=502,
+        media_type="text/plain",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/daddylive/stream/{channel_id}.m3u8")
+async def daddylive_stream(request: Request, channel_id: str) -> Response:
+    return await _handle_daddylive_stream(request, channel_id)
+
+
+@router.get("/{config}/daddylive/stream/{channel_id}.m3u8")
+async def configured_daddylive_stream(
+    request: Request,
+    config: str,
+    channel_id: str,
+) -> Response:
+    return await _handle_daddylive_stream(request, channel_id, config=config)
 
 
 @router.get("/live/manifest.m3u8")

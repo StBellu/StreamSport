@@ -101,7 +101,10 @@ class EPGProgram(BaseModel):
     start_ms: int
     end_ms: int
     sport_hint: str = ""
+    competition_hint: str = ""
+    poster_url: str = ""
     is_live: bool = True
+    is_simulcast: bool = False
     source: str = "sky"
 
 
