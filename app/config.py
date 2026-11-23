@@ -25,8 +25,9 @@ class Settings(BaseSettings):
     TIMEZONE: str = "Europe/Rome"
 
     # Intervals & retention
-    SYNC_INTERVAL_SECONDS: int = 300
-    EPG_SYNC_INTERVAL_SECONDS: int = 900
+    SYNC_INTERVAL_SECONDS: int = 3600
+    SYNC_INTERVAL_SECONDS_NIGHT: int = 14400
+    EPG_SYNC_INTERVAL_SECONDS: int = 7200
     THESPORTSDB_SYNC_INTERVAL_SECONDS: int = 43200
     MATCH_RETENTION_HOURS: int = 6
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 import time
 from typing import Optional
@@ -10,6 +11,7 @@ from typing import Optional
 from app.config import Settings, get_settings
 from app.core.database import DatabaseManager
 from app.core.ram_cache import RAMCacheManager
+from app.graphics._utils import get_timezone
 from app.graphics.banner_service import (
     PRE_LIVE_WINDOW_MS,
     BannerService,
@@ -320,8 +322,18 @@ class PipelineScheduler:
             )
             return len(active_matches)
 
+    def get_current_sync_interval(self, now_utc: Optional[datetime] = None) -> int:
+        """Return night interval (00:00–11:59) or day interval (12:00–23:59) in local timezone."""
+        tz = get_timezone(self._settings.TIMEZONE)
+        utc_dt = now_utc if now_utc is not None else datetime.now(timezone.utc)
+        if utc_dt.tzinfo is None:
+            utc_dt = utc_dt.replace(tzinfo=timezone.utc)
+        local_dt = utc_dt.astimezone(tz)
+        if 0 <= local_dt.hour < 12:
+            return max(10, int(self._settings.SYNC_INTERVAL_SECONDS_NIGHT))
+        return max(10, int(self._settings.SYNC_INTERVAL_SECONDS))
+
     async def _loop(self) -> None:
-        interval = max(10, int(self._settings.SYNC_INTERVAL_SECONDS))
         while not self._stop_event.is_set():
             try:
                 await self.run_once()
@@ -331,6 +343,7 @@ class PipelineScheduler:
                 logger.exception("PipelineScheduler cycle failed: %s", exc)
                 self._cleanup_tvvoo_sessions()
 
+            interval = self.get_current_sync_interval()
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:

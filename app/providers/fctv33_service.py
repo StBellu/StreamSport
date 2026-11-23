@@ -1086,7 +1086,6 @@ class Fctv33Service(BaseStreamProvider):
         api_base: str,
         sfver: str,
         sport_type: int,
-        sem: asyncio.Semaphore,
     ) -> list[ProviderEvent]:
         resp = await client.get(
             f"{api_base}/sfver{sfver}/api/match/live",
@@ -1096,7 +1095,7 @@ class Fctv33Service(BaseStreamProvider):
         if resp.status_code != 200 or not resp.content:
             return []
 
-        matches, active_ids = parse_fctv33_live_catalog(
+        matches, _ = parse_fctv33_live_catalog(
             resp.content, sport_type=sport_type
         )
         if not matches:
@@ -1123,31 +1122,8 @@ class Fctv33Service(BaseStreamProvider):
         if not matches:
             return []
 
-        now_ms = int(time.time() * 1000)
-        if active_ids:
-            target_matches = [m for m in matches if m["match_id"] in active_ids]
-        else:
-            target_matches = [
-                m
-                for m in matches
-                if m["start_ms"] > 0 and abs(m["start_ms"] - now_ms) <= LIVE_WINDOW_MS
-            ]
-
-        if not target_matches:
-            return []
-
-        detail_tasks = [
-            self._fetch_match_detail_streams(
-                client, api_base, m["match_id"], sport_type, sem
-            )
-            for m in target_matches
-        ]
-        detail_results = await asyncio.gather(*detail_tasks, return_exceptions=True)
-
         events: list[ProviderEvent] = []
-        for meta, streams_res in zip(target_matches, detail_results):
-            if isinstance(streams_res, Exception) or not streams_res:
-                continue
+        for meta in matches:
             title = meta["title"]
             competition = meta["competition"]
             is_women, is_youth = detect_demographics_from_stream_title(title)
@@ -1163,17 +1139,17 @@ class Fctv33Service(BaseStreamProvider):
                     home=meta["home"],
                     away=meta["away"],
                     competition=competition,
-                    sport_hint=SPORT_TYPE_TO_HINT.get(sport_type, "others"),
+                    sport_hint=sport_hint,
                     start_ms=meta["start_ms"],
                     is_women=is_women,
                     is_youth=is_youth,
-                    streams=streams_res,
+                    streams=[],
                 )
             )
         return events
 
     async def harvest(self) -> ProviderHarvestResult:
-        """Perform FCTV33 sfver handshake and harvest Protobuf live match catalog."""
+        """Perform FCTV33 sfver handshake and harvest Protobuf live match catalog (detail deferred to JIT)."""
         if not self.enabled:
             return ProviderHarvestResult(provider=self.name)
 
@@ -1185,9 +1161,8 @@ class Fctv33Service(BaseStreamProvider):
 
         sfver = await self._fetch_sfver_bs(client, api_base)
         if sfver:
-            sem = asyncio.Semaphore(8)
             live_tasks = [
-                self._fetch_live_sport_events(client, api_base, sfver, st, sem)
+                self._fetch_live_sport_events(client, api_base, sfver, st)
                 for st in self._sport_types
             ]
             live_results = await asyncio.gather(*live_tasks, return_exceptions=True)

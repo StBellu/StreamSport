@@ -1004,3 +1004,41 @@ async def test_streamfree_live_true_and_fctv33_jit_detail() -> None:
     assert len(fctv_items) == 1
     assert parse_qs(urlsplit(fctv_items[0].url or "").query)["d"] == ["998877:555"]
 
+
+@pytest.mark.asyncio
+async def test_fctv33_harvest_skips_batch_detail_calls_and_tracks_known_matches() -> None:
+    seen_paths: list[str] = []
+    match_msg = (
+        _pb_field_varint(1, 554433)
+        + _pb_field_varint(3, 1795450000)
+        + _pb_field_bytes(10, _pb_field_bytes(3, _pb_field_str(2, "Serie A")))
+        + _pb_field_bytes(
+            30,
+            _pb_field_str(2, "Inter vs Roma")
+            + _pb_field_bytes(10, _pb_field_bytes(3, _pb_field_str(2, "Inter")))
+            + _pb_field_bytes(10, _pb_field_bytes(3, _pb_field_str(2, "Roma"))),
+        )
+    )
+    active_marker = _pb_field_varint(50, 554433)
+    live_payload = _pb_field_bytes(10, _pb_field_bytes(1, match_msg) + _pb_field_bytes(2, active_marker))
+    bs_payload = _pb_field_bytes(10, _pb_field_str(2, "0123456789abcdef0123456789abcdef"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        if request.url.path == "/api/common/bs":
+            return httpx.Response(200, content=bs_payload)
+        if request.url.path.endswith("/api/match/live"):
+            return httpx.Response(200, content=live_payload)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = Fctv33Service(Settings(ENABLE_FCTV33=True), client=client, sport_types=(1,))
+        res = await svc.harvest()
+
+    assert all("/api/match/detail" not in p for p in seen_paths)
+    assert len(res.events) == 1
+    assert res.events[0].streams == []
+    assert len(svc.known_matches) == 1
+    assert svc.known_matches[0]["match_id"] == 554433
+
+

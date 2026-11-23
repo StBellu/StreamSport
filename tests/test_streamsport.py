@@ -969,3 +969,31 @@ async def test_evolved_taxonomy_graphics_routes_and_legacy_config(tmp_path: Path
             assert r_dl.status_code == 307
             assert "host=dlstreams" in r_dl.headers["location"]
 
+    from datetime import datetime, timezone
+
+    default_settings = Settings(_env_file=None, APP_ENV="test", DATA_DIR=tmp_path / "sync_cfg")
+    assert default_settings.SYNC_INTERVAL_SECONDS == 3600
+    assert default_settings.SYNC_INTERVAL_SECONDS_NIGHT == 14400
+    assert default_settings.EPG_SYNC_INTERVAL_SECONDS == 7200
+
+    sched_db = DatabaseManager(default_settings.DB_PATH)
+    sched_ram = RAMCacheManager()
+    sched = PipelineScheduler(
+        settings=default_settings,
+        db=sched_db,
+        ram_cache=sched_ram,
+        diretta=DirettaService(settings=default_settings),
+        epg=ItalianEPGService(settings=default_settings),
+        orchestrator=StreamOrchestrator([], settings=default_settings),
+        tsdb=TheSportsDBService(settings=default_settings),
+        banner=BannerService(settings=default_settings),
+    )
+    assert sched.get_current_sync_interval(datetime(2026, 11, 23, 2, 0, tzinfo=timezone.utc)) == 14400
+    assert sched.get_current_sync_interval(datetime(2026, 11, 23, 10, 59, tzinfo=timezone.utc)) == 14400
+    assert sched.get_current_sync_interval(datetime(2026, 11, 23, 11, 0, tzinfo=timezone.utc)) == 3600
+    assert sched.get_current_sync_interval(datetime(2026, 11, 23, 17, 0, tzinfo=timezone.utc)) == 3600
+    await sched.stop()
+    await sched._orchestrator.aclose()
+    await sched._tsdb.aclose()
+
+
