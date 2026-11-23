@@ -9,7 +9,7 @@ from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse
+from pydantic import BaseModel
 
 from app.config import Settings, get_settings
 from app.core.database import DatabaseManager
@@ -28,6 +28,14 @@ from app.providers import (
 from app.routers import configure_router, media_router, stremio_router
 
 logger = logging.getLogger(__name__)
+
+
+class HealthResponse(BaseModel):
+    """Health check status payload serialized directly by pydantic-core."""
+
+    status: str
+    matches: int
+    updated_at: int
 
 
 def _configure_logging(level_name: str) -> None:
@@ -126,7 +134,6 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
     application = FastAPI(
         title="StreamSport",
         version="1.0.0",
-        default_response_class=ORJSONResponse,
         lifespan=lifespan,
     )
     application.state.settings = resolved_settings
@@ -138,16 +145,14 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    @application.get("/health", response_class=ORJSONResponse)
-    async def health_check(request: Request) -> ORJSONResponse:
+    @application.get("/health")
+    async def health_check(request: Request) -> HealthResponse:
         ram_cache: RAMCacheManager = request.app.state.ram_cache
         snap = ram_cache.snapshot
-        return ORJSONResponse(
-            content={
-                "status": "ok",
-                "matches": len(snap.active_matches),
-                "updated_at": snap.updated_at,
-            }
+        return HealthResponse(
+            status="ok",
+            matches=len(snap.active_matches),
+            updated_at=snap.updated_at,
         )
 
     # Register configure and media routes before parameterized /{config}/... routes

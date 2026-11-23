@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, ORJSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from app.config import Settings
 from app.core.ram_cache import RAMCacheManager
@@ -18,6 +19,15 @@ router = APIRouter()
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 _TEMPLATES = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+
+
+class EncodedConfigResponse(BaseModel):
+    """Response payload for `/api/encode-config` serialized by pydantic-core."""
+
+    config: str
+    manifest_url: str
+    stremio_url: str
+    nuvio_url: str
 
 
 def _build_source_statuses(settings: Settings) -> list[dict[str, object]]:
@@ -71,8 +81,8 @@ async def configured_page(request: Request, config: str) -> HTMLResponse:
     return _render_configure(request, config=config)
 
 
-@router.post("/api/encode-config", response_class=ORJSONResponse)
-async def api_encode_config(request: Request, payload: UserConfig) -> ORJSONResponse:
+@router.post("/api/encode-config")
+async def api_encode_config(request: Request, payload: UserConfig) -> EncodedConfigResponse:
     cfg_token = encode_config(payload)
     base_url = compute_base_url(request)
     manifest_url = f"{base_url}/{cfg_token}/manifest.json"
@@ -80,11 +90,9 @@ async def api_encode_config(request: Request, payload: UserConfig) -> ORJSONResp
         manifest_url.replace("https://", "stremio://", 1).replace("http://", "stremio://", 1)
     )
     nuvio_url = f"{base_url}/{cfg_token}/nuvio/manifest.json"
-    return ORJSONResponse(
-        content={
-            "config": cfg_token,
-            "manifest_url": manifest_url,
-            "stremio_url": stremio_url,
-            "nuvio_url": nuvio_url,
-        }
+    return EncodedConfigResponse(
+        config=cfg_token,
+        manifest_url=manifest_url,
+        stremio_url=stremio_url,
+        nuvio_url=nuvio_url,
     )

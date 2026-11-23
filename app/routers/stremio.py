@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import parse_qs, quote, unquote
 
-from fastapi import APIRouter, Request
-from fastapi.responses import ORJSONResponse
+from fastapi import APIRouter, Request, Response
+from fastapi.responses import JSONResponse
 
 from app.config import Settings
 from app.core.ram_cache import RAMCacheManager
@@ -127,12 +127,13 @@ def _parse_catalog_extras(
 
 def _handle_catalog(
     request: Request,
+    response: Response,
     media_type: str,
     catalog_id: str,
     *,
     extra: Optional[str] = None,
     config: Optional[str] = None,
-) -> ORJSONResponse:
+) -> CatalogResponse:
     ram_cache: RAMCacheManager = request.app.state.ram_cache
     settings: Settings = request.app.state.settings
     base_url = compute_base_url(request)
@@ -163,17 +164,18 @@ def _handle_catalog(
             )
         )
 
-    payload = CatalogResponse(metas=metas).model_dump(exclude_none=True)
-    return ORJSONResponse(content=payload, headers=_NO_STORE_HEADERS)
+    response.headers["Cache-Control"] = "no-store"
+    return CatalogResponse(metas=metas)
 
 
 def _handle_meta(
     request: Request,
+    response: Response,
     media_type: str,
     item_id: str,
     *,
     config: Optional[str] = None,
-) -> ORJSONResponse:
+) -> MetaResponse | JSONResponse:
     ram_cache: RAMCacheManager = request.app.state.ram_cache
     settings: Settings = request.app.state.settings
     base_url = compute_base_url(request)
@@ -181,8 +183,8 @@ def _handle_meta(
     clean_id = unquote(item_id)
     match = ram_cache.get_match(clean_id)
     if match is None:
-        return ORJSONResponse(
-            content=MetaResponse(meta=None).model_dump(),
+        return JSONResponse(
+            content={"meta": None},
             status_code=404,
             headers=_NO_STORE_HEADERS,
         )
@@ -202,28 +204,27 @@ def _handle_meta(
         country=match.country or None,
         behaviorHints={"defaultVideoId": match.stremio_id},
     )
-    payload = MetaResponse(meta=meta).model_dump(exclude_none=True)
-    return ORJSONResponse(content=payload, headers=_NO_STORE_HEADERS)
+    response.headers["Cache-Control"] = "no-store"
+    return MetaResponse(meta=meta)
 
 
 def _handle_stream(
     request: Request,
+    response: Response,
     item_id: str,
     *,
     config: Optional[str] = None,
-) -> ORJSONResponse:
+) -> StreamResponse:
     ram_cache: RAMCacheManager = request.app.state.ram_cache
     orchestrator: StreamOrchestrator = request.app.state.orchestrator
     settings: Settings = request.app.state.settings
     base_url = compute_base_url(request)
 
+    response.headers["Cache-Control"] = "no-store"
     clean_id = unquote(item_id)
     match = ram_cache.get_match(clean_id)
     if match is None:
-        return ORJSONResponse(
-            content=StreamResponse(streams=[]).model_dump(exclude_none=True),
-            headers=_NO_STORE_HEADERS,
-        )
+        return StreamResponse(streams=[])
 
     user_cfg = decode_config(config, settings)
     streams = orchestrator.build_stremio_streams(
@@ -232,8 +233,7 @@ def _handle_stream(
         base_url,
         config_segment=config or "",
     )
-    payload = StreamResponse(streams=streams).model_dump(exclude_none=True)
-    return ORJSONResponse(content=payload, headers=_NO_STORE_HEADERS)
+    return StreamResponse(streams=streams)
 
 
 # ------------------------------------------------------------------
@@ -241,94 +241,130 @@ def _handle_stream(
 # ------------------------------------------------------------------
 
 
-@router.get("/manifest.json", response_class=ORJSONResponse)
-async def stremio_manifest() -> ORJSONResponse:
-    return ORJSONResponse(
-        content=_build_manifest(nuvio=False).model_dump(exclude_none=True),
-        headers=_NO_STORE_HEADERS,
-    )
+@router.get("/manifest.json", response_model=Manifest, response_model_exclude_none=True)
+async def stremio_manifest(response: Response) -> Manifest:
+    response.headers["Cache-Control"] = "no-store"
+    return _build_manifest(nuvio=False)
 
 
-@router.get("/nuvio/manifest.json", response_class=ORJSONResponse)
-async def nuvio_manifest() -> ORJSONResponse:
-    return ORJSONResponse(
-        content=_build_manifest(nuvio=True).model_dump(exclude_none=True),
-        headers=_NO_STORE_HEADERS,
-    )
+@router.get("/nuvio/manifest.json", response_model=Manifest, response_model_exclude_none=True)
+async def nuvio_manifest(response: Response) -> Manifest:
+    response.headers["Cache-Control"] = "no-store"
+    return _build_manifest(nuvio=True)
 
 
-@router.get("/catalog/{media_type}/{catalog_id}/{extra}.json", response_class=ORJSONResponse)
+@router.get(
+    "/catalog/{media_type}/{catalog_id}/{extra}.json",
+    response_model=CatalogResponse,
+    response_model_exclude_none=True,
+)
 async def stremio_catalog_extra(
     request: Request,
+    response: Response,
     media_type: str,
     catalog_id: str,
     extra: str,
-) -> ORJSONResponse:
-    return _handle_catalog(request, media_type, catalog_id, extra=extra)
+) -> CatalogResponse:
+    return _handle_catalog(request, response, media_type, catalog_id, extra=extra)
 
 
-@router.get("/catalog/{media_type}/{catalog_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/catalog/{media_type}/{catalog_id}.json",
+    response_model=CatalogResponse,
+    response_model_exclude_none=True,
+)
 async def stremio_catalog(
     request: Request,
+    response: Response,
     media_type: str,
     catalog_id: str,
-) -> ORJSONResponse:
-    return _handle_catalog(request, media_type, catalog_id)
+) -> CatalogResponse:
+    return _handle_catalog(request, response, media_type, catalog_id)
 
 
-@router.get("/nuvio/catalog/{media_type}/{catalog_id}/{extra}.json", response_class=ORJSONResponse)
+@router.get(
+    "/nuvio/catalog/{media_type}/{catalog_id}/{extra}.json",
+    response_model=CatalogResponse,
+    response_model_exclude_none=True,
+)
 async def nuvio_catalog_extra(
     request: Request,
+    response: Response,
     media_type: str,
     catalog_id: str,
     extra: str,
-) -> ORJSONResponse:
-    return _handle_catalog(request, media_type, catalog_id, extra=extra)
+) -> CatalogResponse:
+    return _handle_catalog(request, response, media_type, catalog_id, extra=extra)
 
 
-@router.get("/nuvio/catalog/{media_type}/{catalog_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/nuvio/catalog/{media_type}/{catalog_id}.json",
+    response_model=CatalogResponse,
+    response_model_exclude_none=True,
+)
 async def nuvio_catalog(
     request: Request,
+    response: Response,
     media_type: str,
     catalog_id: str,
-) -> ORJSONResponse:
-    return _handle_catalog(request, media_type, catalog_id)
+) -> CatalogResponse:
+    return _handle_catalog(request, response, media_type, catalog_id)
 
 
-@router.get("/meta/{media_type}/{item_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/meta/{media_type}/{item_id}.json",
+    response_model=MetaResponse,
+    response_model_exclude_none=True,
+)
 async def stremio_meta(
     request: Request,
+    response: Response,
     media_type: str,
     item_id: str,
-) -> ORJSONResponse:
-    return _handle_meta(request, media_type, item_id)
+) -> MetaResponse | JSONResponse:
+    return _handle_meta(request, response, media_type, item_id)
 
 
-@router.get("/nuvio/meta/{media_type}/{item_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/nuvio/meta/{media_type}/{item_id}.json",
+    response_model=MetaResponse,
+    response_model_exclude_none=True,
+)
 async def nuvio_meta(
     request: Request,
+    response: Response,
     media_type: str,
     item_id: str,
-) -> ORJSONResponse:
-    return _handle_meta(request, media_type, item_id)
+) -> MetaResponse | JSONResponse:
+    return _handle_meta(request, response, media_type, item_id)
 
 
-@router.get("/stream/{media_type}/{item_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/stream/{media_type}/{item_id}.json",
+    response_model=StreamResponse,
+    response_model_exclude_none=True,
+)
 async def stremio_stream(
     request: Request,
+    response: Response,
     media_type: str,
     item_id: str,
-) -> ORJSONResponse:
-    return _handle_stream(request, item_id)
+) -> StreamResponse:
+    return _handle_stream(request, response, item_id)
 
 
-@router.get("/nuvio/stream/{media_type}/{item_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/nuvio/stream/{media_type}/{item_id}.json",
+    response_model=StreamResponse,
+    response_model_exclude_none=True,
+)
 async def nuvio_stream(
     request: Request,
+    response: Response,
     media_type: str,
     item_id: str,
-) -> ORJSONResponse:
-    return _handle_stream(request, item_id)
+) -> StreamResponse:
+    return _handle_stream(request, response, item_id)
 
 
 # ------------------------------------------------------------------
@@ -336,101 +372,137 @@ async def nuvio_stream(
 # ------------------------------------------------------------------
 
 
-@router.get("/{config}/nuvio/manifest.json", response_class=ORJSONResponse)
-async def configured_nuvio_manifest(config: str) -> ORJSONResponse:
+@router.get("/{config}/nuvio/manifest.json", response_model=Manifest, response_model_exclude_none=True)
+async def configured_nuvio_manifest(config: str, response: Response) -> Manifest:
     _ = config
-    return ORJSONResponse(
-        content=_build_manifest(nuvio=True).model_dump(exclude_none=True),
-        headers=_NO_STORE_HEADERS,
-    )
+    response.headers["Cache-Control"] = "no-store"
+    return _build_manifest(nuvio=True)
 
 
-@router.get("/{config}/manifest.json", response_class=ORJSONResponse)
-async def configured_stremio_manifest(config: str) -> ORJSONResponse:
+@router.get("/{config}/manifest.json", response_model=Manifest, response_model_exclude_none=True)
+async def configured_stremio_manifest(config: str, response: Response) -> Manifest:
     _ = config
-    return ORJSONResponse(
-        content=_build_manifest(nuvio=False).model_dump(exclude_none=True),
-        headers=_NO_STORE_HEADERS,
-    )
+    response.headers["Cache-Control"] = "no-store"
+    return _build_manifest(nuvio=False)
 
 
-@router.get("/{config}/nuvio/catalog/{media_type}/{catalog_id}/{extra}.json", response_class=ORJSONResponse)
+@router.get(
+    "/{config}/nuvio/catalog/{media_type}/{catalog_id}/{extra}.json",
+    response_model=CatalogResponse,
+    response_model_exclude_none=True,
+)
 async def configured_nuvio_catalog_extra(
     request: Request,
+    response: Response,
     config: str,
     media_type: str,
     catalog_id: str,
     extra: str,
-) -> ORJSONResponse:
-    return _handle_catalog(request, media_type, catalog_id, extra=extra, config=config)
+) -> CatalogResponse:
+    return _handle_catalog(request, response, media_type, catalog_id, extra=extra, config=config)
 
 
-@router.get("/{config}/nuvio/catalog/{media_type}/{catalog_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/{config}/nuvio/catalog/{media_type}/{catalog_id}.json",
+    response_model=CatalogResponse,
+    response_model_exclude_none=True,
+)
 async def configured_nuvio_catalog(
     request: Request,
+    response: Response,
     config: str,
     media_type: str,
     catalog_id: str,
-) -> ORJSONResponse:
-    return _handle_catalog(request, media_type, catalog_id, config=config)
+) -> CatalogResponse:
+    return _handle_catalog(request, response, media_type, catalog_id, config=config)
 
 
-@router.get("/{config}/catalog/{media_type}/{catalog_id}/{extra}.json", response_class=ORJSONResponse)
+@router.get(
+    "/{config}/catalog/{media_type}/{catalog_id}/{extra}.json",
+    response_model=CatalogResponse,
+    response_model_exclude_none=True,
+)
 async def configured_stremio_catalog_extra(
     request: Request,
+    response: Response,
     config: str,
     media_type: str,
     catalog_id: str,
     extra: str,
-) -> ORJSONResponse:
-    return _handle_catalog(request, media_type, catalog_id, extra=extra, config=config)
+) -> CatalogResponse:
+    return _handle_catalog(request, response, media_type, catalog_id, extra=extra, config=config)
 
 
-@router.get("/{config}/catalog/{media_type}/{catalog_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/{config}/catalog/{media_type}/{catalog_id}.json",
+    response_model=CatalogResponse,
+    response_model_exclude_none=True,
+)
 async def configured_stremio_catalog(
     request: Request,
+    response: Response,
     config: str,
     media_type: str,
     catalog_id: str,
-) -> ORJSONResponse:
-    return _handle_catalog(request, media_type, catalog_id, config=config)
+) -> CatalogResponse:
+    return _handle_catalog(request, response, media_type, catalog_id, config=config)
 
 
-@router.get("/{config}/nuvio/meta/{media_type}/{item_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/{config}/nuvio/meta/{media_type}/{item_id}.json",
+    response_model=MetaResponse,
+    response_model_exclude_none=True,
+)
 async def configured_nuvio_meta(
     request: Request,
+    response: Response,
     config: str,
     media_type: str,
     item_id: str,
-) -> ORJSONResponse:
-    return _handle_meta(request, media_type, item_id, config=config)
+) -> MetaResponse | JSONResponse:
+    return _handle_meta(request, response, media_type, item_id, config=config)
 
 
-@router.get("/{config}/meta/{media_type}/{item_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/{config}/meta/{media_type}/{item_id}.json",
+    response_model=MetaResponse,
+    response_model_exclude_none=True,
+)
 async def configured_stremio_meta(
     request: Request,
+    response: Response,
     config: str,
     media_type: str,
     item_id: str,
-) -> ORJSONResponse:
-    return _handle_meta(request, media_type, item_id, config=config)
+) -> MetaResponse | JSONResponse:
+    return _handle_meta(request, response, media_type, item_id, config=config)
 
 
-@router.get("/{config}/nuvio/stream/{media_type}/{item_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/{config}/nuvio/stream/{media_type}/{item_id}.json",
+    response_model=StreamResponse,
+    response_model_exclude_none=True,
+)
 async def configured_nuvio_stream(
     request: Request,
+    response: Response,
     config: str,
     media_type: str,
     item_id: str,
-) -> ORJSONResponse:
-    return _handle_stream(request, item_id, config=config)
+) -> StreamResponse:
+    return _handle_stream(request, response, item_id, config=config)
 
 
-@router.get("/{config}/stream/{media_type}/{item_id}.json", response_class=ORJSONResponse)
+@router.get(
+    "/{config}/stream/{media_type}/{item_id}.json",
+    response_model=StreamResponse,
+    response_model_exclude_none=True,
+)
 async def configured_stremio_stream(
     request: Request,
+    response: Response,
     config: str,
     media_type: str,
     item_id: str,
-) -> ORJSONResponse:
-    return _handle_stream(request, item_id, config=config)
+) -> StreamResponse:
+    return _handle_stream(request, response, item_id, config=config)
