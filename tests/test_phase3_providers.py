@@ -15,9 +15,10 @@ from app.core.user_config import UserConfig
 from app.models.domain import Match, ProviderEvent, SportSilo, StreamSource, TeamInfo
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult
 from app.providers.daddylive_service import (
+    DADDYLIVE_CANONICAL_CHANNELS,
     MAX_CHANNELS_PER_EVENT,
     DaddyLiveService,
-    parse_daddylive_channels,
+    filter_daddylive_events_by_window,
     parse_daddylive_schedule,
 )
 from app.providers.fctv33_service import (
@@ -121,10 +122,16 @@ def test_daddylive_html_parse_and_24_7_channels() -> None:
     <div class="schedule__dayTitle">2026-11-22</div>
     <div class="schedule__catHeader">Tennis</div>
     <div class="schedule__event">
-      <span class="schedule__time">14:30</span>
+      <span class="schedule__time" data-time="14:30">Live</span>
       <span class="schedule__eventTitle">Jannik Sinner vs Carlos Alcaraz</span>
       <a href="/watch.php?id=55">ESPN UK</a>
       <a href="/watch.php?id=88">SuperTennis IT</a>
+    </div>
+    <div class="schedule__catHeader">Upcoming Events</div>
+    <div class="schedule__event">
+      <span class="schedule__time">18:00</span>
+      <span class="schedule__eventTitle">Future Event A vs Future Event B</span>
+      <a href="/watch.php?id=77">Sky Sport Arena</a>
     </div>
     """
     events = parse_daddylive_schedule(html, "https://dlhd.dad/")
@@ -133,20 +140,20 @@ def test_daddylive_html_parse_and_24_7_channels() -> None:
     assert ev.home == "Jannik Sinner"
     assert ev.away == "Carlos Alcaraz"
     assert ev.sport_hint == "tennis"
+    assert ev.start_ms == int(datetime(2026, 11, 22, 14, 30, tzinfo=timezone.utc).timestamp() * 1000)
     assert ev.streams[0].url == "https://dlhd.dad/watch.php?id=88"
     assert ev.streams[1].url == "https://dlhd.dad/watch.php?id=55"
 
-    ch_html = """
-    <div class="grid">
-      <a href="/watch.php?id=870">Sky Sport Calcio ID: 870 IT</a>
-      <a href="/stream/stream-871.php">DAZN 1 HD</a>
-    </div>
-    """
-    channels = parse_daddylive_channels(ch_html, "https://dlhd.dad")
-    assert "sky sport calcio" in channels
-    assert "dazn 1" in channels
-    assert channels["sky sport calcio"][0].url == "https://dlhd.dad/watch.php?id=870"
-    assert channels["dazn 1"][0].url == "https://dlhd.dad/watch.php?id=871"
+    # Unstructured / stray non-schedule HTML must not invent fake events
+    stray_html = '<div class="footer"><a href="/watch.php?id=870">Sky Sport Calcio</a> Random text</div>'
+    assert parse_daddylive_schedule(stray_html, "https://dlhd.dad/") == []
+
+    # Canonical channels contain ONLY the 18 pure Italian sports channels
+    assert len(DADDYLIVE_CANONICAL_CHANNELS) == 18
+    for generalist in ("rai 1", "rai 2", "rai 3", "rai 4", "italia 1", "20 mediaset"):
+        assert generalist not in DADDYLIVE_CANONICAL_CHANNELS
+    for sport_key in ("sky sport uno", "sky sport 254", "dazn 1", "eurosport 1", "rai sport"):
+        assert sport_key in DADDYLIVE_CANONICAL_CHANNELS
 
 
 @pytest.mark.asyncio
@@ -208,7 +215,10 @@ async def test_streamfree_on_demand_0x_async_stremio_formatting() -> None:
 
 @pytest.mark.asyncio
 async def test_daddylive_service_harvest_and_toggle() -> None:
+    seen_paths: list[str] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
         if "schedule-generated.php" in request.url.path:
             return httpx.Response(
                 200,
@@ -224,8 +234,6 @@ async def test_daddylive_service_harvest_and_toggle() -> None:
                     }
                 },
             )
-        if "24-7-channels.php" in request.url.path:
-            return httpx.Response(200, text='<a href="/watch.php?id=99">DAZN 1</a>')
         return httpx.Response(404)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -234,10 +242,15 @@ async def test_daddylive_service_harvest_and_toggle() -> None:
             client=client,
             mirrors=("https://dlhd.dad",),
         )
-        res = await svc.harvest()
+        res = await svc.harvest(now_utc=datetime(2026, 11, 22, 18, 0, tzinfo=timezone.utc))
         assert res.provider == "daddylive"
         assert len(res.events) == 1
+        assert all("24-7-channels" not in p for p in seen_paths)
+        assert len(res.linear_channels) == 18
         assert "dazn 1" in res.linear_channels
+        assert "sky sport uno" in res.linear_channels
+        assert "rai sport" in res.linear_channels
+        assert "rai 1" not in res.linear_channels
 
         disabled = DaddyLiveService(Settings(ENABLE_DADDYLIVE=False), client=client)
         assert disabled.enabled is False
@@ -1040,5 +1053,107 @@ async def test_fctv33_harvest_skips_batch_detail_calls_and_tracks_known_matches(
     assert res.events[0].streams == []
     assert len(svc.known_matches) == 1
     assert svc.known_matches[0]["match_id"] == 554433
+
+
+@pytest.mark.asyncio
+async def test_daddylive_final_url_failover_window_and_stale_fallback() -> None:
+    # 1. Status checker prioritizes final_url over stale input url
+    def status_handler(request: httpx.Request) -> httpx.Response:
+        if "check_status.php" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "status": "online",
+                    "url": "https://dlhd.pk",
+                    "final_url": "https://fresh-mirror.test/",
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(status_handler)) as client:
+        svc = DaddyLiveService(Settings(ENABLE_DADDYLIVE=True), client=client)
+        mirrors = await svc._discover_mirrors(client)
+        assert mirrors[0] == "https://fresh-mirror.test"
+
+    # 2. Time window filter: [now - 6h, tomorrow 05:59:59 Europe/Rome]
+    # 2026-11-22 18:00 UTC = 19:00 CET (Europe/Rome)
+    # Current broadcast day ends at 2026-11-23 05:59:59 CET = 2026-11-23 04:59:59 UTC
+    now_ref = datetime(2026, 11, 22, 18, 0, tzinfo=timezone.utc)
+    dummy_src = [StreamSource(provider="daddylive", title="Ch 1", url="https://m2.test/watch.php?id=1")]
+    ev_too_old = ProviderEvent(
+        provider="daddylive",
+        title="Old Match",
+        start_ms=int(datetime(2026, 11, 22, 11, 30, tzinfo=timezone.utc).timestamp() * 1000),  # -6.5h
+        streams=dummy_src,
+    )
+    ev_in_past_win = ProviderEvent(
+        provider="daddylive",
+        title="Recent Match",
+        start_ms=int(datetime(2026, 11, 22, 14, 0, tzinfo=timezone.utc).timestamp() * 1000),  # -4h
+        streams=dummy_src,
+    )
+    ev_overnight = ProviderEvent(
+        provider="daddylive",
+        title="NBA Overnight",
+        start_ms=int(datetime(2026, 11, 23, 3, 30, tzinfo=timezone.utc).timestamp() * 1000),  # 04:30 CET
+        streams=dummy_src,
+    )
+    ev_tomorrow_afternoon = ProviderEvent(
+        provider="daddylive",
+        title="Tomorrow Afternoon",
+        start_ms=int(datetime(2026, 11, 23, 14, 0, tzinfo=timezone.utc).timestamp() * 1000),  # 15:00 CET
+        streams=dummy_src,
+    )
+    filtered = filter_daddylive_events_by_window(
+        [ev_too_old, ev_in_past_win, ev_overnight, ev_tomorrow_afternoon],
+        now_utc=now_ref,
+        retention_hours=6,
+        timezone_name="Europe/Rome",
+    )
+    assert [e.title for e in filtered] == ["Recent Match", "NBA Overnight"]
+
+    # 3. Mirror failover skips HTTP 200 stub/challenge & stale fallback retains events on total outage
+    valid_html = (
+        '<section class="schedule__day">'
+        '<div class="schedule__dayTitle">Sunday 22nd Nov 2026 - Schedule Time UK GMT</div>'
+        '<div class="schedule__category">'
+        '<h3 class="schedule__catHeader">Soccer</h3>'
+        '<div class="schedule__event">'
+        '<div class="schedule__eventHeader">'
+        '<span class="schedule__time" data-time="20:00">20:00</span> Inter vs Juventus'
+        '</div>'
+        '<div class="schedule__channels"><a href="/watch.php?id=870">Sky Sport Calcio IT</a></div>'
+        '</div></div></section>'
+        + ("<!-- pad -->" * 600)
+    )
+    fail_all = False
+
+    def failover_handler(request: httpx.Request) -> httpx.Response:
+        if fail_all:
+            return httpx.Response(503)
+        host = request.url.host or ""
+        if host == "stub.test":
+            return httpx.Response(200, text="<html><body>Just a moment...</body></html>")
+        if host == "good.test" and request.url.path == "/index.php":
+            return httpx.Response(200, text=valid_html)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(failover_handler)) as client:
+        svc = DaddyLiveService(
+            Settings(ENABLE_DADDYLIVE=True),
+            client=client,
+            mirrors=("https://stub.test", "https://good.test"),
+        )
+        res1 = await svc.harvest(now_utc=now_ref)
+        assert svc._active_mirror == "https://good.test"
+        assert len(res1.events) == 1
+        assert res1.events[0].title == "Inter vs Juventus"
+        assert len(res1.linear_channels) == 18
+
+        fail_all = True
+        res2 = await svc.harvest(now_utc=now_ref)
+        assert len(res2.events) == 1
+        assert res2.events[0].title == "Inter vs Juventus"
+        assert len(res2.linear_channels) == 18
 
 

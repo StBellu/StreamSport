@@ -1,4 +1,4 @@
-"""DaddyLive (DLHD) schedule & 24/7 channel scraper with DoH bypass."""
+"""DaddyLive (DLHD) schedule scraper with DoH bypass and 18 canonical Italian sports channels."""
 
 from __future__ import annotations
 
@@ -15,19 +15,27 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.config import Settings
-from app.core.network import create_doh_client
+from app.core.network import create_doh_client, create_standard_client
+from app.graphics._utils import get_timezone
 from app.models.domain import ProviderEvent, StreamSource
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult
 from app.taxonomy import detect_demographics_from_stream_title
-from app.taxonomy.channels import canonicalize_channel_name
 
 logger = logging.getLogger(__name__)
 
 MAX_CHANNELS_PER_EVENT = 30
+MIN_SCHEDULE_HTML_BYTES = 5000
+EXCLUDED_CATEGORIES: tuple[str, ...] = (
+    "tv show",
+    "tv shows",
+    "upcoming event",
+    "upcoming events",
+)
 DEFAULT_MIRRORS: tuple[str, ...] = (
     "https://thedaddy.li",
     "https://dlhd.pk",
     "https://dlhd.st",
+    "https://dlstreams.st",
     "https://thedaddy.pk",
     "https://daddylive.pk",
 )
@@ -48,6 +56,7 @@ PLAYER_TEMPLATES: tuple[str, ...] = (
 PLAYER_CACHE_TTL_SECONDS = 60.0
 BLOCKED_DOMAINS: frozenset[str] = frozenset({"dlive.sx", "dlhd.sx"})
 
+# Canonical 18 Italian sports channels exposed natively on DaddyLive 24/7
 DADDYLIVE_CANONICAL_CHANNELS: dict[str, dict[str, str]] = {
     # Linear Sky Sport IT
     "sky sport uno": {"id": "461", "name": "Sky Sport UNO Italy"},
@@ -65,29 +74,17 @@ DADDYLIVE_CANONICAL_CHANNELS: dict[str, dict[str, str]] = {
     "sky sport 252": {"id": "872", "name": "Sky Calcio 2 (252) Italy"},
     "sky sport 253": {"id": "873", "name": "Sky Calcio 3 (253) Italy"},
     "sky sport 254": {"id": "874", "name": "Sky Calcio 4 (254) Italy"},
-    # DAZN & Eurosport
+    # DAZN, Eurosport & Rai Sport
     "dazn 1": {"id": "877", "name": "DAZN ZONA Italy"},
     "eurosport 1": {"id": "878", "name": "EuroSport 1 Italy"},
     "eurosport 2": {"id": "879", "name": "EuroSport 2 Italy"},
-    # Rai & Mediaset FTA
     "rai sport": {"id": "882", "name": "Rai Sport Italy"},
-    "rai 1": {"id": "850", "name": "Rai 1 Italy"},
-    "rai 2": {"id": "851", "name": "Rai 2 Italy"},
-    "rai 3": {"id": "852", "name": "Rai 3 Italy"},
-    "rai 4": {"id": "853", "name": "Rai 4 Italy"},
-    "italia 1": {"id": "854", "name": "Italia 1 Italy"},
-    "20 mediaset": {"id": "857", "name": "20 Mediaset Italy"},
 }
 
 _SCHEDULE_PATHS: tuple[str, ...] = (
     "/index.php",
     "/schedule/schedule-generated.php",
     "/",
-)
-_CHANNELS_PATHS: tuple[str, ...] = (
-    "/24-7-channels.php",
-    "/24-7-channels.json",
-    "/api/channels",
 )
 
 _EXTRA_ID_RE = re.compile(r"(?:watchextra\.php\?id=|^extra_)(\d+)", re.IGNORECASE)
@@ -122,12 +119,6 @@ _EN_CHANNEL_RE = re.compile(
     r"abc|nfl\s*network|nba\s*tv)\b)",
     re.IGNORECASE,
 )
-_CHANNEL_SUFFIX_NOISE_RE = re.compile(
-    r"(?:\b(?:hd|fhd|uhd|sd|4k|it|ita|uk|en|eng|usa|us|es|fr|de|pt|br|vip|backup|server\s*\d*)\b|"
-    r"\(\s*(?:it|ita|uk|en|eng|usa|us|hd|fhd)\s*\)|"
-    r"\[\s*(?:it|ita|uk|en|eng|usa|us|hd|fhd)\s*\])",
-    re.IGNORECASE,
-)
 
 _SPORT_HINT_MAP: dict[str, str] = {
     "soccer": "football",
@@ -156,15 +147,58 @@ _SPORT_HINT_MAP: dict[str, str] = {
 }
 
 
-def normalize_daddylive_channel_key(name: str) -> str:
-    """Normalize a 24/7 channel name for cross-matching with Diretta/EPG broadcasters."""
-    cleaned = re.sub(r"\bid\s*:?\s*\d+\b", " ", name or "", flags=re.IGNORECASE)
-    cleaned = canonicalize_channel_name(cleaned)
-    if cleaned:
-        return cleaned
-    cleaned = _CHANNEL_SUFFIX_NOISE_RE.sub(" ", name or "")
-    cleaned = re.sub(r"[^\w\s]", " ", cleaned.lower())
-    return re.sub(r"\s+", " ", cleaned).strip()
+def _is_excluded_category(cat_name: str) -> bool:
+    lowered = (cat_name or "").strip().lower()
+    return any(token in lowered for token in EXCLUDED_CATEGORIES)
+
+
+def _is_valid_schedule_payload(payload: str) -> bool:
+    """Verify payload is non-empty valid schedule JSON or real DLHD schedule HTML."""
+    text = (payload or "").strip()
+    if not text:
+        return False
+    if text[0] in ("{", "["):
+        try:
+            data = json.loads(text)
+            return isinstance(data, (dict, list)) and bool(data)
+        except json.JSONDecodeError:
+            return False
+    if len(text.encode("utf-8", errors="ignore")) < MIN_SCHEDULE_HTML_BYTES:
+        return False
+    return (
+        "schedule__category" in text
+        or "schedule__dayTitle" in text
+        or "schedule__event" in text
+    )
+
+
+def filter_daddylive_events_by_window(
+    events: Sequence[ProviderEvent],
+    *,
+    now_utc: Optional[datetime] = None,
+    retention_hours: int = 6,
+    timezone_name: str = "Europe/Rome",
+) -> list[ProviderEvent]:
+    """Keep events from `now - retention_hours` through end of current broadcast day (05:59 next morning)."""
+    utc_now = now_utc or datetime.now(timezone.utc)
+    if utc_now.tzinfo is None:
+        utc_now = utc_now.replace(tzinfo=timezone.utc)
+    now_ms = int(utc_now.timestamp() * 1000)
+    min_start_ms = now_ms - max(1, int(retention_hours)) * 3600 * 1000
+
+    tz = get_timezone(timezone_name)
+    local_now = utc_now.astimezone(tz)
+    broadcast_end_local = (
+        datetime(local_now.year, local_now.month, local_now.day, 5, 59, 59, tzinfo=tz)
+        + timedelta(days=1)
+    )
+    max_start_ms = int(broadcast_end_local.timestamp() * 1000)
+
+    return [
+        ev
+        for ev in events
+        if ev.start_ms <= 0 or min_start_ms <= ev.start_ms <= max_start_ms
+    ]
 
 
 def detect_channel_language(channel_name: str) -> str:
@@ -318,7 +352,7 @@ def _build_channel_sources(
         if _JUNK_CHANNEL_RE.search(ch_name or ""):
             continue
         cid = _extract_channel_id(ch_id)
-        if not cid or cid in seen_ids:
+        if not cid or cid in ("0", "00") or cid in seen_ids:
             continue
         seen_ids.add(cid)
         label = re.sub(r"\s+", " ", (ch_name or f"Channel {cid}").strip())
@@ -433,7 +467,7 @@ def _parse_json_schedule(
             if not isinstance(categories, dict):
                 continue
             for category_name, raw_items in categories.items():
-                if not isinstance(raw_items, list):
+                if not isinstance(raw_items, list) or _is_excluded_category(str(category_name)):
                     continue
                 events.extend(
                     _parse_json_event_list(
@@ -456,6 +490,8 @@ def _parse_json_event_list(
     category: str,
 ) -> list[ProviderEvent]:
     parsed: list[ProviderEvent] = []
+    if _is_excluded_category(category):
+        return parsed
     for item in raw_items:
         if not isinstance(item, dict):
             continue
@@ -469,6 +505,8 @@ def _parse_json_event_list(
             continue
 
         item_cat = str(item.get("category") or item.get("sport") or category or "").strip()
+        if _is_excluded_category(item_cat):
+            continue
         start_ms = _parse_start_ms(
             item.get("time") or item.get("start_time"),
             date_base,
@@ -548,14 +586,14 @@ def _parse_html_schedule(
     if category_blocks:
         for cat_block in category_blocks:
             cat_header = cat_block.select_one(
-                ".schedule__catHeader, .schedule__categoryHeader, h2, h3, summary"
+                ".schedule__catHeader, .schedule__categoryHeader, .schedule__meta, h2, h3, summary"
             )
             cat_name = _strip_emojis(
                 cat_header.get_text(" ", strip=True)
                 if cat_header
                 else str(cat_block.get("data-category") or "")
             )
-            if cat_name.lower() in ("tv shows", "tv show"):
+            if _is_excluded_category(cat_name):
                 continue
             if _TEXT_DATE_RE.search(_ORDINAL_RE.sub(r"\1", cat_name)) or _ISO_DATE_RE.search(cat_name):
                 current_date = _parse_date_header(cat_name, reference_dt)
@@ -582,21 +620,26 @@ def _parse_html_schedule(
                     continue
 
                 header_el = ev_node.select_one(".schedule__eventHeader")
+                time_el = ev_node.select_one(".schedule__time, .time, td.time")
+                raw_data_time = str(time_el.get("data-time") or "").strip() if time_el else ""
                 if header_el is not None:
                     data_title = str(header_el.get("data-title") or "")
                     header_text = header_el.get_text(" ", strip=True)
-                    time_el = ev_node.select_one(".schedule__time, .time")
-                    if time_el and time_el.get_text(strip=True) not in header_text:
-                        header_text = f"{time_el.get_text(' ', strip=True)} {header_text}"
+                    raw_time = raw_data_time or (time_el.get_text(" ", strip=True) if time_el else "")
+                    if raw_time and raw_time not in header_text:
+                        header_text = f"{raw_time} {header_text}"
                     ev_date, time_text, title_text = _extract_header_date_time_title(
                         header_text, data_title, ev_date, reference_dt
                     )
+                    if raw_data_time and not time_text:
+                        time_text = raw_data_time
                 else:
-                    time_el = ev_node.select_one(".schedule__time, .time, td.time")
                     title_el = ev_node.select_one(
                         ".schedule__eventTitle, .event-title, .title, summary, strong"
                     )
-                    time_text = time_el.get_text(" ", strip=True) if time_el else ""
+                    time_text = raw_data_time or (
+                        time_el.get_text(" ", strip=True) if time_el else ""
+                    )
                     title_text = _strip_emojis(title_el.get_text(" ", strip=True) if title_el else "")
 
                 if not title_text:
@@ -639,7 +682,7 @@ def _parse_html_schedule(
                 else:
                     current_cat = text
                 continue
-            if current_cat.lower() in ("tv shows", "tv show"):
+            if _is_excluded_category(current_cat):
                 continue
 
             ch_container = node.select_one(".schedule__channels") or node
@@ -651,20 +694,29 @@ def _parse_html_schedule(
                 continue
 
             header_el = node.select_one(".schedule__eventHeader")
+            time_el = node.select_one(".schedule__time, .time, td.time")
+            raw_data_time = str(time_el.get("data-time") or "").strip() if time_el else ""
             ev_date = current_date
             if header_el is not None:
+                header_text = header_el.get_text(" ", strip=True)
+                raw_time = raw_data_time or (time_el.get_text(" ", strip=True) if time_el else "")
+                if raw_time and raw_time not in header_text:
+                    header_text = f"{raw_time} {header_text}"
                 ev_date, time_text, title_text = _extract_header_date_time_title(
-                    header_el.get_text(" ", strip=True),
+                    header_text,
                     str(header_el.get("data-title") or ""),
                     current_date,
                     reference_dt,
                 )
+                if raw_data_time and not time_text:
+                    time_text = raw_data_time
             else:
-                time_el = node.select_one(".schedule__time, .time, td.time")
                 title_el = node.select_one(
                     ".schedule__eventTitle, .event-title, .title, summary, strong"
                 )
-                time_text = time_el.get_text(" ", strip=True) if time_el else ""
+                time_text = raw_data_time or (
+                    time_el.get_text(" ", strip=True) if time_el else ""
+                )
                 title_text = _strip_emojis(title_el.get_text(" ", strip=True) if title_el else "")
                 if not title_text:
                     # Strip anchor text to reconstruct event title from remaining node text
@@ -697,41 +749,6 @@ def _parse_html_schedule(
         if events:
             return events
 
-    # Generic HTML fallback: group channel anchors by immediate parent block
-    grouped: dict[int, tuple[Any, list[tuple[str, str]]]] = {}
-    for a in soup.find_all("a", href=True):
-        cid = _extract_channel_id(a["href"])
-        if not cid:
-            continue
-        parent = a.find_parent(["div", "li", "tr", "p"]) or soup
-        pid = id(parent)
-        if pid not in grouped:
-            grouped[pid] = (parent, [])
-        grouped[pid][1].append((cid, a.get_text(" ", strip=True)))
-
-    for parent, raw_channels in grouped.values():
-        anchor_labels = {label for _, label in raw_channels if label}
-        fragments = [
-            s.strip()
-            for s in parent.stripped_strings
-            if s.strip() and s.strip() not in anchor_labels
-        ]
-        if not fragments:
-            continue
-        raw_line = " ".join(fragments)
-        tm = _TIME_HHMM_RE.search(raw_line)
-        time_text = tm.group(0) if tm else ""
-        title_text = raw_line.replace(time_text, "", 1).strip(" -:|") if time_text else raw_line
-        ev = _build_provider_event(
-            raw_title=title_text,
-            category=current_cat,
-            start_ms=_parse_start_ms(time_text, current_date),
-            raw_channels=raw_channels,
-            base_url=base_url,
-        )
-        if ev is not None:
-            events.append(ev)
-
     return events
 
 
@@ -759,81 +776,8 @@ def parse_daddylive_schedule(
     return _parse_html_schedule(text, base_url, ref)
 
 
-def parse_daddylive_channels(
-    payload: str,
-    base_url: str,
-) -> dict[str, list[StreamSource]]:
-    """Parse DaddyLive 24/7 TV channel list (JSON or HTML) into normalized channel map."""
-    text = (payload or "").strip()
-    if not text:
-        return {}
-    base = base_url.rstrip("/")
-    channels: dict[str, list[StreamSource]] = {}
-    seen_per_key: dict[str, set[str]] = {}
-
-    def _add_entry(cid: str, label: str) -> None:
-        clean_id = _extract_channel_id(cid)
-        clean_label = re.sub(r"\s+", " ", (label or "").strip())
-        if not clean_id or not clean_label or _JUNK_CHANNEL_RE.search(clean_label):
-            return
-        norm_key = normalize_daddylive_channel_key(clean_label)
-        if not norm_key:
-            return
-        seen = seen_per_key.setdefault(norm_key, set())
-        if clean_id in seen:
-            return
-        seen.add(clean_id)
-        lang = detect_channel_language(clean_label)
-        watch_url = _build_watch_url(base, clean_id)
-        channels.setdefault(norm_key, []).append(
-            StreamSource(
-                provider="daddylive",
-                title=f"{clean_label} ({lang.upper()})" if lang else clean_label,
-                url=watch_url,
-                language=lang,
-                priority=4,
-                requires_proxy=True,
-                proxy_host="dlstreams",
-                channel_name=clean_label,
-                raw_url=watch_url,
-            )
-        )
-
-    if text[0] in ("{", "["):
-        try:
-            data = json.loads(text)
-            items = (
-                data
-                if isinstance(data, list)
-                else data.get("channels") or data.get("data") or []
-                if isinstance(data, dict)
-                else []
-            )
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                _add_entry(
-                    str(item.get("channel_id") or item.get("id") or item.get("url") or ""),
-                    str(item.get("channel_name") or item.get("name") or item.get("title") or ""),
-                )
-            return channels
-        except json.JSONDecodeError:
-            pass
-
-    soup = BeautifulSoup(text, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = str(a["href"])
-        cid = _extract_channel_id(href)
-        if not cid:
-            continue
-        label = a.get_text(" ", strip=True) or str(a.get("title") or "")
-        _add_entry(cid, label)
-
-    return channels
-
-
 class DaddyLiveService(BaseStreamProvider):
-    """Async DaddyLive schedule and 24/7 TV channel harvester via DoH."""
+    """Async DaddyLive schedule harvester (DoH) + 18 canonical Italian sports channels."""
 
     name: str = "daddylive"
     priority: int = 4
@@ -848,6 +792,7 @@ class DaddyLiveService(BaseStreamProvider):
         super().__init__(settings)
         self._external_client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
+        self._probe_client: Optional[httpx.AsyncClient] = None
         self._custom_mirrors: bool = mirrors is not None
         self._mirrors: tuple[str, ...] = tuple(
             m.rstrip("/") for m in (mirrors or DEFAULT_MIRRORS) if m.strip()
@@ -855,6 +800,7 @@ class DaddyLiveService(BaseStreamProvider):
         self._active_mirror: str = self._mirrors[0] if self._mirrors else DEFAULT_MIRRORS[0]
         self._player_cache: dict[tuple[str, str], tuple[float, str]] = {}
         self._player_locks: dict[str, asyncio.Lock] = {}
+        self._last_good_events: list[ProviderEvent] = []
 
     def _get_channel_lock(self, cid: str) -> asyncio.Lock:
         lock = self._player_locks.get(cid)
@@ -880,11 +826,25 @@ class DaddyLiveService(BaseStreamProvider):
             self._owned_client = create_doh_client(timeout=15.0)
         return self._owned_client
 
+    def _get_easyproxy_client(self) -> httpx.AsyncClient:
+        if self._external_client is not None:
+            return self._external_client
+        if self._probe_client is None or self._probe_client.is_closed:
+            self._probe_client = create_standard_client(
+                timeout=8.0,
+                verify=True,
+                follow_redirects=False,
+            )
+        return self._probe_client
+
     async def aclose(self) -> None:
-        """Close owned DoH client if created internally."""
+        """Close owned DoH and EasyProxy HTTP clients if created internally."""
         if self._owned_client is not None and not self._owned_client.is_closed:
             await self._owned_client.aclose()
             self._owned_client = None
+        if self._probe_client is not None and not self._probe_client.is_closed:
+            await self._probe_client.aclose()
+            self._probe_client = None
 
     @staticmethod
     def _normalize_origin(candidate: str) -> str:
@@ -911,19 +871,24 @@ class DaddyLiveService(BaseStreamProvider):
             )
             if resp.status_code == 200 and resp.text.strip():
                 text = resp.text.strip()
+                status_offline = False
                 if text.startswith("{"):
                     try:
                         data = resp.json()
                         if isinstance(data, dict):
-                            for key in ("url", "canonical", "active", "domain", "redirect"):
-                                val = data.get(key)
-                                if isinstance(val, str) and val.strip():
-                                    discovered = self._normalize_origin(val)
-                                    if discovered:
-                                        break
+                            raw_status = str(data.get("status") or "").strip().lower()
+                            if raw_status and raw_status not in ("online", "ok", "up", "active"):
+                                status_offline = True
+                            else:
+                                for key in ("final_url", "canonical", "active", "redirect", "domain", "url"):
+                                    val = data.get(key)
+                                    if isinstance(val, str) and val.strip():
+                                        discovered = self._normalize_origin(val)
+                                        if discovered:
+                                            break
                     except ValueError:
                         pass
-                if not discovered:
+                if not discovered and not status_offline:
                     m = re.search(r"https?://[^\s\"'<>]+", text)
                     if m:
                         discovered = self._normalize_origin(m.group(0))
@@ -956,7 +921,7 @@ class DaddyLiveService(BaseStreamProvider):
             url = urljoin(f"{mirror}/", path.lstrip("/"))
             try:
                 resp = await client.get(url, headers=headers)
-                if resp.status_code == 200 and resp.text.strip():
+                if resp.status_code == 200 and _is_valid_schedule_payload(resp.text):
                     return resp.text
             except Exception as exc:
                 logger.debug("DaddyLive fetch failed for %s: %s", url, exc)
@@ -986,7 +951,7 @@ class DaddyLiveService(BaseStreamProvider):
             if cached and now - cached[0] < PLAYER_CACHE_TTL_SECONDS:
                 return cached[1]
 
-            client = self._get_client()
+            client = self._get_easyproxy_client() if ep_base else self._get_client()
             domain = (self._active_mirror or DEFAULT_MIRRORS[0]).rstrip("/")
             headers = {"User-Agent": CHROME_USER_AGENT, "Referer": f"{domain}/"}
 
@@ -1027,18 +992,14 @@ class DaddyLiveService(BaseStreamProvider):
             return first_fallback
 
     @staticmethod
-    def _merge_canonical_channels_fallback(
-        linear_channels: dict[str, list[StreamSource]],
-        base_url: str,
-    ) -> None:
+    def _build_canonical_channels(base_url: str) -> dict[str, list[StreamSource]]:
         base = base_url.rstrip("/")
+        channels: dict[str, list[StreamSource]] = {}
         for canon_key, info in DADDYLIVE_CANONICAL_CHANNELS.items():
-            if canon_key in linear_channels:
-                continue
             cid = info["id"]
             label = info["name"]
             watch_url = _build_watch_url(base, cid)
-            linear_channels[canon_key] = [
+            channels[canon_key] = [
                 StreamSource(
                     provider="daddylive",
                     title=f"{label} (IT)",
@@ -1051,15 +1012,23 @@ class DaddyLiveService(BaseStreamProvider):
                     raw_url=watch_url,
                 )
             ]
+        return channels
 
-    async def harvest(self) -> ProviderHarvestResult:
-        """Scrape DaddyLive active mirror schedule and 24/7 TV channels."""
+    async def harvest(
+        self,
+        *,
+        now_utc: Optional[datetime] = None,
+    ) -> ProviderHarvestResult:
+        """Scrape DaddyLive active mirror schedule and attach canonical Italian sports channels."""
         if not self.enabled:
             return ProviderHarvestResult(provider=self.name)
 
         client = self._get_client()
+        utc_now = now_utc or datetime.now(timezone.utc)
+        if utc_now.tzinfo is None:
+            utc_now = utc_now.replace(tzinfo=timezone.utc)
+
         events: list[ProviderEvent] = []
-        linear_channels: dict[str, list[StreamSource]] = {}
         errors: list[str] = []
         scraped_any = False
 
@@ -1067,26 +1036,44 @@ class DaddyLiveService(BaseStreamProvider):
         for mirror in mirrors:
             try:
                 sched_payload = await self._fetch_first_valid(client, mirror, _SCHEDULE_PATHS)
-                if sched_payload:
-                    events = parse_daddylive_schedule(sched_payload, mirror)
-
-                ch_payload = await self._fetch_first_valid(client, mirror, _CHANNELS_PATHS)
-                if ch_payload:
-                    linear_channels = parse_daddylive_channels(ch_payload, mirror)
-
-                if events or linear_channels:
+                if not sched_payload:
+                    continue
+                parsed_events = parse_daddylive_schedule(
+                    sched_payload, mirror, reference_dt=utc_now
+                )
+                if parsed_events:
+                    events = filter_daddylive_events_by_window(
+                        parsed_events,
+                        now_utc=utc_now,
+                        retention_hours=self.settings.MATCH_RETENTION_HOURS,
+                        timezone_name=self.settings.TIMEZONE,
+                    )
                     self._active_mirror = mirror
+                    self._last_good_events = list(events)
                     scraped_any = True
                     break
             except Exception as exc:
                 errors.append(f"{mirror}: {exc}")
                 logger.warning("DaddyLive mirror %s failed: %s", mirror, exc)
 
-        fallback_mirror = self._active_mirror or (mirrors[0] if mirrors else DEFAULT_MIRRORS[0])
-        self._merge_canonical_channels_fallback(linear_channels, fallback_mirror)
+        if not scraped_any and self._last_good_events:
+            events = filter_daddylive_events_by_window(
+                self._last_good_events,
+                now_utc=utc_now,
+                retention_hours=self.settings.MATCH_RETENTION_HOURS,
+                timezone_name=self.settings.TIMEZONE,
+            )
+            self._last_good_events = list(events)
+            logger.warning(
+                "DaddyLive harvest failed across all mirrors; retaining %d cached events",
+                len(events),
+            )
+
+        active_mirror = self._active_mirror or (mirrors[0] if mirrors else DEFAULT_MIRRORS[0])
+        linear_channels = self._build_canonical_channels(active_mirror)
 
         raw_count = len(events) + sum(len(v) for v in linear_channels.values())
-        error_msg = "; ".join(errors) if (not scraped_any and errors) else ""
+        error_msg = "; ".join(errors) if (not scraped_any and not events and errors) else ""
         return ProviderHarvestResult(
             provider=self.name,
             events=events,
