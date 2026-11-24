@@ -17,7 +17,12 @@ from app.core.database import DatabaseManager
 from app.core.network import DoHResolver, is_safe_public_ip
 from app.core.ram_cache import RAMCacheManager
 from app.core.user_config import UserConfig, decode_config, encode_config
-from app.graphics import BannerService, TennisPosterService, TheSportsDBService
+from app.graphics import (
+    BannerService,
+    TennisPosterService,
+    TheSportsDBService,
+    compute_badge_state,
+)
 from app.ingestion import (
     DirettaService,
     ItalianEPGService,
@@ -26,6 +31,8 @@ from app.ingestion import (
 )
 from app.main import create_app
 from app.models.domain import (
+    DIRETTA_POST_MATCH_MS,
+    SKY_EPG_POST_END_MS,
     EPGProgram,
     Match,
     ProviderEvent,
@@ -125,30 +132,54 @@ async def test_database_wal_busy_timeout_upsert_and_6h_purge(tmp_path: Path) -> 
             assert int(row[0]) == 30000
 
         now_ms = int(time.time() * 1000)
-        expired_end = now_ms - (7 * 3600 * 1000)  # 7h ago -> beyond 6h retention
-        active_end = now_ms - (2 * 3600 * 1000)   # 2h ago -> within 6h retention
 
-        m_expired = _make_match(
+        m_dir_expired = _make_match(
             "diretta-old",
             "Old Match vs Expired",
-            date_ms=expired_end - 7200_000,
-            end_ms=expired_end,
+            date_ms=now_ms - 180 * 60_000,
+            end_ms=now_ms - 31 * 60_000,  # > 30m Diretta grace -> purged
+            source_origin="diretta",
         )
-        m_active = _make_match(
-            "diretta-live",
+        m_dir_grace = _make_match(
+            "diretta-postmatch",
             "Inter vs Milan",
-            date_ms=now_ms - 1800_000,
-            end_ms=active_end + 7200_000,
+            date_ms=now_ms - 140 * 60_000,
+            end_ms=now_ms - 25 * 60_000,  # <= 30m Diretta grace -> kept
             home="Inter",
             away="Milan",
+            source_origin="diretta",
+        )
+        m_sky_expired = _make_match(
+            "sky-old",
+            "Old Sky Broadcast",
+            date_ms=now_ms - 120 * 60_000,
+            end_ms=now_ms - 16 * 60_000,  # > 15m Sky EPG grace -> purged
+            source_origin="epg",
+        )
+        m_sky_grace = _make_match(
+            "sky-postend",
+            "Active Sky Post-End",
+            date_ms=now_ms - 90 * 60_000,
+            end_ms=now_ms - 10 * 60_000,  # <= 15m Sky EPG grace -> kept
+            source_origin="epg",
+        )
+        m_cancel = _make_match(
+            "diretta-cancel",
+            "Cancelled Match",
+            date_ms=now_ms + 3600_000,
+            end_ms=now_ms + 7200_000,
+            source_origin="diretta",
         )
 
-        await db.upsert_matches([m_expired, m_active])
-        purged_ids = await db.purge_expired(retention_hours=6)
-        assert purged_ids == ["diretta-old"]
+        await db.upsert_matches([m_dir_expired, m_dir_grace, m_sky_expired, m_sky_grace, m_cancel])
+        deleted_ids = await db.delete_matches(["diretta-cancel", "missing-id"])
+        assert deleted_ids == ["diretta-cancel"]
 
-        remaining = await db.load_active_matches(now_ms - (6 * 3600 * 1000))
-        assert [m.id for m in remaining] == ["diretta-live"]
+        purged_ids = await db.purge_expired(now_ms=now_ms)
+        assert set(purged_ids) == {"diretta-old", "sky-old"}
+
+        remaining = await db.load_active_matches(now_ms=now_ms)
+        assert {m.id for m in remaining} == {"diretta-postmatch", "sky-postend"}
     finally:
         await db.close()
 
@@ -806,7 +837,6 @@ async def test_all_enable_toggles_false(tmp_path: Path) -> None:
         tmp_path,
         ENABLE_DIRETTA=False,
         ENABLE_SKY_EPG=False,
-        ENABLE_TIVUSAT_EPG=False,
         ENABLE_THESPORTSDB=False,
         ENABLE_TENNIS_POSTERS=False,
         ENABLE_TVVOO=False,
@@ -995,5 +1025,126 @@ async def test_evolved_taxonomy_graphics_routes_and_legacy_config(tmp_path: Path
     await sched.stop()
     await sched._orchestrator.aclose()
     await sched._tsdb.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_state_catalog_realtime_ram_expiry_badge_and_immediate_discard(tmp_path: Path) -> None:
+    now_ms = int(time.time() * 1000)
+
+    # 1. Two-state catalog (LIVE vs IN ARRIVO only; expired matches excluded immediately) + LIVE badge during grace
+    m_dir_grace = _make_match(
+        "diretta-grace",
+        "Diretta Post-Match",
+        silo=SportSilo.FOOTBALL,
+        category="calcio_estero",
+        genres=["Premier League"],
+        date_ms=now_ms - 135 * 60_000,
+        end_ms=now_ms - 25 * 60_000,  # +30m grace -> active & LIVE for 5m more
+        source_origin="diretta",
+    )
+    m_sky_grace = _make_match(
+        "sky-grace",
+        "Sky Active Post-End",
+        silo=SportSilo.FOOTBALL,
+        category="calcio_estero",
+        genres=["Premier League"],
+        date_ms=now_ms - 120 * 60_000,
+        end_ms=now_ms - 10 * 60_000,  # +15m grace -> active & LIVE for 5m more
+        source_origin="epg",
+    )
+    m_expired_already = _make_match(
+        "diretta-done",
+        "Already Finished Match",
+        silo=SportSilo.FOOTBALL,
+        category="calcio_estero",
+        genres=["Premier League"],
+        date_ms=now_ms - 180 * 60_000,
+        end_ms=now_ms - 35 * 60_000,  # > 30m -> must never sit at bottom of catalog
+        source_origin="diretta",
+    )
+    m_upcoming = _make_match(
+        "diretta-next",
+        "Upcoming Match",
+        silo=SportSilo.FOOTBALL,
+        category="calcio_estero",
+        genres=["Premier League"],
+        date_ms=now_ms + 90 * 60_000,
+        end_ms=now_ms + 225 * 60_000,
+        source_origin="diretta",
+    )
+
+    assert compute_badge_state(m_dir_grace, now_ms=now_ms)[0] == "LIVE"
+    assert compute_badge_state(m_sky_grace, now_ms=now_ms)[0] == "LIVE"
+
+    buckets, _ = build_catalog_buckets(
+        [m_upcoming, m_expired_already, m_sky_grace, m_dir_grace],
+        now_ms=now_ms,
+    )
+    bucket_ids = [m.id for m in buckets["calcio_estero"]]
+    assert bucket_ids == ["diretta-grace", "sky-grace", "diretta-next"]
+
+    ram = RAMCacheManager()
+    ram.update_snapshot(
+        active_matches=[m_dir_grace, m_sky_grace, m_upcoming],
+        matches_by_catalog=buckets,
+        genres_by_catalog={},
+        updated_at=now_ms,
+    )
+    # 6 minutes later: both grace windows expired (sky at +15m, diretta at +30m); only upcoming stays in RAM catalog
+    later_ms = now_ms + 6 * 60_000
+    assert SKY_EPG_POST_END_MS == 15 * 60_000 and DIRETTA_POST_MATCH_MS == 30 * 60_000
+    live_cat = ram.get_catalog("calcio_estero", now_ms=later_ms)
+    assert [m.id for m in live_cat] == ["diretta-next"]
+
+    # 2. PipelineScheduler.run_once deletes last_discarded_match_ids from SQLite + cleans posters
+    settings = _test_settings(tmp_path)
+    settings.POSTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    settings.BASE_POSTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    db = DatabaseManager(db_path=settings.DB_PATH)
+    await db.connect()
+    postponed = _make_match(
+        "diretta-postponed",
+        "Postponed Game",
+        date_ms=now_ms + 3600_000,
+        end_ms=now_ms + 7200_000,
+    )
+    await db.upsert_matches([postponed])
+    p_base = settings.BASE_POSTER_CACHE_DIR / "diretta-postponed.jpg"
+    p_base.write_bytes(b"img")
+
+    class MockDiscardDiretta(DirettaService):
+        async def fetch_schedule(self, **kwargs: Any) -> tuple[list[Match], frozenset[str]]:
+            self.last_discarded_match_ids = frozenset({"diretta-postponed"})
+            return [m_upcoming], frozenset()
+
+    class EmptyEPG(ItalianEPGService):
+        async def fetch_epg(self, active_tennis_cities: frozenset[str] = frozenset(), **kwargs: Any) -> list[EPGProgram]:
+            return []
+
+    tsdb = TheSportsDBService(settings=settings)
+    banner = BannerService(settings=settings, tsdb_service=tsdb)
+    orchestrator = StreamOrchestrator([], settings=settings)
+    sched_ram = RAMCacheManager()
+    scheduler = PipelineScheduler(
+        settings=settings,
+        db=db,
+        ram_cache=sched_ram,
+        diretta=MockDiscardDiretta(settings=settings),
+        epg=EmptyEPG(settings=settings),
+        orchestrator=orchestrator,
+        tsdb=tsdb,
+        banner=banner,
+    )
+    try:
+        count = await scheduler.run_once(now_ms=now_ms)
+        assert count == 1
+        assert not p_base.exists()
+        assert [m.id for m in await db.load_active_matches(now_ms=now_ms)] == ["diretta-next"]
+    finally:
+        await orchestrator.aclose()
+        await tsdb.aclose()
+        await db.close()
+
 
 

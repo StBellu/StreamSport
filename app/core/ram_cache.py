@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from app.models.domain import Match
+from app.models.domain import Match, get_match_expiry_ms
 from app.taxonomy.classifier import NUVIO_CATALOG_LOOKUP, _normalize_catalog_id
 
 
@@ -61,6 +61,7 @@ class RAMCacheManager:
         search: Optional[str] = None,
         skip: int = 0,
         limit: int = 100,
+        now_ms: Optional[int] = None,
     ) -> list[Match]:
         """Filter and paginate matches for a catalog purely in RAM."""
         if limit <= 0:
@@ -77,6 +78,13 @@ class RAMCacheManager:
             if items is None:
                 norm_id = _normalize_catalog_id(catalog_id)
                 items = self._snapshot.matches_by_catalog.get(norm_id, ())
+
+        current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        items = tuple(
+            m
+            for m in items
+            if (exp := get_match_expiry_ms(m)) <= 0 or current_ms <= exp
+        )
 
         if effective_genre:
             genre_norm = effective_genre.strip().lower()

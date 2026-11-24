@@ -90,7 +90,7 @@ class Match(BaseModel):
 
 
 class EPGProgram(BaseModel):
-    """Linear TV broadcast schedule item from Sky Italia or Tivùsat."""
+    """Linear TV broadcast schedule item from Sky Italia."""
 
     id: str
     channel_id: str
@@ -121,3 +121,22 @@ class ProviderEvent(BaseModel):
     is_women: bool = False
     is_youth: bool = False
     streams: list[StreamSource] = Field(default_factory=list)
+
+
+DIRETTA_POST_MATCH_MS: int = 30 * 60 * 1000
+SKY_EPG_POST_END_MS: int = 15 * 60 * 1000
+DEFAULT_FALLBACK_DURATION_MS: int = 150 * 60 * 1000
+
+
+def get_match_post_grace_ms(match: Match) -> int:
+    """Return post-end visibility grace in ms (`15m` for Sky EPG, `30m` otherwise)."""
+    return SKY_EPG_POST_END_MS if match.source_origin in ("epg", "sky_epg") else DIRETTA_POST_MATCH_MS
+
+
+def get_match_expiry_ms(match: Match) -> int:
+    """Return the exact expiration timestamp in ms after which `match` leaves catalogs and DB."""
+    if match.end_date > 0:
+        return match.end_date + get_match_post_grace_ms(match)
+    if match.date > 0:
+        return match.date + DEFAULT_FALLBACK_DURATION_MS
+    return 0

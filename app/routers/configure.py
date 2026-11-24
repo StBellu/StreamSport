@@ -34,7 +34,6 @@ def _build_source_statuses(settings: Settings) -> list[dict[str, object]]:
     return [
         {"name": "Diretta", "enabled": settings.ENABLE_DIRETTA, "kind": "Schedule"},
         {"name": "Sky EPG", "enabled": settings.ENABLE_SKY_EPG, "kind": "EPG"},
-        {"name": "Tivùsat", "enabled": settings.ENABLE_TIVUSAT_EPG, "kind": "EPG"},
         {"name": "TheSportsDB", "enabled": settings.ENABLE_THESPORTSDB, "kind": "Posters"},
         {"name": "Tennis Posters", "enabled": settings.ENABLE_TENNIS_POSTERS, "kind": "Posters"},
         {"name": "TvVoo", "enabled": settings.ENABLE_TVVOO, "kind": "Provider"},

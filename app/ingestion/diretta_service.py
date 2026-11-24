@@ -8,14 +8,15 @@ import logging
 import re
 import time
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, NamedTuple, Optional
 
 import httpx
 
 from app.config import Settings, get_settings
 from app.core.network import DEFAULT_USER_AGENT, create_standard_client
-from app.models.domain import Match, SportSilo, TeamInfo
+from app.graphics._utils import get_timezone
+from app.models.domain import DIRETTA_POST_MATCH_MS, Match, SportSilo, TeamInfo
 from app.taxonomy import (
     DEFAULT_GENRE_CLASSIFIER,
     DEFAULT_LEAGUE_TAXONOMY,
@@ -49,9 +50,14 @@ SPORT_IDS: dict[int, SportFeedSpec] = {
     33: SportFeedSpec(SportSilo.MOTORI, 180),  # MotoGP
 }
 
-FEED_DAYS: tuple[int, ...] = (-1, 0, 1, 2)
+FEED_DAYS: tuple[int, ...] = (0, 1, 2)
 IT_FEED_URL = "https://400.flashscore.ninja/400/x/feed/f_{sport_id}_{day}_3_it_1"
 EN_FEED_URL = "https://2.flashscore.ninja/2/x/feed/f_{sport_id}_{day}_3_en-uk_1"
+_FUTURE_FEED_TTL_SECONDS: int = 12 * 3600
+_POST_MIDNIGHT_ROTATION_MINUTE: int = 20
+_YESTERDAY_LIVE_MAX_HOUR: int = 5
+_LIVE_EXTENSION_MS: int = 60 * 60 * 1000
+_CANCELLED_STATUS_DETAILS: frozenset[str] = frozenset({"4", "5", "9"})
 OTT_EXCLUDE: tuple[str, ...] = (
     "now tv",
     "sky go",
@@ -216,7 +222,11 @@ def _parse_block_kv(block: str) -> dict[str, str]:
     return kv
 
 
-def parse_flashscore_feed(raw_text: str) -> list[dict[str, Any]]:
+def parse_flashscore_feed(
+    raw_text: str,
+    *,
+    extract_broadcasters: bool = True,
+) -> list[dict[str, Any]]:
     """Parse Flashscore's `~`/`¬`/`÷` delimited feed into normalized event dicts."""
     if not raw_text:
         return []
@@ -259,6 +269,14 @@ def parse_flashscore_feed(raw_text: str) -> list[dict[str, Any]]:
         except (TypeError, ValueError):
             start_ms = 0
 
+        status = kv.get("AB", "").strip()
+        status_detail = kv.get("AC", "").strip()
+        ao_raw = kv.get("AO", "").strip()
+        try:
+            finish_ms = int(float(ao_raw)) * 1000 if ao_raw else 0
+        except (TypeError, ValueError):
+            finish_ms = 0
+
         za = kv.get("ZA", "").strip() or current_league["ZA"]
         zy = kv.get("ZY", "").strip() or current_league["ZY"]
         zb = kv.get("ZB", "").strip() or current_league["ZB"]
@@ -272,7 +290,9 @@ def parse_flashscore_feed(raw_text: str) -> list[dict[str, Any]]:
         away = kv.get("AF", "").strip()
         wu = kv.get("WU", "").strip()
         wv = kv.get("WV", "").strip()
-        broadcasters = extract_tv_broadcasters(kv.get("AL"))
+        broadcasters = (
+            extract_tv_broadcasters(kv.get("AL")) if extract_broadcasters else []
+        )
 
         events.append(
             {
@@ -282,6 +302,9 @@ def parse_flashscore_feed(raw_text: str) -> list[dict[str, Any]]:
                 "zae": zae,
                 "zl": zl,
                 "start_ms": start_ms,
+                "status": status,
+                "status_detail": status_detail,
+                "finish_ms": finish_ms,
                 "home": home,
                 "away": away,
                 "wu": wu,
@@ -475,6 +498,44 @@ def extract_tennis_cities(competition: str, alt_league: str = "") -> set[str]:
     return cities
 
 
+def _logical_local_day(local_dt: datetime) -> str:
+    """Return logical local YYYY-MM-DD anchored to post-midnight `00:20` rotation."""
+    if local_dt.hour == 0 and local_dt.minute < _POST_MIDNIGHT_ROTATION_MINUTE:
+        return (local_dt - timedelta(days=1)).date().isoformat()
+    return local_dt.date().isoformat()
+
+
+def _resolve_event_end_date(
+    *,
+    day: int,
+    start_ms: int,
+    duration_minutes: int,
+    status: str,
+    status_detail: str,
+    finish_ms: int,
+    now_ms: int,
+) -> tuple[Optional[int], bool]:
+    """Resolve effective `end_date` in ms or return `(None, should_delete_from_db)`."""
+    if status == "3" and status_detail in _CANCELLED_STATUS_DETAILS:
+        return None, True
+    if day == -1 and status != "2":
+        return None, False
+
+    est_end = start_ms + duration_minutes * 60 * 1000
+    if status == "2":
+        return max(est_end, now_ms + _LIVE_EXTENSION_MS), False
+    if status == "3":
+        resolved_finish = (
+            finish_ms
+            if finish_ms > 0
+            else (min(now_ms, est_end) if start_ms > 0 else now_ms)
+        )
+        if now_ms > resolved_finish + DIRETTA_POST_MATCH_MS:
+            return None, True
+        return resolved_finish, False
+    return est_end, False
+
+
 class DirettaService:
     """Async ingestion service for Flashscore / Diretta.it official schedules."""
 
@@ -486,7 +547,12 @@ class DirettaService:
         self._settings = settings or get_settings()
         self._client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
+        self._future_feed_cache: dict[
+            tuple[int, int],
+            tuple[str, float, list[dict[str, Any]], list[dict[str, Any]]],
+        ] = {}
         self._last_tennis_cities: frozenset[str] = frozenset()
+        self.last_discarded_match_ids: frozenset[str] = frozenset()
         self.last_fetch_failed: bool = False
         self.last_failed_feeds: int = 0
         self.last_total_feeds: int = 0
@@ -539,7 +605,9 @@ class DirettaService:
             else:
                 resp = await client.get(url, headers=self.build_headers(lang=lang))
             resp.raise_for_status()
-            return parse_flashscore_feed(resp.text), False
+            return parse_flashscore_feed(
+                resp.text, extract_broadcasters=(lang == "it")
+            ), False
         except Exception as exc:
             logger.warning(
                 "Flashscore feed fetch failed (sport=%s day=%s lang=%s): %s",
@@ -558,6 +626,7 @@ class DirettaService:
         base_silo: SportSilo,
         duration_minutes: int,
         start_ms: int,
+        end_date_ms: Optional[int] = None,
         competition: str,
         country: str,
         stage: str,
@@ -621,6 +690,12 @@ class DirettaService:
             is_youth=is_youth,
         )
 
+        effective_end_ms = (
+            end_date_ms
+            if end_date_ms is not None
+            else (start_ms + duration_minutes * 60 * 1000)
+        )
+
         return Match(
             id=match_id,
             title=title,
@@ -628,7 +703,7 @@ class DirettaService:
             silo=eff_silo,
             genres=genres,
             date=start_ms,
-            end_date=start_ms + duration_minutes * 60 * 1000,
+            end_date=effective_end_ms,
             popular=league_match.is_popular if league_match else False,
             competition=competition,
             canonical_competition=canonical_comp,
@@ -658,6 +733,7 @@ class DirettaService:
         *,
         now_ms: int,
         tennis_cities: set[str],
+        discarded_ids: Optional[set[str]] = None,
     ) -> list[Match]:
         spec = SPORT_IDS[sport_id]
         base_silo = spec.silo
@@ -694,11 +770,12 @@ class DirettaService:
                 for row in group:
                     if en_match is None and row["aa"] in en_by_aa:
                         en_match = en_by_aa[row["aa"]]
-                    for bc in row["broadcasters"]:
-                        bc_key = bc.casefold()
-                        if bc_key not in seen_bc:
-                            seen_bc.add(bc_key)
-                            merged_broadcasters.append(bc)
+                    if it_events:
+                        for bc in row["broadcasters"]:
+                            bc_key = bc.casefold()
+                            if bc_key not in seen_bc:
+                                seen_bc.add(bc_key)
+                                merged_broadcasters.append(bc)
 
                 alt_league = ""
                 alt_title = ""
@@ -713,8 +790,58 @@ class DirettaService:
                     alt_competition = en_clean_comp
                     alt_country = en_country
                     alt_title = en_title
-                    if not merged_broadcasters and en_match["broadcasters"]:
-                        merged_broadcasters = list(en_match["broadcasters"])
+
+                statuses = [r.get("status", "") for r in group if r.get("status")]
+                if not statuses and en_match and en_match.get("status"):
+                    statuses = [en_match["status"]]
+                cancelled_row = next(
+                    (
+                        r
+                        for r in group
+                        if r.get("status") == "3"
+                        and r.get("status_detail", "") in _CANCELLED_STATUS_DETAILS
+                    ),
+                    None,
+                )
+                if "2" in statuses:
+                    sess_status = "2"
+                    sess_detail = ""
+                    sess_finish_ms = 0
+                elif cancelled_row is not None and all(s == "3" for s in statuses):
+                    sess_status = "3"
+                    sess_detail = cancelled_row.get("status_detail", "")
+                    sess_finish_ms = cancelled_row.get("finish_ms", 0)
+                elif statuses and all(s == "3" for s in statuses):
+                    sess_status = "3"
+                    sess_detail = first.get("status_detail", "")
+                    sess_finish_ms = max(
+                        (r.get("finish_ms", 0) for r in group),
+                        default=(en_match.get("finish_ms", 0) if en_match else 0),
+                    )
+                else:
+                    sess_status = first.get("status") or (
+                        en_match.get("status", "") if en_match else ""
+                    )
+                    sess_detail = first.get("status_detail") or (
+                        en_match.get("status_detail", "") if en_match else ""
+                    )
+                    sess_finish_ms = first.get("finish_ms", 0) or (
+                        en_match.get("finish_ms", 0) if en_match else 0
+                    )
+
+                end_date_ms, should_discard = _resolve_event_end_date(
+                    day=day,
+                    start_ms=first["start_ms"],
+                    duration_minutes=duration_minutes,
+                    status=sess_status,
+                    status_detail=sess_detail,
+                    finish_ms=sess_finish_ms,
+                    now_ms=now_ms,
+                )
+                if end_date_ms is None:
+                    if should_discard and discarded_ids is not None:
+                        discarded_ids.add(f"diretta-{first_aa}")
+                    continue
 
                 match = self._build_match(
                     match_id=f"diretta-{first_aa}",
@@ -722,6 +849,7 @@ class DirettaService:
                     base_silo=base_silo,
                     duration_minutes=duration_minutes,
                     start_ms=first["start_ms"],
+                    end_date_ms=end_date_ms,
                     competition=clean_comp,
                     country=country,
                     stage=stage,
@@ -742,22 +870,45 @@ class DirettaService:
 
         # Standard team / individual sports: merge IT primary and EN secondary by AA ID.
         seen_aa: set[str] = set()
-        ordered_pairs: list[tuple[dict[str, Any], Optional[dict[str, Any]]]] = []
+        ordered_pairs: list[tuple[dict[str, Any], Optional[dict[str, Any]], bool]] = []
         for it_ev in it_events:
             aa = it_ev["aa"]
             if aa in seen_aa:
                 continue
             seen_aa.add(aa)
-            ordered_pairs.append((it_ev, en_by_aa.get(aa)))
+            ordered_pairs.append((it_ev, en_by_aa.get(aa), True))
 
         for en_ev in en_events:
             aa = en_ev["aa"]
             if aa not in seen_aa:
                 seen_aa.add(aa)
-                ordered_pairs.append((en_ev, en_ev))
+                ordered_pairs.append((en_ev, en_ev, False))
 
-        for primary_ev, en_ev in ordered_pairs:
+        for primary_ev, en_ev, from_it_feed in ordered_pairs:
             aa = primary_ev["aa"]
+            ev_status = primary_ev.get("status") or (
+                en_ev.get("status", "") if en_ev else ""
+            )
+            ev_detail = primary_ev.get("status_detail") or (
+                en_ev.get("status_detail", "") if en_ev else ""
+            )
+            ev_finish_ms = primary_ev.get("finish_ms", 0) or (
+                en_ev.get("finish_ms", 0) if en_ev else 0
+            )
+            end_date_ms, should_discard = _resolve_event_end_date(
+                day=day,
+                start_ms=primary_ev["start_ms"],
+                duration_minutes=duration_minutes,
+                status=ev_status,
+                status_detail=ev_detail,
+                finish_ms=ev_finish_ms,
+                now_ms=now_ms,
+            )
+            if end_date_ms is None:
+                if should_discard and discarded_ids is not None:
+                    discarded_ids.add(f"diretta-{aa}")
+                continue
+
             comp, country = _split_competition_and_country(
                 primary_ev["za"], primary_ev["country"], base_silo
             )
@@ -793,9 +944,7 @@ class DirettaService:
                     alt_away = en_ev["away"]
                 alt_title = f"{alt_home} vs {alt_away}" if alt_away else alt_home
 
-            broadcasters = list(primary_ev["broadcasters"])
-            if not broadcasters and en_ev is not None:
-                broadcasters = list(en_ev["broadcasters"])
+            broadcasters = list(primary_ev["broadcasters"]) if from_it_feed else []
 
             title = f"{home_name} vs {away_name}" if away_name else home_name
             home_team = (
@@ -815,6 +964,7 @@ class DirettaService:
                 base_silo=base_silo,
                 duration_minutes=duration_minutes,
                 start_ms=primary_ev["start_ms"],
+                end_date_ms=end_date_ms,
                 competition=comp,
                 country=country,
                 stage=stage,
@@ -839,12 +989,13 @@ class DirettaService:
     async def fetch_schedule(
         self,
         *,
-        days: tuple[int, ...] = FEED_DAYS,
+        days: Optional[tuple[int, ...]] = None,
         sport_ids: Optional[Iterable[int]] = None,
         now_utc: Optional[datetime] = None,
     ) -> tuple[list[Match], frozenset[str]]:
         """Fetch and fuse IT+EN Flashscore feeds into admitted `Match` objects."""
         if not self._settings.ENABLE_DIRETTA:
+            self.last_discarded_match_ids = frozenset()
             self.last_fetch_failed = False
             self.last_failed_feeds = 0
             self.last_total_feeds = 0
@@ -852,23 +1003,49 @@ class DirettaService:
 
         target_sports = [sid for sid in (sport_ids or SPORT_IDS.keys()) if sid in SPORT_IDS]
         if not target_sports:
+            self.last_discarded_match_ids = frozenset()
             self.last_fetch_failed = False
             self.last_failed_feeds = 0
             self.last_total_feeds = 0
             return [], frozenset()
 
-        now_ms = (
-            int(now_utc.timestamp() * 1000)
-            if now_utc is not None
-            else int(time.time() * 1000)
-        )
+        if now_utc is None:
+            ref_utc = datetime.now(timezone.utc)
+        elif now_utc.tzinfo is None:
+            ref_utc = now_utc.replace(tzinfo=timezone.utc)
+        else:
+            ref_utc = now_utc.astimezone(timezone.utc)
+
+        ref_ts = ref_utc.timestamp()
+        now_ms = int(ref_ts * 1000)
+        local_dt = ref_utc.astimezone(get_timezone(self._settings.TIMEZONE))
+        logical_day = _logical_local_day(local_dt)
+
+        if days is not None:
+            target_days = tuple(days)
+        elif 0 <= local_dt.hour < _YESTERDAY_LIVE_MAX_HOUR:
+            target_days = (-1, 0, 1, 2)
+        else:
+            target_days = FEED_DAYS
 
         client = self._get_client()
         semaphore = asyncio.Semaphore(10)
         tasks: list[tuple[int, int, str]] = []
         coros = []
+        feeds_by_key: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
+
         for sid in target_sports:
-            for day in days:
+            for day in target_days:
+                if day in (1, 2):
+                    cached = self._future_feed_cache.get((sid, day))
+                    if (
+                        cached is not None
+                        and cached[0] == logical_day
+                        and (ref_ts - cached[1]) < _FUTURE_FEED_TTL_SECONDS
+                    ):
+                        feeds_by_key[(sid, day, "it")] = cached[2]
+                        feeds_by_key[(sid, day, "en")] = cached[3]
+                        continue
                 tasks.append((sid, day, "it"))
                 coros.append(
                     self._fetch_feed_events(client, sid, day, lang="it", semaphore=semaphore)
@@ -878,21 +1055,39 @@ class DirettaService:
                     self._fetch_feed_events(client, sid, day, lang="en", semaphore=semaphore)
                 )
 
-        results = await asyncio.gather(*coros)
-        feeds_by_key: dict[tuple[int, int, str], list[dict[str, Any]]] = {}
+        results = await asyncio.gather(*coros) if coros else []
         failed_feeds = 0
+        failed_by_key: dict[tuple[int, int, str], bool] = {}
         for (sid, day, lang), (parsed, failed) in zip(tasks, results):
             feeds_by_key[(sid, day, lang)] = parsed
+            failed_by_key[(sid, day, lang)] = failed
             if failed:
                 failed_feeds += 1
+
+        for sid in target_sports:
+            for day in target_days:
+                if day not in (1, 2) or (sid, day, "it") not in failed_by_key:
+                    continue
+                it_failed = failed_by_key.get((sid, day, "it"), False)
+                en_failed = failed_by_key.get((sid, day, "en"), False)
+                it_evs = feeds_by_key.get((sid, day, "it"), [])
+                en_evs = feeds_by_key.get((sid, day, "en"), [])
+                if not (it_failed and en_failed):
+                    self._future_feed_cache[(sid, day)] = (logical_day, ref_ts, it_evs, en_evs)
+                else:
+                    cached = self._future_feed_cache.get((sid, day))
+                    if cached is not None and cached[0] == logical_day:
+                        feeds_by_key[(sid, day, "it")] = cached[2]
+                        feeds_by_key[(sid, day, "en")] = cached[3]
 
         total_feeds = len(tasks)
         all_matches: list[Match] = []
         seen_match_ids: set[str] = set()
+        discarded_ids: set[str] = set()
         tennis_cities: set[str] = set()
 
         for sid in target_sports:
-            for day in days:
+            for day in target_days:
                 it_evs = feeds_by_key.get((sid, day, "it"), [])
                 en_evs = feeds_by_key.get((sid, day, "en"), [])
                 day_matches = self._fuse_sport_day(
@@ -902,16 +1097,20 @@ class DirettaService:
                     en_evs,
                     now_ms=now_ms,
                     tennis_cities=tennis_cities,
+                    discarded_ids=discarded_ids,
                 )
                 for m in day_matches:
                     if m.id not in seen_match_ids:
                         seen_match_ids.add(m.id)
                         all_matches.append(m)
 
+        discarded_ids -= seen_match_ids
+        self.last_discarded_match_ids = frozenset(discarded_ids)
+
         all_matches.sort(key=lambda m: (m.date, m.title))
         self.last_failed_feeds = failed_feeds
         self.last_total_feeds = total_feeds
-        self.last_fetch_failed = (failed_feeds == total_feeds) or (
+        self.last_fetch_failed = (total_feeds > 0 and failed_feeds == total_feeds) or (
             not all_matches and failed_feeds > 0
         )
 
@@ -934,7 +1133,7 @@ class DirettaService:
     async def ingest_all(
         self,
         *,
-        days: tuple[int, ...] = FEED_DAYS,
+        days: Optional[tuple[int, ...]] = None,
         sport_ids: Optional[Iterable[int]] = None,
         now_utc: Optional[datetime] = None,
     ) -> tuple[list[Match], frozenset[str]]:

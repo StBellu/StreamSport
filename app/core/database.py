@@ -3,13 +3,20 @@
 import asyncio
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import aiosqlite
 import orjson
 
 from app.config import get_settings
-from app.models.domain import Match, SportSilo, StreamSource, TeamInfo
+from app.models.domain import (
+    DIRETTA_POST_MATCH_MS,
+    SKY_EPG_POST_END_MS,
+    Match,
+    SportSilo,
+    StreamSource,
+    TeamInfo,
+)
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS matches (
@@ -260,32 +267,93 @@ class DatabaseManager:
 
         await self._run_write_tx(_op)
 
-    async def load_active_matches(self, min_end_ms: int) -> list[Match]:
-        """Load all matches whose `end_date` is at or after `min_end_ms`."""
+    async def delete_matches(self, match_ids: Iterable[str]) -> list[str]:
+        """Delete specific matches (e.g. cancelled/postponed or newly expired) immediately."""
+        ordered_ids: list[str] = []
+        seen: set[str] = set()
+        for raw_id in match_ids:
+            cid = str(raw_id or "").strip()
+            if cid and cid not in seen:
+                seen.add(cid)
+                ordered_ids.append(cid)
+        if not ordered_ids:
+            return []
+
+        async def _op(db: aiosqlite.Connection) -> list[str]:
+            deleted_ids: list[str] = []
+            for idx in range(0, len(ordered_ids), 500):
+                chunk = ordered_ids[idx : idx + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                async with db.execute(
+                    f"SELECT id FROM matches WHERE id IN ({placeholders});",
+                    chunk,
+                ) as cursor:
+                    found = [row["id"] for row in await cursor.fetchall()]
+                if found:
+                    await db.execute(
+                        f"DELETE FROM matches WHERE id IN ({placeholders});",
+                        chunk,
+                    )
+                    deleted_ids.extend(found)
+            return deleted_ids
+
+        return await self._run_write_tx(_op)
+
+    async def load_active_matches(
+        self,
+        min_end_ms: Optional[int] = None,
+        *,
+        now_ms: Optional[int] = None,
+    ) -> list[Match]:
+        """Load active matches applying explicit `min_end_ms` or origin-aware grace cutoffs."""
         db = self._require_db()
+        if min_end_ms is not None:
+            async with db.execute(
+                "SELECT * FROM matches WHERE end_date >= ? ORDER BY date ASC;",
+                (min_end_ms,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return [_row_to_match(row) for row in rows]
+
+        ref_ms = int(now_ms if now_ms is not None else _now_ms())
+        sky_cutoff = ref_ms - SKY_EPG_POST_END_MS
+        diretta_cutoff = ref_ms - DIRETTA_POST_MATCH_MS
         async with db.execute(
-            "SELECT * FROM matches WHERE end_date >= ? ORDER BY date ASC;",
-            (min_end_ms,),
+            """
+            SELECT * FROM matches
+            WHERE (
+                (source_origin IN ('epg', 'sky_epg') AND end_date >= ?)
+                OR (source_origin NOT IN ('epg', 'sky_epg') AND end_date >= ?)
+            )
+            ORDER BY date ASC;
+            """,
+            (sky_cutoff, diretta_cutoff),
         ) as cursor:
             rows = await cursor.fetchall()
         return [_row_to_match(row) for row in rows]
 
-    async def purge_expired(self, retention_hours: int) -> list[str]:
-        """Delete expired matches and stale `not_found` TheSportsDB records."""
-        now_ms = _now_ms()
-        match_cutoff_ms = now_ms - (retention_hours * 3600 * 1000)
-        tsdb_cutoff_ms = now_ms - (86400 * 1000)
+    async def purge_expired(self, *, now_ms: Optional[int] = None) -> list[str]:
+        """Delete expired matches (origin-aware 15m Sky / 30m Diretta grace) and stale TSDB rows."""
+        ref_ms = int(now_ms if now_ms is not None else _now_ms())
+        sky_cutoff = ref_ms - SKY_EPG_POST_END_MS
+        diretta_cutoff = ref_ms - DIRETTA_POST_MATCH_MS
+        tsdb_cutoff_ms = ref_ms - (86400 * 1000)
 
         async def _op(db: aiosqlite.Connection) -> list[str]:
+            where_clause = (
+                "(source_origin IN ('epg', 'sky_epg') AND end_date < ?) "
+                "OR (source_origin NOT IN ('epg', 'sky_epg') AND end_date < ?)"
+            )
+            params = (sky_cutoff, diretta_cutoff)
             async with db.execute(
-                "SELECT id FROM matches WHERE end_date < ?;",
-                (match_cutoff_ms,),
+                f"SELECT id FROM matches WHERE {where_clause};",
+                params,
             ) as cursor:
                 purged_ids = [row["id"] for row in await cursor.fetchall()]
             if purged_ids:
                 await db.execute(
-                    "DELETE FROM matches WHERE end_date < ?;",
-                    (match_cutoff_ms,),
+                    f"DELETE FROM matches WHERE {where_clause};",
+                    params,
                 )
             await db.execute(
                 "DELETE FROM thesportsdb_cache WHERE status = 'not_found' AND checked_at < ?;",

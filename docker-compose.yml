@@ -23,7 +23,6 @@ services:
       # Individual Data Source & Provider Toggles
       ENABLE_DIRETTA: ${ENABLE_DIRETTA:-true}
       ENABLE_SKY_EPG: ${ENABLE_SKY_EPG:-true}
-      ENABLE_TIVUSAT_EPG: ${ENABLE_TIVUSAT_EPG:-true}
       ENABLE_THESPORTSDB: ${ENABLE_THESPORTSDB:-true}
       ENABLE_TENNIS_POSTERS: ${ENABLE_TENNIS_POSTERS:-true}
       ENABLE_TVVOO: ${ENABLE_TVVOO:-true}

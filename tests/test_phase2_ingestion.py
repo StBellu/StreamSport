@@ -14,7 +14,6 @@ from app.ingestion import (
     ItalianEPGService,
     SKY_CHANNELS,
     SPORT_IDS,
-    TIVUSAT_CHANNELS,
     clamp_sky_from,
     deabbreviate_tennis_name,
     deduplicate_simulcasts,
@@ -209,23 +208,29 @@ def test_clamp_sky_from_prevents_gt_3h_lookback() -> None:
     now = datetime(2026, 11, 22, 18, 0, 0, tzinfo=timezone.utc)
     too_old = now - timedelta(hours=5)
     clamped = clamp_sky_from(too_old, now)
-    assert clamped == now - timedelta(minutes=165)
-    assert (now - clamped) <= timedelta(minutes=165)
+    assert clamped == now - timedelta(hours=3)
+    assert (now - clamped) <= timedelta(hours=3)
 
     recent = now - timedelta(minutes=45)
     assert clamp_sky_from(recent, now) == recent
 
+    # Post-midnight HTTP 422 guard: never request earlier than 22:05 UTC of previous UTC day
+    after_midnight = datetime(2026, 11, 24, 0, 30, 0, tzinfo=timezone.utc)
+    clamped_midnight = clamp_sky_from(after_midnight - timedelta(hours=3), after_midnight)
+    assert clamped_midnight == datetime(2026, 11, 23, 22, 5, 0, tzinfo=timezone.utc)
+
 
 def test_non_live_or_studio_and_out_of_calendar_tennis_filters() -> None:
-    assert is_non_live_or_studio("Sky Sport 24 - Rassegna Stampa")
-    assert is_non_live_or_studio("Paddock Live Show")
-    assert is_non_live_or_studio("Calciomercato L'Originale")
+    assert is_non_live_or_studio("Notiziario Sportivo - Rassegna Stampa")
+    assert is_non_live_or_studio("Pre-Partita F1")
+    assert is_non_live_or_studio("Post-Partita Serie A")
     assert is_non_live_or_studio("Studio Tennis ATP Finals")
-    assert is_non_live_or_studio("Sky Calcio Club")
+    assert is_non_live_or_studio("Rubrica Calcio Sera")
     assert is_non_live_or_studio("F1 GP Italia - Highlights")
     assert is_non_live_or_studio("MotoGP - On Board")
     assert is_non_live_or_studio("Ep. 14", "La trasmissione dedicata ai gol della Serie A")
     assert is_non_live_or_studio("Nessun evento in onda")
+    assert is_non_live_or_studio("Serie A: Inter - Juventus (Differita)")
     assert not is_non_live_or_studio("Diretta Gol Serie A")
     assert is_non_live_or_studio("Partita", "Sintesi e azioni salienti in replica")
     assert not is_non_live_or_studio("Serie A: Inter - Juventus", "Telecronaca diretta")
@@ -326,7 +331,7 @@ async def test_italian_epg_service_toggles_and_sky_clamp_query() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         seen_urls.append(url)
-        if "apid.sky.it" in url:
+        if "apid.sky.it" in url and "from=2026-11-22T15:00:00Z" in url:
             return httpx.Response(
                 200,
                 json={
@@ -371,76 +376,29 @@ async def test_italian_epg_service_toggles_and_sky_clamp_query() -> None:
                     "total": 3,
                 },
             )
-        return httpx.Response(200, json={"events": []})
+        return httpx.Response(200, json={"events": [], "total": 0})
 
-    settings = Settings(ENABLE_SKY_EPG=True, ENABLE_TIVUSAT_EPG=False)
+    settings = Settings(ENABLE_SKY_EPG=True)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         svc = ItalianEPGService(settings=settings, client=client)
         progs = await svc.fetch_epg(
             requested_from=now - timedelta(hours=6),
             now_utc=now,
         )
+        # Second cycle 30m later refreshes only Day 0; Days +1/+2 hit 12h cache
+        await svc.fetch_epg(now_utc=now + timedelta(minutes=30))
+        disabled = ItalianEPGService(settings=Settings(ENABLE_SKY_EPG=False), client=client)
+        assert await disabled.fetch_epg(now_utc=now) == []
 
-    assert len(seen_urls) == 1
-    assert "from=2026-11-22T15:15:00Z" in seen_urls[0]  # 18:00 - 165m = 15:15
-    assert "tivulaguida" not in seen_urls[0]
+    assert len(seen_urls) == 4  # 3 daily buckets (0, +1, +2) initially + 1 Day 0 refresh
+    assert "from=2026-11-22T15:00:00Z" in seen_urls[0]  # 18:00 - 3h = 15:00
+    channels_queried = seen_urls[0].split("channels=")[1].split("&")[0].split(",")
+    assert "807" in channels_queried  # Rai Sport included on Sky
+    for excluded_sky in ("9094", "9513", "9893", "8293", "7587", "12120"):
+        assert excluded_sky not in channels_queried
     assert len(progs) == 1
     assert progs[0].title == "Serie A: Roma - Napoli"
     assert len(SKY_CHANNELS) >= 32
-    assert "88" in TIVUSAT_CHANNELS and "295" in TIVUSAT_CHANNELS
-
-
-@pytest.mark.asyncio
-async def test_tivusat_only_epg_and_date_parsing() -> None:
-    seen_urls: list[str] = []
-    now = datetime(2026, 11, 22, 18, 0, 0, tzinfo=timezone.utc)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        seen_urls.append(url)
-        if "/channels/88/date/2026-11-22" in url:
-            return httpx.Response(
-                200,
-                json={
-                    "events": [
-                        {
-                            "id": 9001,
-                            "date_start": "22-11-2026 20:30",
-                            "date_end": "22-11-2026 22:30",
-                            "program": {
-                                "title": "Coppa Italia Volley: Perugia - Trentino",
-                                "description": "Diretta semifinale",
-                                "genres": [{"id": 36, "name": "Sport"}],
-                            },
-                        },
-                        {
-                            "id": 9002,
-                            "date_start": "22-11-2026 06:00",
-                            "date_end": "22-11-2026 07:00",
-                            "program": {
-                                "title": "Sabato al 90°",
-                                "description": "La storica rubrica Rai",
-                                "genres": [{"id": 36, "name": "Sport"}],
-                            },
-                        },
-                    ]
-                },
-            )
-        return httpx.Response(200, json={"events": []})
-
-    settings = Settings(ENABLE_SKY_EPG=False, ENABLE_TIVUSAT_EPG=True)
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        svc = ItalianEPGService(settings=settings, client=client)
-        progs = await svc.fetch_epg(days_ahead=0, now_utc=now)
-
-    assert all("apid.sky.it" not in u for u in seen_urls)
-    assert any("services.tivulaguida.it" in u for u in seen_urls)
-    assert len(progs) == 1
-    assert progs[0].source == "tivusat"
-    assert progs[0].channel_name == "Rai Sport HD"
-    # 20:30 CET (UTC+1 on Nov 22) == 19:30 UTC
-    expected_start_ms = int(datetime(2026, 11, 22, 19, 30, tzinfo=timezone.utc).timestamp() * 1000)
-    assert progs[0].start_ms == expected_start_ms
 
 
 @pytest.mark.asyncio
@@ -584,4 +542,282 @@ def test_epg_semantic_slug_bridge_and_strict_orphan_allowlist() -> None:
     )
     resolved = filter_conflicting_italian_channels([conflict_match], [epg_uno])
     assert resolved[0].sources == []
+
+
+@pytest.mark.asyncio
+async def test_diretta_ignores_foreign_en_broadcasters() -> None:
+    now_utc = datetime(2026, 11, 22, 12, 0, tzinfo=timezone.utc)
+    ts_sec = int(now_utc.timestamp()) + 3600
+    en_al = json.dumps({"1": [{"BN": "Sky Sports Main Event"}, {"BN": "TNT Sports 1"}]})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "f_1_0_3_it_1" in url:
+            return httpx.Response(
+                200,
+                text=(
+                    "SA÷1¬~"
+                    "ZA÷ITALIA: Serie A¬ZY÷Italia¬ZAE÷Giornata 13~"
+                    f"AA÷it1¬AD÷{ts_sec}¬AE÷Internazionale¬WU÷inter¬AF÷Milan¬WV÷milan~"
+                    "ZA÷ITALIA: Serie D - Girone A¬ZY÷Italia¬ZAE÷Giornata 13~"
+                    f"AA÷minor1¬AD÷{ts_sec}¬AE÷Squadra Alfa¬WU÷alfa¬AF÷Squadra Beta¬WV÷beta~"
+                ),
+            )
+        if "f_1_0_3_en-uk_1" in url:
+            return httpx.Response(
+                200,
+                text=(
+                    "SA÷1¬~"
+                    "ZA÷ITALY: Serie A¬ZY÷Italy¬ZAE÷Round 13~"
+                    f"AA÷it1¬AD÷{ts_sec}¬AE÷Inter Milan¬WU÷inter¬AF÷AC Milan¬WV÷milan¬AL÷{en_al}~"
+                    "ZA÷ITALY: Serie D - Group A¬ZY÷Italy¬ZAE÷Round 13~"
+                    f"AA÷minor1¬AD÷{ts_sec}¬AE÷Squadra Alfa¬WU÷alfa¬AF÷Squadra Beta¬WV÷beta¬AL÷{en_al}~"
+                    "ZA÷ENGLAND: Premier League¬ZY÷England¬ZAE÷Round 12~"
+                    f"AA÷enonly1¬AD÷{ts_sec}¬AE÷Liverpool¬WU÷liverpool¬AF÷Everton¬WV÷everton¬AL÷{en_al}~"
+                ),
+            )
+        return httpx.Response(200, text="")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = DirettaService(settings=Settings(ENABLE_DIRETTA=True), client=client)
+        matches, _ = await svc.fetch_schedule(days=(0,), sport_ids=(1,), now_utc=now_utc)
+
+    by_id = {m.id: m for m in matches}
+    assert "diretta-it1" in by_id
+    assert by_id["diretta-it1"].broadcasters == []
+    assert by_id["diretta-it1"].alt_home == "Inter Milan"
+    assert by_id["diretta-it1"].alt_away == "AC Milan"
+    assert by_id["diretta-it1"].alt_league == "Serie A"
+
+    # Serie D must NOT sneak in via foreign EN TV broadcasters
+    assert "diretta-minor1" not in by_id
+
+    # EN-only Tier 1 league is still admitted cleanly without foreign broadcasters
+    assert "diretta-enonly1" in by_id
+    assert by_id["diretta-enonly1"].broadcasters == []
+    assert by_id["diretta-enonly1"].alt_home == "Liverpool"
+
+
+@pytest.mark.asyncio
+async def test_diretta_yesterday_window_only_00_to_04_59_live_only() -> None:
+    requested_urls: list[str] = []
+    # 02:30 CET (UTC+1) -> 01:30 UTC (inside 00:00-04:59 Rome window)
+    night_utc = datetime(2026, 11, 24, 1, 30, tzinfo=timezone.utc)
+    # 18:00 CET -> 17:00 UTC (outside 00:00-04:59 window)
+    evening_utc = datetime(2026, 11, 24, 17, 0, tzinfo=timezone.utc)
+    start_sec = int(night_utc.timestamp()) - 7200
+
+    yest_it = (
+        "SA÷1¬~"
+        "ZA÷ITALIA: Serie A¬ZY÷Italia¬ZAE÷Giornata 14~"
+        f"AA÷y_live¬AD÷{start_sec}¬AB÷2¬AC÷1¬AE÷Inter¬AF÷Napoli~"
+        f"AA÷y_fin¬AD÷{start_sec}¬AB÷3¬AC÷3¬AO÷{start_sec + 6000}¬AE÷Milan¬AF÷Roma~"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requested_urls.append(url)
+        if "f_1_-1_3_it_1" in url:
+            return httpx.Response(200, text=yest_it)
+        return httpx.Response(200, text="")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = DirettaService(settings=Settings(ENABLE_DIRETTA=True), client=client)
+        night_matches, _ = await svc.fetch_schedule(sport_ids=(1,), now_utc=night_utc)
+        night_ids = {m.id for m in night_matches}
+        assert night_ids == {"diretta-y_live"}
+        assert any("f_1_-1_3_it_1" in u for u in requested_urls)
+
+        requested_urls.clear()
+        await svc.fetch_schedule(sport_ids=(1,), now_utc=evening_utc)
+        assert not any("_-1_" in u for u in requested_urls)
+
+
+@pytest.mark.asyncio
+async def test_diretta_future_12h_cache_and_00_20_rotation() -> None:
+    requested_days: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        for day in (0, 1, 2):
+            if f"f_1_{day}_3_it_1" in url or f"f_1_{day}_3_en-uk_1" in url:
+                requested_days.append(day)
+        return httpx.Response(200, text="")
+
+    # Nov 24 14:00 CET = 13:00 UTC -> logical day 2026-11-24
+    t0 = datetime(2026, 11, 24, 13, 0, tzinfo=timezone.utc)
+    # Nov 24 19:00 CET (+5h, within 12h TTL) -> +1/+2 stay cached
+    t1 = datetime(2026, 11, 24, 18, 0, tzinfo=timezone.utc)
+    # Nov 25 00:05 CET = Nov 24 23:05 UTC (+10h05m < 12h TTL and < 00:20 Rome -> still cached)
+    t_pre_rot = datetime(2026, 11, 24, 23, 5, tzinfo=timezone.utc)
+    # Nov 25 00:21 CET = Nov 24 23:21 UTC (>= 00:20 Rome -> flips to 2026-11-25, refetches +1/+2)
+    t_post_rot = datetime(2026, 11, 24, 23, 21, tzinfo=timezone.utc)
+    # Nov 25 13:00 CET (+12h39m after t_post_rot) -> 12h TTL expired -> refetches +1/+2
+    t_ttl_exp = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = DirettaService(settings=Settings(ENABLE_DIRETTA=True), client=client)
+
+        await svc.fetch_schedule(days=(0, 1, 2), sport_ids=(1,), now_utc=t0)
+        assert requested_days.count(0) == 2 and requested_days.count(1) == 2 and requested_days.count(2) == 2
+
+        requested_days.clear()
+        await svc.fetch_schedule(days=(0, 1, 2), sport_ids=(1,), now_utc=t1)
+        assert requested_days == [0, 0]
+
+        requested_days.clear()
+        await svc.fetch_schedule(days=(0, 1, 2), sport_ids=(1,), now_utc=t_pre_rot)
+        assert requested_days == [0, 0]
+
+        requested_days.clear()
+        await svc.fetch_schedule(days=(0, 1, 2), sport_ids=(1,), now_utc=t_post_rot)
+        assert requested_days.count(0) == 2 and requested_days.count(1) == 2 and requested_days.count(2) == 2
+
+        requested_days.clear()
+        await svc.fetch_schedule(days=(0, 1, 2), sport_ids=(1,), now_utc=t_ttl_exp)
+        assert requested_days.count(0) == 2 and requested_days.count(1) == 2 and requested_days.count(2) == 2
+
+
+@pytest.mark.asyncio
+async def test_diretta_real_status_ab_ac_ao_and_sky_extension() -> None:
+    now_utc = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+    now_sec = int(now_utc.timestamp())
+    now_ms = now_sec * 1000
+
+    # live_long: started 3h ago (135m est already passed), still AB=2 -> extend end_date to now + 60m
+    # fin_recent: AB=3, AC=3, finished 20m ago -> kept with end_date=AO, eligible for Sky extension
+    # fin_old: AB=3, AC=3, finished 35m ago -> discarded & marked in last_discarded_match_ids
+    # postponed: AB=3, AC=4 -> immediate discard & marked in last_discarded_match_ids
+    # cancelled: AB=3, AC=5 -> immediate discard & marked in last_discarded_match_ids
+    feed_it = (
+        "SA÷1¬~"
+        "ZA÷ITALIA: Serie A¬ZY÷Italia¬ZAE÷Giornata 14~"
+        f"AA÷live_long¬AD÷{now_sec - 3 * 3600}¬AB÷2¬AC÷1¬AE÷Inter¬AF÷Milan~"
+        f"AA÷fin_recent¬AD÷{now_sec - 7200}¬AB÷3¬AC÷3¬AO÷{now_sec - 20 * 60}¬AE÷Juventus¬AF÷Lazio~"
+        f"AA÷fin_old¬AD÷{now_sec - 9000}¬AB÷3¬AC÷3¬AO÷{now_sec - 35 * 60}¬AE÷Napoli¬AF÷Torino~"
+        f"AA÷postponed¬AD÷{now_sec + 3600}¬AB÷3¬AC÷4¬AE÷Roma¬AF÷Bologna~"
+        f"AA÷cancelled¬AD÷{now_sec + 3600}¬AB÷3¬AC÷5¬AE÷Atalanta¬AF÷Como~"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "f_1_0_3_it_1" in str(request.url):
+            return httpx.Response(200, text=feed_it)
+        return httpx.Response(200, text="")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = DirettaService(settings=Settings(ENABLE_DIRETTA=True), client=client)
+        matches, _ = await svc.fetch_schedule(days=(0,), sport_ids=(1,), now_utc=now_utc)
+
+    by_id = {m.id: m for m in matches}
+    assert set(by_id.keys()) == {"diretta-live_long", "diretta-fin_recent"}
+    assert by_id["diretta-live_long"].end_date >= now_ms + 60 * 60_000
+    assert by_id["diretta-fin_recent"].end_date == (now_sec - 20 * 60) * 1000
+    assert {"diretta-fin_old", "diretta-postponed", "diretta-cancelled"} <= svc.last_discarded_match_ids
+
+    # Pairing with Sky broadcast running until AO + 40m pushes expiry to sky_end_ms + 15m
+    sky_end_ms = now_ms + 20 * 60_000
+    sky_prog = EPGProgram(
+        id="sky_juve",
+        channel_id="9113",
+        channel_name="Sky Sport Calcio",
+        title="Serie A: Juventus - Lazio",
+        start_ms=by_id["diretta-fin_recent"].date,
+        end_ms=sky_end_ms,
+        sport_hint="Calcio",
+        is_live=True,
+        source="sky",
+    )
+    enriched, _ = reconcile_with_schedule([by_id["diretta-fin_recent"]], [sky_prog])
+    assert enriched[0].end_date == sky_end_ms - 15 * 60_000
+
+
+@pytest.mark.asyncio
+async def test_sky_epg_per_day_cache_rotation_422_retry_and_15m_expiry() -> None:
+    calls: list[tuple[str, str]] = []
+    state = {"raise_422_once": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        from_val = request.url.params.get("from", "")
+        to_val = request.url.params.get("to", "")
+        calls.append((from_val, to_val))
+
+        if state["raise_422_once"]:
+            state["raise_422_once"] = False
+            return httpx.Response(
+                422,
+                json={"description": "Dates validation has failed"},
+                request=request,
+            )
+
+        # Day 0: one program expired >15m ago (ignored), one program ending 10m ago (kept)
+        if from_val.startswith("2026-11-24"):
+            return httpx.Response(
+                200,
+                json={
+                    "events": [
+                        {
+                            "eventId": "d0_exp",
+                            "starttime": "2026-11-24T12:00:00Z",
+                            "endtime": "2026-11-24T14:40:00Z",  # 20m before 15:00Z -> discarded
+                            "eventTitle": "Serie A: Fiorentina - Genoa",
+                            "channel": {"id": 9113, "name": "Sky Sport Calcio"},
+                            "content": {"genre": {"name": "Sport"}, "subgenre": {"name": "Calcio"}},
+                        },
+                        {
+                            "eventId": "d0_keep",
+                            "starttime": "2026-11-24T13:00:00Z",
+                            "endtime": "2026-11-24T14:50:00Z",  # 10m before 15:00Z -> kept (+15m)
+                            "eventTitle": "Serie A: Udinese - Parma",
+                            "channel": {"id": 9113, "name": "Sky Sport Calcio"},
+                            "content": {"genre": {"name": "Sport"}, "subgenre": {"name": "Calcio"}},
+                        },
+                    ],
+                    "total": 2,
+                },
+            )
+        if from_val.startswith("2026-11-25"):
+            return httpx.Response(
+                200,
+                json={
+                    "events": [
+                        {
+                            "eventId": "d2_future",
+                            "starttime": "2026-11-26T20:00:00Z",
+                            "endtime": "2026-11-26T22:00:00Z",
+                            "eventTitle": "Champions League: Milan - Liverpool",
+                            "channel": {"id": 9097, "name": "Sky Sport Uno"},
+                            "content": {"genre": {"name": "Sport"}, "subgenre": {"name": "Calcio"}},
+                        }
+                    ],
+                    "total": 1,
+                },
+            )
+        return httpx.Response(200, json={"events": [], "total": 0})
+
+    t0 = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+    # 2026-11-25 00:05 CET = 2026-11-24 23:05 UTC (< 00:20 -> +1/+2 cached!)
+    t_pre_rot = datetime(2026, 11, 24, 23, 5, tzinfo=timezone.utc)
+    # 2026-11-25 00:25 CET = 2026-11-24 23:25 UTC (>= 00:20 -> +1/+2 rotated & refreshed)
+    t_post_rot = datetime(2026, 11, 24, 23, 25, tzinfo=timezone.utc)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = ItalianEPGService(settings=Settings(ENABLE_SKY_EPG=True), client=client)
+        progs = await svc.fetch_epg(now_utc=t0)
+        ids = {p.id for p in progs}
+        assert "sky_d0_exp" not in ids
+        assert "sky_d0_keep" in ids
+        assert "sky_d2_future" in ids
+        # 4 calls: initial 422 on Day 0 + retry from now_utc + Day +1 + Day +2
+        assert len(calls) == 4
+        assert calls[1][0] == "2026-11-24T15:00:00Z"
+
+        calls.clear()
+        await svc.fetch_epg(now_utc=t_pre_rot)
+        assert len(calls) == 1  # Only Day 0 requested before 00:20 rotation
+
+        calls.clear()
+        await svc.fetch_epg(now_utc=t_post_rot)
+        assert len(calls) == 3  # All 3 buckets (0, +1, +2) refreshed after 00:20 rotation
+
 

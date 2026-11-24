@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import time
 import unicodedata
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -16,7 +15,14 @@ from rapidfuzz import fuzz
 
 from app.config import Settings, get_settings
 from app.core.network import create_standard_client
-from app.models.domain import EPGProgram, Match, SportSilo, TeamInfo
+from app.models.domain import (
+    DIRETTA_POST_MATCH_MS,
+    SKY_EPG_POST_END_MS,
+    EPGProgram,
+    Match,
+    SportSilo,
+    TeamInfo,
+)
 from app.taxonomy import (
     DEFAULT_GENRE_CLASSIFIER,
     DEFAULT_TEAM_MATCHER,
@@ -24,10 +30,7 @@ from app.taxonomy import (
     detect_demographics_from_stream_title,
 )
 from app.taxonomy.channels import (
-    SKY_CHANNEL_IDS,
-    TIVUSAT_CHANNEL_IDS,
     canonical_from_sky_id,
-    canonical_from_tivusat_id,
     canonicalize_channel_name,
 )
 
@@ -78,7 +81,7 @@ def _load_rome_tz() -> tzinfo:
 
 
 _ROME_TZ: tzinfo = _load_rome_tz()
-_SKY_MAX_LOOKBACK = timedelta(minutes=165)
+_SKY_MAX_LOOKBACK = timedelta(hours=3)
 _SIMULCAST_WINDOW_MS = 30 * 60 * 1000
 _RECONCILE_WINDOW_MS = 60 * 60 * 1000
 _LINEAR_PRE_MATCH_MS = 35 * 60 * 1000
@@ -87,7 +90,10 @@ _MOTORI_PRE_MATCH_MS = 120 * 60 * 1000
 _MOTORI_POST_MATCH_MS = 20 * 60 * 1000
 _TENNIS_1V1_PRE_MATCH_MS = 360 * 60 * 1000
 _TENNIS_1V1_POST_MATCH_MS = 60 * 60 * 1000
-_SKY_DAY_CACHE_TTL_SECONDS = 3 * 3600
+_SKY_OUTAGE_CACHE_TTL_SECONDS = 3 * 3600
+_SKY_FUTURE_BUCKET_TTL_SECONDS = 12 * 3600
+_SKY_POST_MIDNIGHT_ROTATION_MINUTE = 20
+SKY_FEED_DAYS: tuple[int, ...] = (0, 1, 2)
 _ROLLING_CACHE_WINDOW_MS = int(3.5 * 3600 * 1000)
 
 _GENERALIST_CANONICAL_CHANNELS: frozenset[str] = frozenset(
@@ -108,7 +114,6 @@ _GENERALIST_CANONICAL_CHANNELS: frozenset[str] = frozenset(
 )
 
 SKY_EVENTS_URL = "https://apid.sky.it/gtv/v1/events"
-TIVUSAT_EPG_URL = "https://services.tivulaguida.it/api/epg/channels/{ch_id}/date/{date_str}"
 
 # Verified against https://apid.sky.it/gtv/v1/channels?env=DTH
 # Note: Sky Italia replaced Eurosport 1 & 2 (LCN 210/211) with Sky Sport Legend & Sky Sport Mix.
@@ -126,6 +131,7 @@ SKY_SPORTS_CHANNELS: dict[str, str] = {
     "11909": "Sky Sport Mix",
     "6000": "SuperTennis",
     "10013": "Sky Sport 4K",
+    "807": "Rai Sport",
     "11402": "DAZN 1",
     "11401": "DAZN 2",
     "11849": "DAZN 3",
@@ -158,35 +164,12 @@ SKY_CHANNELS: dict[str, str] = {**SKY_SPORTS_CHANNELS, **SKY_GENERALIST_CHANNELS
 SKY_SPORTS_CHANNEL_IDS: frozenset[str] = frozenset(SKY_SPORTS_CHANNELS.keys())
 SKY_GENERALIST_CHANNEL_IDS: frozenset[str] = frozenset(SKY_GENERALIST_CHANNELS.keys())
 
-# Verified against https://services.tivulaguida.it/api/epg/channels
-TIVUSAT_SPORTS_CHANNELS: dict[str, str] = {
-    "88": "Rai Sport HD",
-    "295": "SOLOCALCIO",
-    "277": "EQUtv",
-}
-
-TIVUSAT_GENERALIST_CHANNELS: dict[str, str] = {
-    "42": "Rai 1",
-    "43": "Rai 2",
-    "44": "Rai 3",
-    "279": "TV8",
-    "140": "NOVE",
-    "280": "Cielo",
-    "249": "20 Mediaset",
-}
-
-TIVUSAT_CHANNELS: dict[str, str] = {**TIVUSAT_SPORTS_CHANNELS, **TIVUSAT_GENERALIST_CHANNELS}
-TIVUSAT_SPORTS_CHANNEL_IDS: frozenset[str] = frozenset(TIVUSAT_SPORTS_CHANNELS.keys())
-
-_NON_LIVE_TITLE_RE = re.compile(
-    r"(?:"
-    r"\btg\s*(?:sport|24|1|2|3|4|5|com|la7)?\b"
-    r"|\bsport\s*24\b"
-    r"|\bpaddock\s+live\b"
+_HARD_NON_LIVE_PATTERN = (
+    r"\btg\b"
+    r"|\bnotiziario\b"
     r"|\bcalciomercato\b"
     r"|\brassegna\s+stampa\b"
     r"|\bstudio\b"
-    r"|\bspeciale\b"
     r"|\bhighlights\b"
     r"|\bsintesi\b"
     r"|\breplica\b"
@@ -194,37 +177,22 @@ _NON_LIVE_TITLE_RE = re.compile(
     r"|\brubrica\b"
     r"|\bpre\s*-?\s*partita\b"
     r"|\bpost\s*-?\s*partita\b"
-    r"|\bsky\s+calcio\s+club\b"
-    r"|\b(?:la\s+)?domenica\s+sportiva\b"
-    r"|\b90[°o]\s*minuto\b"
-    r"|\bsabato\s+al\s+90[°o]\b"
-    r"|\bpressing\b"
-    r"|\btiki\s+taka\b"
-    r"|\brace\s+anatomy\b"
-    r"|\bafter\s+race\b"
-    r"|\bl['’]originale\b"
-    r"|\bsupertele\b"
     r"|\banteprima\b"
     r"|\bmagazine\b"
     r"|\bdocumentario\b"
     r"|\brewind\b"
     r"|\brivedi\b"
     r"|\bbest\s+of\b"
-    r"|\bfederico\s+buffa\b"
-    r"|\bicarus\b"
-    r"|\bbasket\s+room\b"
-    r"|\bsky\s+sport\s+tech\b"
     r"|\bnessun\s+evento\b"
-    r"|^\s*ep\.?\s*\d+\b"
     r"|\bdifferita\b"
     r"|\barchivio\b"
-    r"|\bstory\b"
-    r"|\blegends\b"
-    r"|\bdoc\b"
     r"|\bintervista\b"
     r"|\bpodcast\b"
     r"|[\(\[]\s*r\s*[\)\]]"
-    r")",
+)
+_HARD_NON_LIVE_TITLE_RE = re.compile(rf"(?:{_HARD_NON_LIVE_PATTERN})", re.IGNORECASE)
+_NON_LIVE_TITLE_RE = re.compile(
+    rf"(?:{_HARD_NON_LIVE_PATTERN}|\bspeciale\b|^\s*ep\.?\s*\d+\b|\bstory\b|\blegends\b|\bdoc\b)",
     re.IGNORECASE,
 )
 
@@ -538,11 +506,9 @@ _SKY_SLUG_COMP_MAP: dict[str, str] = {
 }
 
 _MAGAZINE_SLUG_RE = re.compile(
-    r"(?:\b1-vs-1\b|-remix\b|\bremix\b|-magazine\b|\bmagazine\b|-speciale?\b|\bspeciale\b|"
-    r"-preview\b|\bpreview\b|\banteprima\b|-talk\b|\btalk\b|-stor(?:y|ies)\b|boat-show|"
-    r"this-is-padel|atp-tour-this-week|paddock-live|conf(?:erenza)?-stampa|talent-time|"
-    r"\b90-10\b|la-giovane-italia|\brubrica\b|matchplan|mondo-gol|calcio-show|calciomercato|"
-    r"/replica\b|/differita\b)",
+    r"(?:-remix\b|\bremix\b|-magazine\b|\bmagazine\b|-speciale?\b|\bspeciale\b|"
+    r"-preview\b|\bpreview\b|\banteprima\b|-talk\b|\btalk\b|-stor(?:y|ies)\b|"
+    r"conf(?:erenza)?-stampa|\brubrica\b|calciomercato|/replica\b|/differita\b)",
     re.IGNORECASE,
 )
 
@@ -559,7 +525,7 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 
 def _is_generalist_channel(channel_name: str, channel_id: str = "") -> bool:
-    if channel_id and (channel_id in SKY_GENERALIST_CHANNEL_IDS or channel_id in TIVUSAT_GENERALIST_CHANNELS):
+    if channel_id and channel_id in SKY_GENERALIST_CHANNEL_IDS:
         return True
     canon = canonicalize_channel_name(channel_name, country="Italy")
     return canon in _GENERALIST_CANONICAL_CHANNELS
@@ -857,11 +823,44 @@ def _is_supertennis_program(epg: EPGProgram) -> bool:
 
 
 def clamp_sky_from(requested_from: datetime, now_utc: datetime) -> datetime:
-    """Clamp Sky API `from` parameter to at most 165 minutes in the past (prevents HTTP 422)."""
+    """Clamp Sky API `from` parameter to at most 3h lookback and >= `22:05 UTC` previous day."""
     req = _ensure_utc(requested_from)
     now = _ensure_utc(now_utc)
-    min_allowed = now - _SKY_MAX_LOOKBACK
+    lookback_floor = now - _SKY_MAX_LOOKBACK
+    prev_utc_day = now.date() - timedelta(days=1)
+    midnight_safe_floor = datetime(
+        prev_utc_day.year,
+        prev_utc_day.month,
+        prev_utc_day.day,
+        22,
+        5,
+        0,
+        tzinfo=timezone.utc,
+    )
+    min_allowed = max(lookback_floor, midnight_safe_floor)
     return req if req >= min_allowed else min_allowed
+
+
+def _sky_logical_rome_day(local_now: datetime) -> str:
+    """Return logical Rome YYYY-MM-DD anchored to post-midnight `00:20` rotation."""
+    if local_now.hour == 0 and local_now.minute < _SKY_POST_MIDNIGHT_ROTATION_MINUTE:
+        return (local_now - timedelta(days=1)).date().isoformat()
+    return local_now.date().isoformat()
+
+
+def _rome_day_bounds_utc(local_day: date) -> tuple[datetime, datetime]:
+    """Return UTC `(start, end)` bounds covering `[00:00:00, 23:59:59]` Rome time."""
+    next_day = local_day + timedelta(days=1)
+    start_utc = datetime(
+        local_day.year, local_day.month, local_day.day, 0, 0, 0, tzinfo=_ROME_TZ
+    ).astimezone(timezone.utc)
+    end_utc = (
+        datetime(
+            next_day.year, next_day.month, next_day.day, 0, 0, 0, tzinfo=_ROME_TZ
+        )
+        - timedelta(seconds=1)
+    ).astimezone(timezone.utc)
+    return start_utc, end_utc
 
 
 def _has_historical_year(text: str, ref_year: int) -> bool:
@@ -1069,7 +1068,7 @@ def _infer_silo_from_epg(epg: EPGProgram) -> SportSilo:
         return SportSilo.RUGBY
     if any(k in combined for k in ("pallamano", "handball")):
         return SportSilo.HANDBALL
-    if any(k in combined for k in ("golf", "ciclismo", "cycling", "sci", "biathlon", "atletica", "equtv", "ippica", "padel", "snooker", "olimpiadi")):
+    if any(k in combined for k in ("golf", "ciclismo", "cycling", "sci", "biathlon", "atletica", "ippica", "padel", "snooker", "olimpiadi")):
         return SportSilo.ALTRI_SPORT
     if any(k in combined for k in ("serie a", "serie b", "serie c", "coppa italia", "zona dazn", "solocalcio")):
         return SportSilo.CALCIO_ITA
@@ -1343,48 +1342,6 @@ def _merge_broadcasters(existing: list[str], additions: list[str]) -> list[str]:
     return merged
 
 
-_REPLAY_OR_STUDIO_HARD_RE = re.compile(
-    r"(?:"
-    r"\btg\s*(?:sport|24|1|2|3|4|5|com|la7)?\b"
-    r"|\bsport\s*24\b"
-    r"|\bpaddock\s+live\b"
-    r"|\bcalciomercato\b"
-    r"|\brassegna\s+stampa\b"
-    r"|\bstudio\b"
-    r"|\bhighlights\b"
-    r"|\bsintesi\b"
-    r"|\breplica\b"
-    r"|\bon\s*board\b"
-    r"|\brubrica\b"
-    r"|\bpre\s*-?\s*partita\b"
-    r"|\bpost\s*-?\s*partita\b"
-    r"|\bsky\s+calcio\s+club\b"
-    r"|\b(?:la\s+)?domenica\s+sportiva\b"
-    r"|\b90[°o]\s*minuto\b"
-    r"|\bsabato\s+al\s+90[°o]\b"
-    r"|\bpressing\b"
-    r"|\btiki\s+taka\b"
-    r"|\brace\s+anatomy\b"
-    r"|\bafter\s+race\b"
-    r"|\bl['’]originale\b"
-    r"|\bsupertele\b"
-    r"|\banteprima\b"
-    r"|\bmagazine\b"
-    r"|\bdocumentario\b"
-    r"|\brewind\b"
-    r"|\brivedi\b"
-    r"|\bbest\s+of\b"
-    r"|\bnessun\s+evento\b"
-    r"|\bdifferita\b"
-    r"|\barchivio\b"
-    r"|\bintervista\b"
-    r"|\bpodcast\b"
-    r"|[\(\[]\s*r\s*[\)\]]"
-    r")",
-    re.IGNORECASE,
-)
-
-
 def _is_allowlisted_orphan(epg: EPGProgram) -> bool:
     """Strict Orphan Allowlist: admit only certified live simulcasts or legitimate non-1v1 live events."""
     if not epg.is_live:
@@ -1415,7 +1372,7 @@ def _is_allowlisted_orphan(epg: EPGProgram) -> bool:
         return True
 
     title_norm = _strip_accents(epg.title or "")
-    if _REPLAY_OR_STUDIO_HARD_RE.search(title_norm):
+    if _HARD_NON_LIVE_TITLE_RE.search(title_norm):
         return False
     if is_non_live_or_studio(epg.title, epg.description):
         has_explicit_live = bool(re.search(r"\b(?:live|diretta)\b", title_norm, re.I))
@@ -1457,6 +1414,9 @@ def reconcile_with_schedule(
     broadcaster_updates: dict[int, list[str]] = {
         idx: list(m.broadcasters) for idx, m in enumerate(diretta_matches)
     }
+    end_date_updates: dict[int, int] = {
+        idx: m.end_date for idx, m in enumerate(diretta_matches)
+    }
     orphan_matches: list[Match] = []
     seen_orphan_ids: set[str] = set()
     discarded_orphans = 0
@@ -1476,6 +1436,10 @@ def reconcile_with_schedule(
             broadcaster_updates[best_idx] = _merge_broadcasters(
                 broadcaster_updates[best_idx], epg_channels
             )
+            if epg.end_ms > 0:
+                target_end = epg.end_ms - (DIRETTA_POST_MATCH_MS - SKY_EPG_POST_END_MS)
+                if target_end > end_date_updates[best_idx]:
+                    end_date_updates[best_idx] = target_end
             continue
 
         if not _is_allowlisted_orphan(epg):
@@ -1500,9 +1464,8 @@ def reconcile_with_schedule(
             is_youth=is_youth,
         )
 
-        prefix = "tivusat" if epg.source == "tivusat" else "sky"
         slug = _slugify(epg.title)
-        orphan_id = f"{prefix}_{epg.channel_id}_{slug}_{epg.start_ms}"
+        orphan_id = f"sky_{epg.channel_id}_{slug}_{epg.start_ms}"
         if orphan_id in seen_orphan_ids:
             continue
         seen_orphan_ids.add(orphan_id)
@@ -1537,12 +1500,14 @@ def reconcile_with_schedule(
             discarded_orphans,
         )
 
-    enriched = [
-        m.model_copy(update={"broadcasters": broadcaster_updates[idx]})
-        if broadcaster_updates[idx] != m.broadcasters
-        else m
-        for idx, m in enumerate(diretta_matches)
-    ]
+    enriched: list[Match] = []
+    for idx, m in enumerate(diretta_matches):
+        updates: dict[str, Any] = {}
+        if broadcaster_updates[idx] != m.broadcasters:
+            updates["broadcasters"] = broadcaster_updates[idx]
+        if end_date_updates[idx] != m.end_date:
+            updates["end_date"] = end_date_updates[idx]
+        enriched.append(m.model_copy(update=updates) if updates else m)
     return enriched, orphan_matches
 
 
@@ -1672,20 +1637,6 @@ def _parse_iso_to_ms(value: str) -> int:
         return 0
 
 
-def _parse_tivusat_dt_to_ms(value: str) -> int:
-    if not value:
-        return 0
-    raw = value.strip()
-    for fmt in ("%d-%m-%Y %H:%M", "%d-%m-%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-        try:
-            naive = datetime.strptime(raw, fmt)
-            rome_dt = naive.replace(tzinfo=_ROME_TZ)
-            return int(rome_dt.astimezone(timezone.utc).timestamp() * 1000)
-        except ValueError:
-            continue
-    return _parse_iso_to_ms(raw)
-
-
 def _is_sports_program(
     *,
     is_dedicated_sports_channel: bool,
@@ -1704,7 +1655,7 @@ def _is_sports_program(
 
 
 class ItalianEPGService:
-    """Async EPG ingestion service for Sky Italia and Tivùsat Guida TV."""
+    """Async EPG ingestion service for Sky Italia Guida TV."""
 
     def __init__(
         self,
@@ -1715,6 +1666,7 @@ class ItalianEPGService:
         self._client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
         self._sky_day_cache: dict[str, tuple[float, list[EPGProgram]]] = {}
+        self._sky_future_cache: dict[int, tuple[str, float, list[EPGProgram]]] = {}
         self._rolling_cache: list[EPGProgram] = []
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -1757,19 +1709,20 @@ class ItalianEPGService:
             return True
         return False
 
-    async def _fetch_sky_day(
+    async def _fetch_sky_window(
         self,
         client: httpx.AsyncClient,
         *,
         from_dt: datetime,
         to_dt: datetime,
         now_utc: datetime,
-    ) -> list[EPGProgram]:
-        """Fetch Sky Guida TV events for the `[from_dt, to_dt]` window with 3h day-snapshot cache."""
+        allow_422_retry: bool = True,
+    ) -> tuple[list[EPGProgram], bool]:
+        """Fetch paginated Sky Guida TV events for `[from_dt, to_dt]`, discarding >15m expired items."""
         from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        day_key = now_utc.astimezone(_ROME_TZ).strftime("%Y-%m-%d")
-        ch_ids = ",".join(dict.fromkeys([*SKY_CHANNELS.keys(), *SKY_CHANNEL_IDS.keys()]))
+        ch_ids = ",".join(SKY_CHANNELS.keys())
+        now_ms = int(now_utc.timestamp() * 1000)
 
         programs: list[EPGProgram] = []
         page_num = 0
@@ -1785,6 +1738,32 @@ class ItalianEPGService:
                 resp = await client.get(url)
                 resp.raise_for_status()
                 payload = resp.json()
+            except httpx.HTTPStatusError as exc:
+                if (
+                    exc.response is not None
+                    and exc.response.status_code == 422
+                    and page_num == 0
+                    and allow_422_retry
+                    and from_dt < now_utc
+                ):
+                    logger.warning(
+                        "Sky EPG returned HTTP 422 for from=%s; retrying once from now_utc=%s",
+                        from_iso,
+                        now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    )
+                    fallback_to = (
+                        to_dt if to_dt > now_utc else (now_utc + timedelta(hours=1))
+                    )
+                    return await self._fetch_sky_window(
+                        client,
+                        from_dt=now_utc,
+                        to_dt=fallback_to,
+                        now_utc=now_utc,
+                        allow_422_retry=False,
+                    )
+                logger.warning("Sky EPG fetch failed (page=%s): %s", page_num, exc)
+                fetch_failed = page_num == 0
+                break
             except Exception as exc:
                 logger.warning("Sky EPG fetch failed (page=%s): %s", page_num, exc)
                 fetch_failed = page_num == 0
@@ -1837,6 +1816,8 @@ class ItalianEPGService:
                 end_ms = _parse_iso_to_ms(ev.get("endtime", ""))
                 if start_ms <= 0 or end_ms <= start_ms:
                     continue
+                if now_ms > end_ms + SKY_EPG_POST_END_MS:
+                    continue
 
                 competition_hint = url_comp or _extract_competition_from_synopsis(description) or ""
                 if not _passes_epg_program_guards(
@@ -1882,199 +1863,143 @@ class ItalianEPGService:
                 break
             page_num += 1
 
-        now_mono = time.monotonic()
-        now_ms = int(now_utc.timestamp() * 1000)
-
-        if programs:
-            merged = _merge_and_handover_channel_blocks(programs)
-            self._sky_day_cache[day_key] = (now_mono, merged)
-            # Prune expired day snapshots (> 3h TTL)
-            expired_keys = [
-                k for k, (ts, _) in self._sky_day_cache.items()
-                if (now_mono - ts) > _SKY_DAY_CACHE_TTL_SECONDS
-            ]
-            for k in expired_keys:
-                self._sky_day_cache.pop(k, None)
-            return merged
-
         if fetch_failed:
-            # Anti-midnight / outage fallback: check today or yesterday snapshot within 3h TTL
-            prev_day_key = (now_utc.astimezone(_ROME_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
-            for candidate_key in (day_key, prev_day_key):
-                cached = self._sky_day_cache.get(candidate_key)
-                if cached and (now_mono - cached[0]) <= _SKY_DAY_CACHE_TTL_SECONDS:
-                    still_valid = [p for p in cached[1] if p.end_ms > now_ms]
-                    if still_valid:
-                        logger.warning(
-                            "Sky EPG fetch failed; serving %d still-valid programs from %s snapshot",
-                            len(still_valid),
-                            candidate_key,
-                        )
-                        return still_valid
-
-        return []
+            return [], True
+        return (_merge_and_handover_channel_blocks(programs) if programs else []), False
 
     async def _fetch_sky_with_client(
         self,
         client: httpx.AsyncClient,
         *,
         requested_from: Optional[datetime] = None,
-        hours_ahead: int = 36,
+        days: tuple[int, ...] = SKY_FEED_DAYS,
         now_utc: Optional[datetime] = None,
     ) -> list[EPGProgram]:
         if not self._settings.ENABLE_SKY_EPG:
             return []
 
         now = _ensure_utc(now_utc or datetime.now(timezone.utc))
-        raw_from = requested_from if requested_from is not None else now - _SKY_MAX_LOOKBACK
-        from_dt = clamp_sky_from(raw_from, now)
-        to_dt = now + timedelta(hours=max(1, hours_ahead))
-        return await self._fetch_sky_day(
-            client,
-            from_dt=from_dt,
-            to_dt=to_dt,
-            now_utc=now,
-        )
+        ref_ts = now.timestamp()
+        now_ms = int(ref_ts * 1000)
+        local_now = now.astimezone(_ROME_TZ)
+        today_local = local_now.date()
+        today_key = today_local.isoformat()
+        prev_day_key = (today_local - timedelta(days=1)).isoformat()
+        logical_day = _sky_logical_rome_day(local_now)
+
+        ordered_days = sorted(dict.fromkeys(days))
+        merged_programs: list[EPGProgram] = []
+        seen_ids: set[str] = set()
+
+        for day_offset in ordered_days:
+            bucket_progs: list[EPGProgram] = []
+            if day_offset == 0:
+                raw_from = (
+                    requested_from
+                    if requested_from is not None
+                    else now - _SKY_MAX_LOOKBACK
+                )
+                from_dt = clamp_sky_from(raw_from, now)
+                _, day0_end_utc = _rome_day_bounds_utc(today_local)
+                to_dt = (
+                    day0_end_utc
+                    if day0_end_utc > from_dt
+                    else (from_dt + timedelta(hours=1))
+                )
+                day0_progs, failed = await self._fetch_sky_window(
+                    client,
+                    from_dt=from_dt,
+                    to_dt=to_dt,
+                    now_utc=now,
+                    allow_422_retry=True,
+                )
+                if day0_progs:
+                    self._sky_day_cache[today_key] = (ref_ts, day0_progs)
+                    expired_keys = [
+                        k
+                        for k, (ts, _) in self._sky_day_cache.items()
+                        if (ref_ts - ts) > _SKY_OUTAGE_CACHE_TTL_SECONDS
+                    ]
+                    for k in expired_keys:
+                        self._sky_day_cache.pop(k, None)
+                    bucket_progs = day0_progs
+                elif failed:
+                    for candidate_key in (today_key, prev_day_key):
+                        cached = self._sky_day_cache.get(candidate_key)
+                        if (
+                            cached
+                            and (ref_ts - cached[0]) <= _SKY_OUTAGE_CACHE_TTL_SECONDS
+                        ):
+                            still_valid = [
+                                p
+                                for p in cached[1]
+                                if now_ms <= p.end_ms + SKY_EPG_POST_END_MS
+                            ]
+                            if still_valid:
+                                logger.warning(
+                                    "Sky EPG fetch failed; serving %d still-valid programs from %s snapshot",
+                                    len(still_valid),
+                                    candidate_key,
+                                )
+                                bucket_progs = still_valid
+                                break
+            elif day_offset > 0:
+                cached_fut = self._sky_future_cache.get(day_offset)
+                if (
+                    cached_fut is not None
+                    and cached_fut[0] == logical_day
+                    and (ref_ts - cached_fut[1]) < _SKY_FUTURE_BUCKET_TTL_SECONDS
+                ):
+                    bucket_progs = [
+                        p
+                        for p in cached_fut[2]
+                        if now_ms <= p.end_ms + SKY_EPG_POST_END_MS
+                    ]
+                else:
+                    target_date = today_local + timedelta(days=day_offset)
+                    start_utc, end_utc = _rome_day_bounds_utc(target_date)
+                    fut_progs, failed = await self._fetch_sky_window(
+                        client,
+                        from_dt=start_utc,
+                        to_dt=end_utc,
+                        now_utc=now,
+                        allow_422_retry=False,
+                    )
+                    if not failed:
+                        self._sky_future_cache[day_offset] = (
+                            logical_day,
+                            ref_ts,
+                            fut_progs,
+                        )
+                        bucket_progs = fut_progs
+                    elif cached_fut is not None:
+                        bucket_progs = [
+                            p
+                            for p in cached_fut[2]
+                            if now_ms <= p.end_ms + SKY_EPG_POST_END_MS
+                        ]
+
+            for prog in bucket_progs:
+                if prog.id not in seen_ids and now_ms <= prog.end_ms + SKY_EPG_POST_END_MS:
+                    seen_ids.add(prog.id)
+                    merged_programs.append(prog)
+
+        return merged_programs
 
     async def fetch_sky_epg(
         self,
         *,
         requested_from: Optional[datetime] = None,
-        hours_ahead: int = 36,
+        days: tuple[int, ...] = SKY_FEED_DAYS,
         now_utc: Optional[datetime] = None,
     ) -> list[EPGProgram]:
-        """Fetch raw sports EPG items from Sky Italia REST API with 165m lookback clamp."""
+        """Fetch raw sports EPG items from Sky Italia REST API by per-day buckets (3h lookback clamp)."""
         if not self._settings.ENABLE_SKY_EPG:
             return []
         return await self._fetch_sky_with_client(
             self._get_client(),
             requested_from=requested_from,
-            hours_ahead=hours_ahead,
-            now_utc=now_utc,
-        )
-
-    async def _fetch_tivusat_channel_day(
-        self,
-        client: httpx.AsyncClient,
-        ch_id: str,
-        date_str: str,
-    ) -> list[EPGProgram]:
-        url = TIVUSAT_EPG_URL.format(ch_id=ch_id, date_str=date_str)
-        try:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            payload = resp.json()
-        except Exception as exc:
-            logger.warning("Tivùsat EPG fetch failed (ch=%s date=%s): %s", ch_id, date_str, exc)
-            return []
-
-        events = payload.get("events") or []
-        canonical_channel = TIVUSAT_CHANNELS.get(ch_id) or canonical_from_tivusat_id(ch_id)
-        if not canonical_channel:
-            return []
-        is_sports_ch = ch_id in TIVUSAT_SPORTS_CHANNEL_IDS or not _is_generalist_channel(
-            canonical_channel, ch_id
-        )
-        items: list[EPGProgram] = []
-
-        for ev in events:
-            prog = ev.get("program") or {}
-            title = (prog.get("title") or ev.get("title") or "").strip()
-            if not title:
-                continue
-            description = (prog.get("description") or ev.get("description") or "").strip()
-
-            genres = prog.get("genres") or []
-            cats = prog.get("categories") or []
-            genre_names = [str(g.get("name", "")).strip() for g in genres if isinstance(g, dict) and g.get("name")]
-            cat_names = [str(c.get("name", "")).strip() for c in cats if isinstance(c, dict) and c.get("name")]
-            category = ", ".join(genre_names or cat_names)
-
-            if not _is_sports_program(
-                is_dedicated_sports_channel=is_sports_ch,
-                title=title,
-                description=description,
-                category=category,
-                sport_hint="",
-            ):
-                continue
-
-            start_ms = _parse_tivusat_dt_to_ms(ev.get("date_start", ""))
-            end_ms = _parse_tivusat_dt_to_ms(ev.get("date_end", ""))
-            if start_ms <= 0 or end_ms <= start_ms:
-                continue
-
-            comp_hint = _extract_competition_from_synopsis(description) or ""
-            if not _passes_epg_program_guards(
-                is_generalist=not is_sports_ch,
-                title=title,
-                description=description,
-                start_ms=start_ms,
-                end_ms=end_ms,
-                competition_hint=comp_hint,
-            ):
-                continue
-
-            ev_id = str(ev.get("id") or f"{ch_id}_{start_ms}")
-            items.append(
-                EPGProgram(
-                    id=f"tivusat_{ev_id}",
-                    channel_id=ch_id,
-                    channel_name=canonical_channel,
-                    title=title,
-                    description=description,
-                    category=category,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    sport_hint=genre_names[0] if genre_names else "",
-                    competition_hint=comp_hint,
-                    is_live=not is_non_live_or_studio(title, description),
-                    is_simulcast=_is_simulcast_title(title),
-                    source="tivusat",
-                )
-            )
-        return items
-
-    async def _fetch_tivusat_with_client(
-        self,
-        client: httpx.AsyncClient,
-        *,
-        days_ahead: int = 1,
-        now_utc: Optional[datetime] = None,
-    ) -> list[EPGProgram]:
-        if not self._settings.ENABLE_TIVUSAT_EPG:
-            return []
-
-        now_rome = _ensure_utc(now_utc or datetime.now(timezone.utc)).astimezone(_ROME_TZ)
-        dates = [
-            (now_rome + timedelta(days=offset)).strftime("%Y-%m-%d")
-            for offset in range(0, max(0, days_ahead) + 1)
-        ]
-
-        channel_ids = list(dict.fromkeys([*TIVUSAT_CHANNELS.keys(), *TIVUSAT_CHANNEL_IDS.keys()]))
-        coros = [
-            self._fetch_tivusat_channel_day(client, ch_id, date_str)
-            for ch_id in channel_ids
-            for date_str in dates
-        ]
-        results = await asyncio.gather(*coros)
-        items: list[EPGProgram] = []
-        for batch in results:
-            items.extend(batch)
-        return _merge_and_handover_channel_blocks(items)
-
-    async def fetch_tivusat_epg(
-        self,
-        *,
-        days_ahead: int = 1,
-        now_utc: Optional[datetime] = None,
-    ) -> list[EPGProgram]:
-        """Fetch raw sports EPG items from Tivùsat Guida TV REST API."""
-        if not self._settings.ENABLE_TIVUSAT_EPG:
-            return []
-        return await self._fetch_tivusat_with_client(
-            self._get_client(),
-            days_ahead=days_ahead,
+            days=days,
             now_utc=now_utc,
         )
 
@@ -2085,24 +2010,29 @@ class ItalianEPGService:
         now_ms: int,
     ) -> list[EPGProgram]:
         """Retain still-active/recent programs across midnight transitions without time-shift duplicates."""
+        active_fresh = [
+            p
+            for p in fresh_programs
+            if p.end_ms <= 0 or now_ms <= p.end_ms + SKY_EPG_POST_END_MS
+        ]
         if not self._rolling_cache:
-            self._rolling_cache = list(fresh_programs)
-            return fresh_programs
+            self._rolling_cache = list(active_fresh)
+            return active_fresh
 
-        fresh_ids = {p.id for p in fresh_programs}
+        fresh_ids = {p.id for p in active_fresh}
         retained: list[EPGProgram] = []
         for prev in self._rolling_cache:
             if prev.id in fresh_ids:
                 continue
             if prev.start_ms <= 0 or (now_ms - prev.start_ms) >= _ROLLING_CACHE_WINDOW_MS:
                 continue
-            if prev.end_ms <= now_ms - 30 * 60_000:
+            if prev.end_ms > 0 and now_ms > prev.end_ms + SKY_EPG_POST_END_MS:
                 continue
 
             prev_canon = canonicalize_channel_name(prev.channel_name, country="Italy")
             prev_norm = _normalize_simulcast_title(prev.title)
             is_time_shifted = False
-            for curr in fresh_programs:
+            for curr in active_fresh:
                 curr_canon = canonicalize_channel_name(curr.channel_name, country="Italy")
                 if prev_canon and curr_canon and prev_canon == curr_canon:
                     if abs(curr.start_ms - prev.start_ms) <= 90 * 60_000:
@@ -2117,7 +2047,7 @@ class ItalianEPGService:
             if not is_time_shifted:
                 retained.append(prev)
 
-        combined = [*retained, *fresh_programs]
+        combined = [*retained, *active_fresh]
         self._rolling_cache = combined
         return combined
 
@@ -2126,31 +2056,22 @@ class ItalianEPGService:
         active_tennis_cities: frozenset[str] = frozenset(),
         *,
         requested_from: Optional[datetime] = None,
-        hours_ahead: int = 36,
-        days_ahead: int = 1,
+        days: tuple[int, ...] = SKY_FEED_DAYS,
         now_utc: Optional[datetime] = None,
     ) -> list[EPGProgram]:
-        """Fetch Sky + Tivùsat EPGs, filter studio/replays/out-of-calendar tennis, and merge simulcasts."""
+        """Fetch Sky Italia EPG, filter studio/replays/out-of-calendar tennis, and merge simulcasts."""
         ref_now = _ensure_utc(now_utc or datetime.now(timezone.utc))
         now_ms = int(ref_now.timestamp() * 1000)
         client = self._get_client()
 
-        sky_items, tivusat_items = await asyncio.gather(
-            self._fetch_sky_with_client(
-                client,
-                requested_from=requested_from,
-                hours_ahead=hours_ahead,
-                now_utc=ref_now,
-            ),
-            self._fetch_tivusat_with_client(
-                client,
-                days_ahead=days_ahead,
-                now_utc=ref_now,
-            ),
+        sky_items = await self._fetch_sky_with_client(
+            client,
+            requested_from=requested_from,
+            days=days,
+            now_utc=ref_now,
         )
-        combined = [*sky_items, *tivusat_items]
         filtered: list[EPGProgram] = []
-        for prog in combined:
+        for prog in sky_items:
             if is_non_live_or_studio(prog.title, prog.description, current_year=ref_now.year):
                 continue
             if is_out_of_calendar_tennis(

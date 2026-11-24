@@ -112,26 +112,6 @@ SKY_CHANNEL_IDS: dict[str, str] = {
     "8293": "equtv",              # LCN 220
 }
 
-# Direct mapping for Tivùsat EPG API (services.tivulaguida.it) channel IDs
-TIVUSAT_CHANNEL_IDS: dict[str, str] = {
-    "42": "rai 1",
-    "43": "rai 2",
-    "44": "rai 3",
-    "88": "rai sport",
-    "145": "canale 5",
-    "5": "canale 5",
-    "148": "italia 1",
-    "6": "italia 1",
-    "140": "nove",
-    "249": "20 mediaset",
-    "279": "tv8",
-    "280": "cielo",
-    "295": "sportitalia solocalcio",
-    "277": "equtv",
-    "32": "dmax",
-    "256": "rai 4k",
-}
-
 # MandraKodi FreeShot / Sky A1A159 JIT channel IDs -> canonical keys
 SKY_CHID_TO_CANONICAL: dict[str, str] = {
     "skysport24": "sky sport 24",
@@ -1150,11 +1130,6 @@ def canonical_from_sky_id(channel_id: Any) -> Optional[str]:
     return SKY_CHANNEL_IDS.get(str(channel_id).strip())
 
 
-def canonical_from_tivusat_id(channel_id: Any) -> Optional[str]:
-    """Return canonical channel key for a Tivùsat EPG API channel ID."""
-    return TIVUSAT_CHANNEL_IDS.get(str(channel_id).strip())
-
-
 __all__ = [
     "CANONICAL_DISPLAY_NAMES",
     "CHANNEL_COUNTRY_PATTERNS",
@@ -1163,11 +1138,9 @@ __all__ = [
     "GLOBAL_CHANNEL_ALIASES",
     "SKY_CHANNEL_IDS",
     "SKY_CHID_TO_CANONICAL",
-    "TIVUSAT_CHANNEL_IDS",
     "TVVOO_COUNTRY_GROUPS",
     "UNSUPPORTED_COUNTRY_SUFFIXES",
     "canonical_from_sky_id",
-    "canonical_from_tivusat_id",
     "canonicalize_channel_name",
     "clean_channel_name",
     "detect_channel_flag",

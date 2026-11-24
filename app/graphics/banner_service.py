@@ -28,7 +28,7 @@ from app.graphics._utils import (
 )
 from app.graphics.tennis_poster import TennisPosterService
 from app.graphics.thesportsdb_service import TheSportsDBService, render_dark_canvas
-from app.models.domain import Match, SportSilo
+from app.models.domain import Match, SportSilo, get_match_expiry_ms
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +64,12 @@ def compute_badge_state(
     Never produces a Replay badge.
     """
     current_ms = now_ms if now_ms is not None else int(time.time() * 1000)
-    live_win_ms = get_live_window_minutes(match.silo) * 60 * 1000
     live_start = match.date - PRE_LIVE_WINDOW_MS
-    live_end = max(match.end_date, match.date + live_win_ms)
+    if match.end_date > 0:
+        live_end = get_match_expiry_ms(match)
+    else:
+        live_win_ms = get_live_window_minutes(match.silo) * 60 * 1000
+        live_end = match.date + live_win_ms
 
     if live_start <= current_ms <= live_end:
         return "LIVE", "LIVE"

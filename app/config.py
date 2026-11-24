@@ -34,7 +34,6 @@ class Settings(BaseSettings):
     # Feature & provider toggles
     ENABLE_DIRETTA: bool = True
     ENABLE_SKY_EPG: bool = True
-    ENABLE_TIVUSAT_EPG: bool = True
     ENABLE_THESPORTSDB: bool = True
     ENABLE_TENNIS_POSTERS: bool = True
     ENABLE_TVVOO: bool = True

@@ -25,7 +25,13 @@ from app.ingestion.epg_service import (
     filter_ghost_epg_matches,
     reconcile_with_schedule,
 )
-from app.models.domain import EPGProgram, Match, SportSilo
+from app.models.domain import (
+    SKY_EPG_POST_END_MS,
+    EPGProgram,
+    Match,
+    SportSilo,
+    get_match_expiry_ms,
+)
 from app.providers.stream_orchestrator import StreamOrchestrator
 from app.providers.tvvoo_service import TvVooService
 from app.taxonomy.classifier import (
@@ -38,14 +44,17 @@ logger = logging.getLogger(__name__)
 
 def _live_bounds_ms(match: Match) -> tuple[int, int]:
     """Return `(live_start_ms, live_end_ms)` for a match."""
-    live_win_ms = get_live_window_minutes(match.silo) * 60 * 1000
     live_start = match.date - PRE_LIVE_WINDOW_MS
-    live_end = max(match.end_date, match.date + live_win_ms)
+    if match.end_date > 0:
+        live_end = get_match_expiry_ms(match)
+    else:
+        live_win_ms = get_live_window_minutes(match.silo) * 60 * 1000
+        live_end = match.date + live_win_ms
     return live_start, live_end
 
 
 def is_match_live_window(match: Match, now_ms: int) -> bool:
-    """Return True if `now_ms` falls within `[date - 20m, max(end_date, date + live_window)]`."""
+    """Return True if `now_ms` falls within `[date - 20m, live_end]`."""
     if match.date <= 0:
         return False
     live_start, live_end = _live_bounds_ms(match)
@@ -53,13 +62,11 @@ def is_match_live_window(match: Match, now_ms: int) -> bool:
 
 
 def _smart_sort_key(match: Match, now_ms: int) -> tuple[int, int, int, str]:
-    """Sort live matches first (popular boosted, start asc), then upcoming, then finished."""
+    """Sort live/post-match active events first (popular boosted, start asc), then upcoming."""
     live_start, live_end = _live_bounds_ms(match)
     if match.date > 0 and live_start <= now_ms <= live_end:
         return (0, 0 if match.popular else 1, match.date, match.title.casefold())
-    if match.date <= 0 or now_ms < live_start:
-        return (1, 0 if match.popular else 1, match.date, match.title.casefold())
-    return (2, 0 if match.popular else 1, -match.date, match.title.casefold())
+    return (1, 0 if match.popular else 1, match.date, match.title.casefold())
 
 
 def build_catalog_buckets(
@@ -67,9 +74,14 @@ def build_catalog_buckets(
     *,
     now_ms: Optional[int] = None,
 ) -> tuple[dict[str, tuple[Match, ...]], dict[str, tuple[str, ...]]]:
-    """Partition and smart-sort matches into catalog buckets and active genre lists."""
+    """Partition and smart-sort non-expired matches into catalog buckets and active genre lists."""
     current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
-    ordered = sorted(matches, key=lambda m: _smart_sort_key(m, current_ms))
+    active = [
+        m
+        for m in matches
+        if (exp := get_match_expiry_ms(m)) <= 0 or current_ms <= exp
+    ]
+    ordered = sorted(active, key=lambda m: _smart_sort_key(m, current_ms))
 
     matches_by_catalog: dict[str, tuple[Match, ...]] = {}
     genres_by_catalog: dict[str, tuple[str, ...]] = {}
@@ -144,10 +156,12 @@ class PipelineScheduler:
     async def hydrate_from_db(self, *, now_ms: Optional[int] = None) -> int:
         """Load persisted active matches into RAMCacheManager at startup for instant O(1) serving."""
         current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
-        retention_ms = self._settings.MATCH_RETENTION_HOURS * 3600 * 1000
-        min_end_ms = current_ms - retention_ms
-
-        active_matches = await self._db.load_active_matches(min_end_ms)
+        loaded = await self._db.load_active_matches(now_ms=current_ms)
+        active_matches = [
+            m
+            for m in loaded
+            if (exp := get_match_expiry_ms(m)) <= 0 or current_ms <= exp
+        ]
         matches_by_catalog, genres_by_catalog = build_catalog_buckets(
             active_matches, now_ms=current_ms
         )
@@ -177,11 +191,17 @@ class PipelineScheduler:
         """Execute one full ingestion -> EPG -> streams -> TSDB -> DB -> RAM snapshot cycle."""
         async with self._run_lock:
             current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+            ref_utc = datetime.fromtimestamp(current_ms / 1000.0, tz=timezone.utc)
             logger.info("Pipeline cycle started")
 
             # 1. Official schedule ingestion (preserve tennis cities on outage/0-match)
             prev_snapshot = self._ram_cache.snapshot
-            diretta_matches, fetched_tennis_cities = await self._diretta.fetch_schedule()
+            diretta_matches, fetched_tennis_cities = await self._diretta.fetch_schedule(
+                now_utc=ref_utc
+            )
+            discarded_ids = sorted(
+                getattr(self._diretta, "last_discarded_match_ids", frozenset())
+            )
             diretta_failed = bool(getattr(self._diretta, "last_fetch_failed", False))
             if (diretta_failed or (self._settings.ENABLE_DIRETTA and not diretta_matches)) and prev_snapshot.active_tennis_cities:
                 active_tennis_cities = fetched_tennis_cities or prev_snapshot.active_tennis_cities
@@ -200,14 +220,16 @@ class PipelineScheduler:
                 )
 
             # 2. Italian EPG ingestion (throttled by EPG_SYNC_INTERVAL_SECONDS, with stale fallback)
-            if self._settings.ENABLE_SKY_EPG or self._settings.ENABLE_TIVUSAT_EPG:
+            if self._settings.ENABLE_SKY_EPG:
                 mono_now = time.monotonic()
                 if (
                     not self._epg_cache
                     or (mono_now - self._last_epg_sync_monotonic)
                     >= self._settings.EPG_SYNC_INTERVAL_SECONDS
                 ):
-                    fresh_epg = await self._epg.fetch_epg(active_tennis_cities)
+                    fresh_epg = await self._epg.fetch_epg(
+                        active_tennis_cities, now_utc=ref_utc
+                    )
                     if fresh_epg or not self._epg_cache:
                         self._epg_cache = fresh_epg
                         self._last_epg_sync_monotonic = mono_now
@@ -216,7 +238,11 @@ class PipelineScheduler:
                             "EPG fetch returned 0 programs; retaining %d stale EPG programs",
                             len(self._epg_cache),
                         )
-                epg_programs = list(self._epg_cache)
+                epg_programs = [
+                    p
+                    for p in self._epg_cache
+                    if p.end_ms <= 0 or current_ms <= p.end_ms + SKY_EPG_POST_END_MS
+                ]
             else:
                 self._epg_cache = []
                 epg_programs = []
@@ -290,16 +316,32 @@ class PipelineScheduler:
                 for m in matches
             ]
 
-            # 5. Persist to SQLite, purge expired (> MATCH_RETENTION_HOURS), and clean disk posters
+            # Filter out expired items before persisting and purge cancelled/expired rows
+            matches = [
+                m
+                for m in matches
+                if (exp := get_match_expiry_ms(m)) <= 0 or current_ms <= exp
+            ]
+
+            # 5. Persist to SQLite, delete discarded/expired matches, and clean disk posters
             await self._db.upsert_matches(matches)
-            purged_ids = await self._db.purge_expired(self._settings.MATCH_RETENTION_HOURS)
-            if purged_ids:
-                self._banner.cleanup_poster_files(purged_ids)
+            deleted_ids = (
+                await self._db.delete_matches(discarded_ids)
+                if discarded_ids
+                else []
+            )
+            purged_ids = await self._db.purge_expired(now_ms=current_ms)
+            removed_ids = list(dict.fromkeys([*deleted_ids, *purged_ids]))
+            if removed_ids:
+                self._banner.cleanup_poster_files(removed_ids)
 
             # 6. Reload active matches and swap RAM snapshot atomically
-            retention_ms = self._settings.MATCH_RETENTION_HOURS * 3600 * 1000
-            min_end_ms = current_ms - retention_ms
-            active_matches = await self._db.load_active_matches(min_end_ms)
+            loaded_active = await self._db.load_active_matches(now_ms=current_ms)
+            active_matches = [
+                m
+                for m in loaded_active
+                if (exp := get_match_expiry_ms(m)) <= 0 or current_ms <= exp
+            ]
 
             matches_by_catalog, genres_by_catalog = build_catalog_buckets(
                 active_matches, now_ms=current_ms
@@ -318,7 +360,7 @@ class PipelineScheduler:
                 "Pipeline cycle completed: %d ingested, %d active in RAM, %d purged",
                 len(matches),
                 len(active_matches),
-                len(purged_ids),
+                len(removed_ids),
             )
             return len(active_matches)
 
