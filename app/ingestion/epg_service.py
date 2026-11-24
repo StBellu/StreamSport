@@ -24,6 +24,7 @@ from app.models.domain import (
     SportSilo,
     TeamInfo,
 )
+from app.ingestion.diretta_service import extract_tennis_cities
 from app.taxonomy import (
     DEFAULT_GENRE_CLASSIFIER,
     DEFAULT_TEAM_MATCHER,
@@ -33,6 +34,10 @@ from app.taxonomy import (
 from app.taxonomy.channels import (
     canonical_from_sky_id,
     canonicalize_channel_name,
+)
+from app.taxonomy.matcher import (
+    _extract_motorsport_series,
+    _extract_motorsport_session,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,7 +88,7 @@ def _load_rome_tz() -> tzinfo:
 
 _ROME_TZ: tzinfo = _load_rome_tz()
 _SKY_MAX_LOOKBACK = timedelta(hours=3)
-_SIMULCAST_WINDOW_MS = 30 * 60 * 1000
+_SIMULCAST_WINDOW_MS = 45 * 60 * 1000
 _RECONCILE_WINDOW_MS = 60 * 60 * 1000
 _LINEAR_PRE_MATCH_MS = 35 * 60 * 1000
 _LINEAR_POST_MATCH_MS = 30 * 60 * 1000
@@ -184,14 +189,18 @@ _HARD_NON_LIVE_PATTERN = (
     r"|\bnotiziario\b"
     r"|\bcalciomercato\b"
     r"|\brassegna\s+stampa\b"
+    r"|\bconf(?:erenza)?\.?\s+stampa\b"
+    r"|\bpit\s+walk\b"
+    r"|\bafter\s+party\b"
     r"|\bstudio\b"
+    r"|\bshow\b"
     r"|\bhighlights\b"
     r"|\bsintesi\b"
     r"|\breplica\b"
     r"|\bon\s*board\b"
     r"|\brubrica\b"
-    r"|\bpre\s*-?\s*partita\b"
-    r"|\bpost\s*-?\s*partita\b"
+    r"|\bpre\s*-?\s*(?:partita|gara|match)\b"
+    r"|\bpost\s*-?\s*(?:partita|gara|match)\b"
     r"|\banteprima\b"
     r"|\bmagazine\b"
     r"|\bdocumentario\b"
@@ -217,14 +226,15 @@ _NON_LIVE_DESC_RE = re.compile(
     r"|\brubrica\b"
     r"|\bnotiziario\b"
     r"|\brassegna\s+stampa\b"
+    r"|\bconf(?:erenza)?\.?\s+stampa\b"
     r"|\bapprofondimento\b"
     r"|\btalk\s+show\b"
     r"|\bazioni\s+salienti\b"
     r"|\bhighlights\b"
     r"|\bsintesi\b"
     r"|\bcalciomercato\b"
-    r"|\bpre\s*-?\s*partita\b"
-    r"|\bpost\s*-?\s*partita\b"
+    r"|\bpre\s*-?\s*(?:partita|gara|match)\b"
+    r"|\bpost\s*-?\s*(?:partita|gara|match)\b"
     r"|\btrasmissione\s+dedicata\b"
     r"|\bdifferita\b"
     r"|\barchivio\b"
@@ -234,6 +244,11 @@ _NON_LIVE_DESC_RE = re.compile(
     r"|\bspeciale\b"
     r"|\bbest\s+of\b"
     r")",
+    re.IGNORECASE,
+)
+_BARE_DATE_TITLE_RE = re.compile(r"^\d{1,2}[/\-.]\d{1,2}(?:[/\-.]\d{2,4})?$")
+_NON_LIVE_URL_RE = re.compile(
+    r"/(?:pre-?partita|post-?partita|pre-?gara|post-?gara|replica|differita|highlights|sintesi|speciale|magazine|rubrica|documentario|studio)\b",
     re.IGNORECASE,
 )
 
@@ -272,6 +287,11 @@ _SIMULCAST_NOISE_RE = re.compile(
     r"canale\s*5|italia\s*1|nove|20\s*mediaset)\b",
     re.IGNORECASE,
 )
+_DATE_TOKEN_RE = re.compile(r"\b\d{1,2}[/\-.]\d{1,2}(?:[/\-.]\d{2,4})?\b")
+_STAG_EP_TOKEN_RE = re.compile(
+    r"(?:\bs\d+\s*ep\d+\b|\bstag(?:ione)?\.?\s*\d+\b|\bep\.?\s*\d+\b)",
+    re.IGNORECASE,
+)
 
 _YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
 _CLUB_YEAR_PREFIX_RE = re.compile(
@@ -300,50 +320,20 @@ _MOTORI_PREFIX_RE = re.compile(
     r"^(formula\s*1|f1|motogp|moto\s*2|moto\s*3|wrc|wsbk|sbk|superbike|indycar|nascar)\b\s*[:\-–—]?\s*(.*)$",
     re.IGNORECASE,
 )
-_COMPOUND_HYPHEN_PREFIXES: frozenset[str] = frozenset(
-    {
-        "saint",
-        "st",
-        "al",
-        "el",
-        "ben",
-        "abu",
-        "ibn",
-        "san",
-        "santa",
-        "sao",
-        "under",
-        "u",
-        "sub",
-        "play",
-        "all",
-        "pre",
-        "post",
-        "ex",
-        "de",
-        "del",
-        "la",
-        "le",
-        "mac",
-        "mc",
-    }
+_COMP_YEAR_PREFIX_RE = re.compile(
+    r"^(?:(?:uefa|cev|fiba|atp|wta)\s+)?"
+    r"(?:champions\s+league|europa\s+league|conference\s+league|serie\s+[abc12]|"
+    r"premier\s+league|bundesliga|eurolega|superlega)"
+    r"(?:\s+(?:f|m|femminile|maschile|donne|uomini))?\s+(?:19|20)\d{2}\s+",
+    re.IGNORECASE,
 )
-_KNOWN_COMPOUND_HYPHEN_WORDS: frozenset[str] = frozenset(
-    {
-        "auger-aliassime",
-        "bautista-agut",
-        "carreno-busta",
-        "davidovich-fokina",
-        "mpetshi-perricard",
-        "clermont-ferrand",
-        "emilia-romagna",
-        "friuli-venezia",
-        "trentino-alto",
-        "saint-etienne",
-        "saint-germain",
-        "west-ham",
-    }
+_COMP_WOMEN_F_RE = re.compile(
+    r"\b(?:champions\s+league|europa\s+league|serie\s+a1?|coppa\s+italia|supercoppa|"
+    r"volley|pallavolo|basket|calcio|cev)\s+f\b",
+    re.IGNORECASE,
 )
+_U23_BTEAM_RE = re.compile(r"\b(?:u[- ]?23|under[- ]?23|next\s*gen)\b", re.IGNORECASE)
+_TRAILING_WOMEN_CODE_RE = re.compile(r"\s+[DW]\s*$")
 
 _SIMULCAST_TITLE_RE = re.compile(
     r"\b(?:diretta\s+gol|diretta\s+goal|zona\s+gol|zona\s+serie\s*[ab]|zona\s+dazn|mosaico|red\s*zone)\b",
@@ -355,87 +345,87 @@ _GENERALIST_STUDIO_DESC_RE = re.compile(
     re.IGNORECASE,
 )
 _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}")
-_TENNIS_EXCLUDED_TOKENS: frozenset[str] = frozenset(
+_NON_TEAM_KEYWORDS: frozenset[str] = frozenset(
     {
-        "men", "women", "singles", "doubles", "singolare", "doppio", "live", "tour",
-        "2025", "2026", "2027", "masters", "finals", "open", "quarti", "semifinali",
-        "semifinal", "finale", "giornata", "sessione", "day", "night", "court",
-        "campo", "round", "turno", "match", "diretta", "tennis", "atp", "wta",
+        "gara", "gp", "gran premio", "finale", "semifinale", "quarti", "ottavi",
+        "giornata", "highlights", "sintesi", "diretta", "live", "speciale",
+        "studio", "prove libere", "qualifiche", "sprint", "warm up", "giorno",
+        "day", "round", "turno", "episodio", "stagione", "after party", "paddock",
+        "rubrica", "notiziario", "show", "review", "preview", "prepartita",
+        "postpartita", "conf stampa", "conferenza stampa",
     }
 )
-_KNOWN_TENNIS_CITIES: tuple[str, ...] = (
-    "roma", "rome", "parigi", "paris", "londra", "london", "wimbledon", "madrid",
-    "barcellona", "barcelona", "montecarlo", "monte carlo", "torino", "turin",
-    "milano", "milan", "miami", "indian wells", "cincinnati", "toronto", "montreal",
-    "new york", "melbourne", "sydney", "tokyo", "pechino", "beijing", "shanghai",
-    "wuhan", "doha", "dubai", "basilea", "basel", "vienna", "halle", "queens",
-    "eastbourne", "berlino", "berlin", "stuttgart", "rotterdam", "marsiglia",
-    "marseille", "malaga", "bologna", "riyadh",
+_SEQUENTIAL_SLOT_SIDE_RE = re.compile(
+    r"^(?:giorno|day|gara|game|match|round|turno|ep|episodio|stagione)\s*\d+$",
+    re.IGNORECASE,
 )
 
-_COUNTRY_TEAM_MAP: dict[str, str] = {
-    "norvegia": "Norway",
-    "portogallo": "Portugal",
-    "lituania": "Lithuania",
-    "azerbaigian": "Azerbaijan",
-    "spagna": "Spain",
-    "francia": "France",
-    "germania": "Germany",
-    "inghilterra": "England",
-    "italia": "Italy",
-    "olanda": "Netherlands",
-    "paesi bassi": "Netherlands",
-    "croazia": "Croatia",
-    "serbia": "Serbia",
-    "belgio": "Belgium",
-    "svizzera": "Switzerland",
-    "austria": "Austria",
-    "svezia": "Sweden",
-    "danimarca": "Denmark",
-    "polonia": "Poland",
-    "repubblica ceca": "Czechia",
-    "cechia": "Czechia",
-    "turchia": "Turkey",
-    "grecia": "Greece",
-    "brasile": "Brazil",
-    "argentina": "Argentina",
-    "stati uniti": "USA",
-    "ucraina": "Ukraine",
-    "irlanda": "Ireland",
-    "scozia": "Scotland",
-    "galles": "Wales",
-    "romania": "Romania",
-    "bulgaria": "Bulgaria",
-    "ungheria": "Hungary",
-    "slovacchia": "Slovakia",
-    "slovenia": "Slovenia",
-    "finlandia": "Finland",
-    "islanda": "Iceland",
-    "israele": "Israel",
-    "albania": "Albania",
-    "macedonia del nord": "North Macedonia",
-    "macedonia": "North Macedonia",
-    "bosnia": "Bosnia and Herzegovina",
-    "bosnia ed erzegovina": "Bosnia and Herzegovina",
-    "montenegro": "Montenegro",
-    "georgia": "Georgia",
-    "cipro": "Cyprus",
-    "malta": "Malta",
-    "armenia": "Armenia",
-    "moldavia": "Moldova",
-    "kazakistan": "Kazakhstan",
-    "lussemburgo": "Luxembourg",
-    "bielorussia": "Belarus",
-    "kosovo": "Kosovo",
-    "estonia": "Estonia",
-    "lettonia": "Latvia",
-    "far oer": "Faroe Islands",
-    "isole far oer": "Faroe Islands",
-    "gibilterra": "Gibraltar",
-    "liechtenstein": "Liechtenstein",
-    "san marino": "San Marino",
-    "andorra": "Andorra",
-}
+# Closed 6-category orphan allowlist & fallback silo matchers
+_CALCIO_ITA_HINT_RE = re.compile(
+    r"\b(?:serie\s*[abc]|coppa\s+italia|supercoppa\s+italiana|zona\s+dazn|zona\s+serie\s*[ab]|solocalcio)\b",
+    re.IGNORECASE,
+)
+_MOTORI_FALLBACK_RE = re.compile(
+    r"\b(?:formula\s*1|formula\s*2|formula\s*3|formula\s*e|f1|f2|f3|motogp|moto\s*2|moto\s*3|"
+    r"superbike|wsbk|sbk|wrc|indycar|nascar|wec|motori|automobilismo|motociclismo)\b",
+    re.IGNORECASE,
+)
+_TENNIS_FALLBACK_RE = re.compile(
+    r"\b(?:tennis|supertennis|atp|wta|challenger|wimbledon|roland\s+garros|us\s+open|"
+    r"australian\s+open|coppa\s+davis|davis\s+cup|bjk\s*cup|billie\s+jean\s+king|laver\s+cup|united\s+cup)\b",
+    re.IGNORECASE,
+)
+_BASKET_FALLBACK_RE = re.compile(
+    r"\b(?:basket|basketball|nba|wnba|eurolega|euroleague|eurocup|pallacanestro|fiba|lba)\b",
+    re.IGNORECASE,
+)
+_COMBAT_FALLBACK_RE = re.compile(
+    r"\b(?:ufc|mma|boxe|boxing|pugilato|wrestling|wwe|aew)\b",
+    re.IGNORECASE,
+)
+_VOLLEY_FALLBACK_RE = re.compile(
+    r"\b(?:volley|pallavolo|superlega|cev\s+champions\s+league)\b",
+    re.IGNORECASE,
+)
+_NFL_FALLBACK_RE = re.compile(
+    r"\b(?:nfl|red\s*zone|football\s+americano)\b",
+    re.IGNORECASE,
+)
+_HOCKEY_FALLBACK_RE = re.compile(r"\b(?:hockey|nhl)\b", re.IGNORECASE)
+_BASEBALL_FALLBACK_RE = re.compile(r"\b(?:baseball|mlb)\b", re.IGNORECASE)
+_RUGBY_FALLBACK_RE = re.compile(
+    r"\b(?:rugby|sei\s+nazioni|six\s+nations|nations\s+championship|urc|top\s*14)\b",
+    re.IGNORECASE,
+)
+_HANDBALL_FALLBACK_RE = re.compile(r"\b(?:pallamano|handball)\b", re.IGNORECASE)
+_ALTRI_SPORT_EXPLICIT_RE = re.compile(
+    r"\b(?:golf|ciclismo|cycling|sci|sport\s+invernali|biathlon|atletica|nuoto|tuffi|"
+    r"pattinaggio|equtv|ippica|padel|snooker|olimpiadi|vela)\b",
+    re.IGNORECASE,
+)
+_FOOTBALL_FALLBACK_RE = re.compile(
+    r"\b(?:calcio|football|soccer|champions\s+league|europa\s+league|conference\s+league|"
+    r"nations\s+league|premier\s+league|bundesliga|la\s*liga|ligue\s*1|diretta\s+gol)\b",
+    re.IGNORECASE,
+)
+_MOTORI_TRACK_SESSION_RE = re.compile(
+    r"\b(?:prove\s+libere(?:\s*[123])?|libere\s*[123]|free\s+practice(?:\s*[123])?|"
+    r"fp\s*[123]|qualifich[ei]|qualifying|quali|shootout|"
+    r"sprint(?:\s*(?:race|gara|qualifich[ei]|qualifying))?|gara|race|warm\s*up)\b",
+    re.IGNORECASE,
+)
+_GOLF_ORPHAN_RE = re.compile(
+    r"\b(?:golf|pga\s+tour|dp\s+world\s+tour|ryder\s+cup|liv\s+golf|lpga)\b",
+    re.IGNORECASE,
+)
+_PADEL_ORPHAN_RE = re.compile(r"\bpadel\b", re.IGNORECASE)
+_RECOGNIZED_NON_1V1_SPORT_RE = re.compile(
+    r"\b(?:ciclismo|cycling|giro\s+d['’]italia|tour\s+de\s+france|vuelta|"
+    r"sci|sport\s+invernali|biathlon|slalom|discesa\s+libera|super-?g|"
+    r"salto\s+con\s+gli\s+sci|snowboard|atletica|diamond\s+league|maratona|"
+    r"nuoto|tuffi|swimming|pattinaggio|skating|olimpiadi|olympics|giochi\s+olimpici)\b",
+    re.IGNORECASE,
+)
 
 _SKY_SLUG_COMP_MAP: dict[str, str] = {
     "serie-a": "Serie A",
@@ -520,6 +510,7 @@ _SKY_SLUG_COMP_MAP: dict[str, str] = {
     "golf-dp-world-tour": "DP World Tour",
     "ryder-cup": "Ryder Cup",
     "cev-champions-league-femminile": "CEV Champions League Femminile",
+    "cev-champions-league-f": "CEV Champions League Femminile",
     "fiba-qualificazioni-world-cup": "FIBA World Cup Qualifiers",
     "diretta-gol-champions-league": "UEFA Champions League",
     "diretta-gol-europa-and-conference-league": "UEFA Europa & Conference League",
@@ -632,75 +623,6 @@ def extract_competition_from_sky_url(content_url: str) -> Optional[str]:
     return None
 
 
-def _extract_competition_from_synopsis(synopsis: str) -> Optional[str]:
-    """Extract competition hint from EPG synopsis when title/URL lacks it."""
-    if not synopsis or not isinstance(synopsis, str):
-        return None
-    s = synopsis.strip()
-
-    m_ten = re.search(r"\b(WTA|ATP)\s*(\d{3,4})?\b", s, re.I)
-    if m_ten:
-        circ = m_ten.group(1).upper()
-        tier = m_ten.group(2)
-        all_cities = re.findall(r"\b(?:di|da)\s+([A-Z][a-z]+)", s)
-        city = ""
-        for c in all_cities:
-            if c not in (
-                "Tennis", "Diretta", "Giappone", "Austria", "Francia",
-                "Spagna", "Italia", "Cina", "Germania",
-            ):
-                city = c
-                break
-        if not city:
-            s_low = s.lower()
-            for kc in _KNOWN_TENNIS_CITIES:
-                if re.search(rf"\b{re.escape(kc)}\b", s_low):
-                    city = kc.title()
-                    break
-        if tier and city:
-            return f"{circ} {tier} {city}"
-        if tier:
-            return f"{circ} {tier}"
-        if city:
-            return f"{circ} {city}"
-        return circ
-
-    m_slam = re.search(
-        r"\b(Wimbledon|Roland Garros|US Open|Australian Open|Coppa Davis|BJK Cup)\b",
-        s,
-        re.I,
-    )
-    if m_slam:
-        return m_slam.group(1)
-
-    m_gp = re.search(
-        r"\b(?:Gran Premio|GP)\s+(?:del\s+|della\s+|di\s+)?([A-Za-z\s]+?)"
-        r"(?:\s+di\s+(?:F1|Formula\s*1|MotoGP)|\s*[,.]|$)",
-        s,
-        re.I,
-    )
-    if m_gp and any(k in s.lower() for k in ("f1", "formula 1", "motogp")):
-        sport = "Formula 1" if ("f1" in s.lower() or "formula" in s.lower()) else "MotoGP"
-        return f"{sport}: GP {m_gp.group(1).strip()}"
-
-    m_league = re.search(
-        r"\b(Serie A|Serie B|Serie C|Premier League|Bundesliga|UEFA Champions League|"
-        r"Champions League|UEFA Europa League|Europa League|Conference League|Coppa Italia|"
-        r"Eurolega|Eurocup|Superlega)\b",
-        s,
-        re.I,
-    )
-    if m_league:
-        l_name = m_league.group(1).title()
-        if "Champions League" in l_name:
-            return "UEFA Champions League"
-        if "Europa League" in l_name:
-            return "UEFA Europa League"
-        return l_name
-
-    return None
-
-
 def _extract_sky_poster_url(content: dict[str, Any]) -> str:
     """Extract valid 16:9 Sky poster URL (`scene_key_art` -> `scene`), dropping 403/400 placeholders."""
     images_map = content.get("imagesMap")
@@ -725,30 +647,6 @@ def _extract_sky_poster_url(content: dict[str, Any]) -> str:
     return f"https://guidatv.sky.it{chosen}" if chosen.startswith("/") else chosen
 
 
-def _passes_epg_program_guards(
-    *,
-    is_generalist: bool,
-    title: str,
-    description: str,
-    start_ms: int,
-    end_ms: int,
-    competition_hint: str = "",
-) -> bool:
-    """Apply shared generalist duration/studio and episodic documentary guards."""
-    if _EPISODIC_SERIES_RE.search(f"{title} {description}"):
-        return False
-    if is_generalist:
-        duration_min = (end_ms - start_ms) / 60000.0
-        if 0 < duration_min < 25:
-            return False
-        if description and _GENERALIST_STUDIO_DESC_RE.search(_strip_accents(description)):
-            return False
-        combined_hint = _strip_accents(f"{title} {competition_hint}")
-        if not _SPORTS_EVENT_HINT_RE.search(combined_hint) and not _SIMULCAST_TITLE_RE.search(combined_hint):
-            return False
-    return True
-
-
 def _merge_and_handover_channel_blocks(programs: list[EPGProgram]) -> list[EPGProgram]:
     """Merge contiguous non-1v1 blocks on the same channel and clamp overlapping end_ms."""
     if not programs:
@@ -765,8 +663,8 @@ def _merge_and_handover_channel_blocks(programs: list[EPGProgram]) -> list[EPGPr
         for curr in ordered:
             if merged:
                 prev = merged[-1]
-                _, prev_home, prev_away = _extract_epg_teams(prev.title)
-                _, curr_home, curr_away = _extract_epg_teams(curr.title)
+                _, prev_home, prev_away = _extract_epg_teams(prev.title, prev.content_title)
+                _, curr_home, curr_away = _extract_epg_teams(curr.title, curr.content_title)
                 is_1v1_pair = bool(prev_home and prev_away) or bool(curr_home and curr_away)
                 if (
                     not is_1v1_pair
@@ -812,56 +710,48 @@ def _merge_and_handover_channel_blocks(programs: list[EPGProgram]) -> list[EPGPr
     return result
 
 
-def _translate_country_team(name: str) -> str:
-    clean = _strip_accents(name or "").strip().lower()
-    return _COUNTRY_TEAM_MAP.get(clean, "")
-
-
 def _is_tennis_doubles(text: str) -> bool:
     return bool(re.search(r"\b(?:doubles?|doppi[oa]?)\b", text or "", re.IGNORECASE))
 
 
-def _extract_tennis_circuit_and_city(text: str) -> tuple[Optional[str], Optional[str]]:
-    """Extract tennis circuit (`atp`, `wta`, `challenger`, `slam`) and city from text."""
+def _extract_tennis_circuit(text: str) -> Optional[str]:
+    """Extract normalized tennis circuit identifier (`atp`, `wta`, `challenger`, `slam`, `davis`, `bjk`)."""
     t = _strip_accents((text or "").lower())
-    circuit: Optional[str] = None
     if re.search(r"\b(?:wta|wta\s*1000|wta\s*500|wta\s*250|wta\s*125)\b", t):
-        circuit = "wta"
-    elif re.search(r"\bchallenger\b", t):
-        circuit = "challenger"
-    elif re.search(r"\b(?:wimbledon|roland\s*garros|us\s*open|australian\s*open)\b", t):
-        circuit = "slam"
-    elif re.search(r"\b(?:atp|masters\s*1000|atp\s*500|atp\s*250|atp\s*finals|masters)\b", t):
-        circuit = "atp"
+        return "wta"
+    if re.search(r"\bchallenger\b", t):
+        return "challenger"
+    if re.search(r"\b(?:wimbledon|roland\s*garros|us\s*open|australian\s*open)\b", t):
+        return "slam"
+    if re.search(r"\b(?:coppa\s+davis|davis\s+cup)\b", t):
+        return "davis"
+    if re.search(r"\b(?:bjk\s*cup|billie\s+jean\s+king)\b", t):
+        return "bjk"
+    if re.search(r"\b(?:atp|masters\s*1000|atp\s*500|atp\s*250|atp\s*finals|masters)\b", t):
+        return "atp"
+    return None
 
-    city: Optional[str] = None
-    m_city = re.search(r"(?:atp|wta|challenger)[^:]*?:\s*([a-z]+)", t)
-    if m_city and m_city.group(1).strip() not in _TENNIS_EXCLUDED_TOKENS:
-        city = m_city.group(1).strip()
 
-    if not city:
-        m_city2 = re.search(
-            r"\b(?:atp|wta|challenger)(?:\s+(?:masters|finals|\d{3,4}|series|tour|singles|doubles|doppio|singolare|men|women|uomini|donne))*\s+([a-z]+)",
-            t,
-        )
-        if m_city2 and m_city2.group(1).strip() not in _TENNIS_EXCLUDED_TOKENS:
-            city = m_city2.group(1).strip()
+def _tennis_match_tokens(match: Match) -> set[str]:
+    """Extract dynamic active tournament/city tokens directly from a Diretta tennis `Match`."""
+    tokens = extract_tennis_cities(match.competition, match.alt_league)
+    header = _strip_accents(f"{match.competition} {match.alt_league}").lower()
+    if "internazionali bnl" in header:
+        tokens.add("roma")
+    cleaned = {t for t in (_strip_accents(tok).lower().strip() for tok in tokens) if len(t) >= 3}
+    if "coppa davis" in cleaned:
+        cleaned.add("davis cup")
+    elif "davis cup" in cleaned:
+        cleaned.add("coppa davis")
+    return cleaned
 
-    if not city:
-        m_city3 = re.search(r"\b(?:di|da)\s+([a-z]+),\s*[a-z]+", t)
-        if m_city3 and m_city3.group(1).strip() not in _TENNIS_EXCLUDED_TOKENS:
-            city = m_city3.group(1).strip()
 
-    if not city:
-        for kc in _KNOWN_TENNIS_CITIES:
-            if re.search(rf"\b{re.escape(kc)}\b", t):
-                city = kc
-                break
-
-    if not city and "internazionali bnl" in t:
-        city = "roma"
-
-    return circuit, city
+def _tennis_tournament_matches_text(match: Match, normalized_eval_low: str) -> bool:
+    """Return True if any active tournament/city token of `match` appears in `normalized_eval_low`."""
+    for tok in _tennis_match_tokens(match):
+        if re.search(rf"(?<!\w){re.escape(tok)}(?!\w)", normalized_eval_low):
+            return True
+    return False
 
 
 def _is_supertennis_program(epg: EPGProgram) -> bool:
@@ -928,6 +818,7 @@ def is_non_live_or_studio(
     *,
     epg_title: str = "",
     content_title: str = "",
+    content_url: str = "",
     season_number: Optional[int] = None,
     current_year: Optional[int] = None,
 ) -> bool:
@@ -935,12 +826,18 @@ def is_non_live_or_studio(
     ref_year = current_year if current_year is not None else datetime.now(timezone.utc).year
     if season_number is not None and season_number < ref_year:
         return True
+    if content_url and _NON_LIVE_URL_RE.search(content_url):
+        return True
     clean_title = _strip_accents((title or "").strip())
     if not clean_title:
         return True
     clean_epg = _strip_accents((epg_title or "").strip())
     clean_ct = _strip_accents((content_title or "").strip())
     clean_desc = _strip_accents((description or "").strip())
+    if _BARE_DATE_TITLE_RE.match(clean_title) and (
+        not clean_ct or _BARE_DATE_TITLE_RE.match(clean_ct)
+    ):
+        return True
     if _EPISODIC_SERIES_RE.search(f"{clean_title} {clean_epg} {clean_ct} {clean_desc}"):
         return True
     for candidate in (clean_title, clean_epg, clean_ct):
@@ -992,6 +889,8 @@ def is_out_of_calendar_tennis(
 
 def _normalize_simulcast_title(title: str) -> str:
     clean = _strip_accents((title or "").lower())
+    clean = _DATE_TOKEN_RE.sub(" ", clean)
+    clean = _STAG_EP_TOKEN_RE.sub(" ", clean)
     clean = _SIMULCAST_NOISE_RE.sub(" ", clean)
     clean = re.sub(r"[^\w\s]", " ", clean)
     return re.sub(r"\s+", " ", clean).strip()
@@ -1013,38 +912,82 @@ def _split_channel_names(channel_name: str) -> list[str]:
 def _are_simulcasts(a: EPGProgram, b: EPGProgram) -> bool:
     if abs(a.start_ms - b.start_ms) > _SIMULCAST_WINDOW_MS:
         return False
+    if a.channel_id and b.channel_id and a.channel_id == b.channel_id:
+        return False
 
-    hint_a = _strip_accents(a.sport_hint).lower().strip()
-    hint_b = _strip_accents(b.sport_hint).lower().strip()
-    if hint_a and hint_b and hint_a != hint_b:
-        if hint_a not in hint_b and hint_b not in hint_a:
+    silo_a = _infer_silo_from_epg(a)
+    silo_b = _infer_silo_from_epg(b)
+    if silo_a != silo_b:
+        football_family = {SportSilo.FOOTBALL, SportSilo.CALCIO_ITA}
+        if not ({silo_a, silo_b} <= football_family):
+            a_generic = silo_a == SportSilo.ALTRI_SPORT and _strip_accents(a.sport_hint or "").strip().lower() in {"", "altri", "intrattenimento"}
+            b_generic = silo_b == SportSilo.ALTRI_SPORT and _strip_accents(b.sport_hint or "").strip().lower() in {"", "altri", "intrattenimento"}
+            if not (a_generic or b_generic):
+                return False
+
+    if silo_a == SportSilo.MOTORI or silo_b == SportSilo.MOTORI:
+        a_txt = f"{a.competition_hint} {a.title} {a.content_title}"
+        b_txt = f"{b.competition_hint} {b.title} {b.content_title}"
+        ser_a, ser_b = _extract_motorsport_series(a_txt), _extract_motorsport_series(b_txt)
+        if ser_a and ser_b and ser_a != ser_b:
+            return False
+        sess_a, sess_b = _extract_motorsport_session(a_txt), _extract_motorsport_session(b_txt)
+        if sess_a and sess_b and sess_a != sess_b:
             return False
 
-    norm_a = _normalize_simulcast_title(a.title)
-    norm_b = _normalize_simulcast_title(b.title)
-    if not norm_a or not norm_b:
-        return False
-    if norm_a == norm_b:
-        return True
+    if silo_a == SportSilo.TENNIS or silo_b == SportSilo.TENNIS:
+        a_ten = f"{a.title} {a.content_title} {a.description}"
+        b_ten = f"{b.title} {b.content_title} {b.description}"
+        if _is_tennis_doubles(a_ten) != _is_tennis_doubles(b_ten):
+            return False
 
-    min_len = min(len(norm_a), len(norm_b))
-    if min_len < 6:
+    sim_a = a.is_simulcast or _is_simulcast_title(a.title) or _is_simulcast_title(a.content_title)
+    sim_b = b.is_simulcast or _is_simulcast_title(b.title) or _is_simulcast_title(b.content_title)
+    if sim_a != sim_b:
         return False
 
-    sort_score = fuzz.token_sort_ratio(norm_a, norm_b)
-    if sort_score >= 86:
-        return True
-    if min_len >= 10 and fuzz.token_set_ratio(norm_a, norm_b) >= 92:
-        return True
+    norms_a = {n for n in (_normalize_simulcast_title(a.title), _normalize_simulcast_title(a.content_title)) if n}
+    norms_b = {n for n in (_normalize_simulcast_title(b.title), _normalize_simulcast_title(b.content_title)) if n}
+    if not norms_a or not norms_b:
+        return False
+
+    if sim_a and sim_b:
+        comp_a = _strip_accents(a.competition_hint or "").strip().lower()
+        comp_b = _strip_accents(b.competition_hint or "").strip().lower()
+        if comp_a and comp_b and comp_a == comp_b:
+            return True
+        for na in norms_a:
+            for nb in norms_b:
+                if na == nb:
+                    return True
+                if min(len(na), len(nb)) >= 6 and fuzz.token_sort_ratio(na, nb) >= 80:
+                    return True
+        return False
+
+    for na in norms_a:
+        for nb in norms_b:
+            if na == nb:
+                return True
+            if min(len(na), len(nb)) >= 6 and fuzz.token_sort_ratio(na, nb) >= 86:
+                return True
     return False
 
 
 def deduplicate_simulcasts(programs: list[EPGProgram]) -> list[EPGProgram]:
-    """Merge identical broadcasts across channels within 30m, expanding window and channels."""
+    """Merge identical broadcasts across channels within 45m, expanding window and channels."""
     if not programs:
         return []
 
-    ordered = sorted(programs, key=lambda p: (p.start_ms, p.source != "sky", p.channel_name))
+    ordered = sorted(
+        programs,
+        key=lambda p: (
+            p.start_ms,
+            not p.is_live,
+            not p.is_dedicated_sports,
+            p.source != "sky",
+            p.channel_name,
+        ),
+    )
     groups: list[list[EPGProgram]] = []
 
     for prog in ordered:
@@ -1117,67 +1060,81 @@ def _slugify(text: str, max_len: int = 48) -> str:
     return slug or "event"
 
 
-def _infer_silo_from_epg(epg: EPGProgram) -> SportSilo:
-    combined = _strip_accents(
-        f"{epg.competition_hint} {epg.sport_hint} {epg.category} {epg.channel_name} {epg.title}"
-    ).lower()
+_SUBGENRE_SILO_MAP: dict[str, SportSilo] = {
+    "tennis": SportSilo.TENNIS,
+    "basket": SportSilo.BASKET,
+    "pallacanestro": SportSilo.BASKET,
+    "volley": SportSilo.VOLLEY,
+    "pallavolo": SportSilo.VOLLEY,
+    "motori": SportSilo.MOTORI,
+    "automobilismo": SportSilo.MOTORI,
+    "motociclismo": SportSilo.MOTORI,
+    "rugby": SportSilo.RUGBY,
+    "pugilato": SportSilo.COMBAT,
+    "boxe": SportSilo.COMBAT,
+    "mma": SportSilo.COMBAT,
+    "arti marziali": SportSilo.COMBAT,
+    "wrestling": SportSilo.COMBAT,
+    "combattimento": SportSilo.COMBAT,
+    "football americano": SportSilo.NFL,
+    "hockey": SportSilo.HOCKEY,
+    "hockey su ghiaccio": SportSilo.HOCKEY,
+    "baseball": SportSilo.BASEBALL,
+    "pallamano": SportSilo.HANDBALL,
+    "handball": SportSilo.HANDBALL,
+    "golf": SportSilo.ALTRI_SPORT,
+    "ciclismo": SportSilo.ALTRI_SPORT,
+    "sport invernali": SportSilo.ALTRI_SPORT,
+    "sci": SportSilo.ALTRI_SPORT,
+    "atletica": SportSilo.ALTRI_SPORT,
+    "nuoto": SportSilo.ALTRI_SPORT,
+    "vela": SportSilo.ALTRI_SPORT,
+    "ippica": SportSilo.ALTRI_SPORT,
+    "padel": SportSilo.ALTRI_SPORT,
+    "snooker": SportSilo.ALTRI_SPORT,
+    "olimpiadi": SportSilo.ALTRI_SPORT,
+    "pattinaggio": SportSilo.ALTRI_SPORT,
+}
 
-    if any(k in combined for k in ("formula 1", "f1", "motogp", "moto 2", "moto 3", "superbike", "motori", "automobilismo", "motociclismo")):
+
+def _infer_silo_from_epg(epg: EPGProgram) -> SportSilo:
+    sh = _strip_accents(epg.sport_hint or "").strip().lower()
+    if sh == "calcio":
+        ita_text = _strip_accents(f"{epg.competition_hint} {epg.title} {epg.content_title}")
+        return SportSilo.CALCIO_ITA if _CALCIO_ITA_HINT_RE.search(ita_text) else SportSilo.FOOTBALL
+    if sh in _SUBGENRE_SILO_MAP:
+        return _SUBGENRE_SILO_MAP[sh]
+
+    combined = _strip_accents(
+        f"{epg.competition_hint} {epg.title} {epg.content_title} {epg.channel_name}"
+    )
+    if _MOTORI_FALLBACK_RE.search(combined):
         return SportSilo.MOTORI
-    if any(k in combined for k in ("tennis", "supertennis", "atp", "wta", "wimbledon", "roland garros")):
+    if _TENNIS_FALLBACK_RE.search(combined):
         return SportSilo.TENNIS
-    if any(k in combined for k in ("basket", "nba", "wnba", "eurolega", "euroleague", "pallacanestro")):
+    if _BASKET_FALLBACK_RE.search(combined):
         return SportSilo.BASKET
-    if any(k in combined for k in ("ufc", "mma", "boxe", "boxing", "pugilato", "wrestling", "wwe", "aew")):
+    if _COMBAT_FALLBACK_RE.search(combined):
         return SportSilo.COMBAT
-    if any(k in combined for k in ("volley", "pallavolo", "superlega")):
+    if _VOLLEY_FALLBACK_RE.search(combined):
         return SportSilo.VOLLEY
-    if any(k in combined for k in ("nfl", "redzone", "red zone", "football americano")):
+    if _NFL_FALLBACK_RE.search(combined):
         return SportSilo.NFL
-    if any(k in combined for k in ("hockey", "nhl")):
+    if _HOCKEY_FALLBACK_RE.search(combined):
         return SportSilo.HOCKEY
-    if any(k in combined for k in ("baseball", "mlb")):
+    if _BASEBALL_FALLBACK_RE.search(combined):
         return SportSilo.BASEBALL
-    if any(k in combined for k in ("rugby", "sei nazioni", "six nations")):
+    if _RUGBY_FALLBACK_RE.search(combined):
         return SportSilo.RUGBY
-    if any(k in combined for k in ("pallamano", "handball")):
+    if _HANDBALL_FALLBACK_RE.search(combined):
         return SportSilo.HANDBALL
-    if any(k in combined for k in ("golf", "ciclismo", "cycling", "sci", "biathlon", "atletica", "ippica", "padel", "snooker", "olimpiadi")):
+    if _ALTRI_SPORT_EXPLICIT_RE.search(combined):
         return SportSilo.ALTRI_SPORT
-    if any(k in combined for k in ("serie a", "serie b", "serie c", "coppa italia", "zona dazn", "solocalcio")):
+    if _CALCIO_ITA_HINT_RE.search(combined):
         return SportSilo.CALCIO_ITA
-    if any(k in combined for k in ("calcio", "football", "soccer", "champions", "europa league", "conference league", "premier league", "bundesliga", "liga", "dazn")):
+    if _FOOTBALL_FALLBACK_RE.search(combined):
         return SportSilo.FOOTBALL
     return SportSilo.ALTRI_SPORT
-
-
-def _split_unspaced_hyphen(text: str) -> Optional[tuple[str, str]]:
-    """Split `TeamA-TeamB` on an unspaced hyphen unless it belongs to a known compound name."""
-    for idx, ch in enumerate(text):
-        if ch != "-" or idx == 0 or idx == len(text) - 1:
-            continue
-        if text[idx - 1].isspace() or text[idx + 1].isspace():
-            continue
-        left = text[:idx].strip()
-        right = text[idx + 1 :].strip()
-        m_left = re.search(r"([A-Za-zÀ-ÖØ-öø-ÿ0-9]+)$", left)
-        m_right = re.match(r"^([A-Za-zÀ-ÖØ-öø-ÿ0-9]+)", right)
-        if not m_left or not m_right:
-            continue
-        lw = m_left.group(1)
-        rw = m_right.group(1)
-        if len(lw) < 2 or len(rw) < 2:
-            continue
-        lw_low = _strip_accents(lw).lower()
-        rw_low = _strip_accents(rw).lower()
-        if rw.isdigit() or rw_low in {"off", "offs", "in", "out", "star", "stars"}:
-            continue
-        if lw_low in _COMPOUND_HYPHEN_PREFIXES:
-            continue
-        if f"{lw_low}-{rw_low}" in _KNOWN_COMPOUND_HYPHEN_WORDS:
-            continue
-        return left, right
-    return None
 
 
 def _strip_round_phase_suffixes(text: str) -> str:
@@ -1190,33 +1147,25 @@ def _strip_round_phase_suffixes(text: str) -> str:
     return cleaned
 
 
-def _normalize_motorsports_session(text: str) -> str:
-    """Map Italian/English motorsports session labels to their counterpart for matching."""
-    out = text
-    replacements = (
-        (r"\bprove\s+libere\s*([123])\b", r"FP\1"),
-        (r"\blibere\s*([123])\b", r"FP\1"),
-        (r"\bfree\s+practice\s*([123])\b", r"FP\1"),
-        (r"\bfp\s*([123])\b", r"Prove Libere \1"),
-        (r"\bprove\s+libere\b", "FP"),
-        (r"\bqualifiche\b", "Qualifying"),
-        (r"\bqualifying\b", "Qualifiche"),
-        (r"\bgara\b", "Race"),
-        (r"\brace\b", "Gara"),
-    )
-    for pattern, repl in replacements:
-        new_out = re.sub(pattern, repl, out, flags=re.IGNORECASE)
-        if new_out != out:
-            out = new_out
-            break
-    return out
+def _is_valid_team_side(side: str) -> bool:
+    norm = _strip_accents((side or "").strip())
+    if not norm or _BARE_DATE_TITLE_RE.match(norm):
+        return False
+    low = re.sub(r"[^\w\s]", " ", norm.lower())
+    low = re.sub(r"\s+", " ", low).strip()
+    if len(low) < 2 or low.isdigit():
+        return False
+    if low in _NON_TEAM_KEYWORDS or _SEQUENTIAL_SLOT_SIDE_RE.match(low):
+        return False
+    return True
 
 
-def _extract_epg_teams(title: str) -> tuple[str, str, str]:
-    """Return `(league_hint, home, away)` parsed from an EPG program title."""
-    cleaned = re.sub(r"\s*[\(\[]\s*(?:diretta|live)\s*[\)\]]\s*", " ", title or "", flags=re.IGNORECASE)
+def _parse_teams_from_text(raw: str) -> tuple[str, str, str]:
+    """Parse `(league_hint, home, away)` from a single title string without inventing 1v1 pairs."""
+    cleaned = re.sub(r"\s*[\(\[]\s*(?:diretta|live)\s*[\)\]]\s*", " ", raw or "", flags=re.IGNORECASE)
     cleaned = re.sub(r"^(?:diretta|live)\s*[:\-–]\s*", "", cleaned.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = _STAG_EP_TOKEN_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—:")
 
     league_hint = ""
     if ":" in cleaned:
@@ -1241,28 +1190,52 @@ def _extract_epg_teams(title: str) -> tuple[str, str, str]:
 
     cleaned = _strip_round_phase_suffixes(cleaned)
 
+    # Strip leading tournament + year prefix without colon (e.g. "CEV Champions League F 2026 Conegliano - Novara")
+    m_comp_pref = _COMP_YEAR_PREFIX_RE.match(cleaned)
+    if m_comp_pref and cleaned[m_comp_pref.end() :].strip():
+        comp_pref = m_comp_pref.group(0).strip()
+        league_hint = f"{league_hint} - {comp_pref}" if league_hint else comp_pref
+        cleaned = cleaned[m_comp_pref.end() :].strip()
+
     # Handle multiple `-` with a competition prefix: e.g. "Serie A - Inter - Juventus"
     dash_parts = [p.strip() for p in re.split(r"\s+[-–—]\s+", cleaned) if p.strip()]
     if len(dash_parts) >= 3:
-        comp_part = " - ".join(dash_parts[:-2])
-        league_hint = f"{league_hint} - {comp_part}" if league_hint else comp_part
-        return league_hint, dash_parts[-2], dash_parts[-1]
+        cand_h = _strip_round_phase_suffixes(dash_parts[-2])
+        cand_a = _strip_round_phase_suffixes(dash_parts[-1])
+        if _is_valid_team_side(cand_h) and _is_valid_team_side(cand_a):
+            comp_part = " - ".join(dash_parts[:-2])
+            league_hint = f"{league_hint} - {comp_part}" if league_hint else comp_part
+            return league_hint, cand_h, cand_a
+        return league_hint, cleaned.strip(), ""
 
     parts = _TEAM_SPLIT_RE.split(cleaned, maxsplit=1)
     if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-        return league_hint, _strip_round_phase_suffixes(parts[0]), _strip_round_phase_suffixes(parts[1])
-
-    unspaced = _split_unspaced_hyphen(cleaned)
-    if unspaced is not None:
-        return league_hint, _strip_round_phase_suffixes(unspaced[0]), _strip_round_phase_suffixes(unspaced[1])
+        left = _strip_round_phase_suffixes(parts[0])
+        right = _strip_round_phase_suffixes(parts[1])
+        if _is_valid_team_side(left) and _is_valid_team_side(right):
+            return league_hint, left, right
 
     return league_hint, cleaned.strip(), ""
 
 
-_ALTRI_SPORT_EXPLICIT_RE = re.compile(
-    r"\b(?:golf|ciclismo|cycling|sci|biathlon|atletica|equtv|ippica|padel|snooker)\b",
-    re.IGNORECASE,
-)
+def _extract_epg_teams(title: str, content_title: str = "") -> tuple[str, str, str]:
+    """Return `(league_hint, home, away)`, preferring structured `content_title` when 1v1."""
+    t_hint, t_h, t_a = _parse_teams_from_text(title)
+    if content_title and content_title.strip() != (title or "").strip():
+        ct_hint, ct_h, ct_a = _parse_teams_from_text(content_title)
+        if ct_h and ct_a:
+            return (ct_hint or t_hint), ct_h, ct_a
+    return t_hint, t_h, t_a
+
+
+def _extract_alt_epg_teams(epg: EPGProgram, primary_home: str, primary_away: str) -> tuple[str, str]:
+    """Return alternate 1v1 pair from `epg.title` when `content_title` supplied a distinct pair."""
+    if not epg.content_title or epg.content_title.strip() == (epg.title or "").strip():
+        return "", ""
+    _, t_h, t_a = _parse_teams_from_text(epg.title)
+    if t_h and t_a and (t_h != primary_home or t_a != primary_away):
+        return t_h, t_a
+    return "", ""
 
 
 def is_epg_match_compatible(epg: EPGProgram, match: Match) -> bool:
@@ -1274,9 +1247,52 @@ def is_epg_match_compatible(epg: EPGProgram, match: Match) -> bool:
     if epg_silo == SportSilo.ALTRI_SPORT:
         if match.silo == SportSilo.ALTRI_SPORT:
             return True
-        combined = _strip_accents(f"{epg.sport_hint} {epg.category} {epg.channel_name} {epg.title}")
+        combined = _strip_accents(f"{epg.sport_hint} {epg.category} {epg.channel_name} {epg.title} {epg.content_title}")
         return not bool(_ALTRI_SPORT_EXPLICIT_RE.search(combined))
     return epg_silo == match.silo
+
+
+def _detect_epg_demographics(epg: EPGProgram, match: Optional[Match] = None) -> tuple[bool, bool]:
+    """Detect `(is_women, is_youth)` across Phase A fields with U23 senior-league exception."""
+    m_url_comp = re.search(r"/(?:sport|programmi-tv)/([^/]+)/", epg.content_url or "")
+    url_comp_text = m_url_comp.group(1).replace("-", " ") if m_url_comp else ""
+    comp_w, comp_y = detect_demographics(f"{epg.competition_hint} {url_comp_text}")
+    title_w, title_y = detect_demographics_from_stream_title(
+        f"{epg.title} {epg.content_title} {epg.description}"
+    )
+    explicit_f_w = bool(
+        _COMP_WOMEN_F_RE.search(
+            _strip_accents(f"{epg.title} {epg.content_title} {epg.competition_hint}")
+        )
+    )
+    is_women = comp_w or title_w or explicit_f_w
+    is_youth = comp_y or title_y
+
+    if is_youth and match is not None and not match.is_youth and not comp_y:
+        m_teams = f"{match.home_team.name if match.home_team else ''} {match.away_team.name if match.away_team else ''}"
+        if _U23_BTEAM_RE.search(m_teams):
+            is_youth = False
+
+    return is_women, is_youth
+
+
+def _is_fta_topdown_candidate(epg: EPGProgram) -> bool:
+    """Return True if an FTA item with blank `programHighlights` may attach Top-Down onto Diretta."""
+    if epg.program_highlights != "":
+        return False
+    is_fta = epg.channel_id in SKY_FTA_CHANNEL_ID_SET or _is_generalist_channel(
+        epg.channel_name, epg.channel_id
+    )
+    if not is_fta:
+        return False
+    return not is_non_live_or_studio(
+        epg.title,
+        epg.description,
+        epg_title=epg.epg_title,
+        content_title=epg.content_title,
+        content_url=epg.content_url,
+        season_number=epg.season_number,
+    )
 
 
 def _competition_tiebreak_bonus(epg: EPGProgram, match: Match) -> float:
@@ -1295,9 +1311,24 @@ def _competition_tiebreak_bonus(epg: EPGProgram, match: Match) -> float:
 
 def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
     """Return match confidence score > 0 if `epg` represents `match`, else 0.0."""
+    fta_fallback = False
     if not epg.is_live:
+        if (
+            match.home_team is not None
+            and match.away_team is not None
+            and _is_fta_topdown_candidate(epg)
+        ):
+            fta_fallback = True
+        else:
+            return 0.0
+
+    if epg.is_simulcast or _is_simulcast_title(epg.title) or _is_simulcast_title(epg.content_title):
         return 0.0
-    if epg.is_simulcast or _is_simulcast_title(epg.title):
+    # Fast O(1) integer time-bounds guard before regex-based silo compatibility checks
+    raw_diff = match.date - epg.start_ms
+    if raw_diff < -_TENNIS_1V1_POST_MATCH_MS or (
+        raw_diff > _TENNIS_1V1_PRE_MATCH_MS and match.date > epg.end_ms + _LINEAR_POST_MATCH_MS
+    ):
         return 0.0
     if not is_epg_match_compatible(epg, match):
         return 0.0
@@ -1319,54 +1350,62 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
     time_diff = match.date - epg.start_ms  # positive when EPG starts before match kickoff
     in_asym_window = -post_ms <= time_diff <= pre_ms
     overlaps = (
-        epg.start_ms <= match.date <= (epg.end_ms + _LINEAR_POST_MATCH_MS)
+        not fta_fallback
+        and epg.start_ms <= match.date <= (epg.end_ms + _LINEAR_POST_MATCH_MS)
         and time_diff <= max(pre_ms, 90 * 60 * 1000)
     )
     if not in_asym_window and not overlaps:
         return 0.0
 
-    _, epg_home, epg_away = _extract_epg_teams(epg.title)
-    epg_women, epg_youth = detect_demographics_from_stream_title(epg.title)
+    _, epg_home, epg_away = _extract_epg_teams(epg.title, epg.content_title)
+    epg_women, epg_youth = _detect_epg_demographics(epg, match=match)
 
-    # Tennis Singles vs Doubles guard + Tournament Session Bridge
+    # Tennis Singles vs Doubles guard + Dynamic Tournament Session Bridge
     if match.silo == SportSilo.TENNIS:
         m_eval = f"{match.competition} {match.alt_league} {match.title}"
-        ep_eval = f"{epg.competition_hint} {epg.title} {epg.description}"
+        ep_eval = f"{epg.competition_hint} {epg.title} {epg.content_title} {epg.description}"
         if _is_tennis_doubles(m_eval) != _is_tennis_doubles(ep_eval):
             return 0.0
         if not epg_away:
             # SuperTennis Guard: never bridge generic SuperTennis sessions to 1v1 matches
             if _is_supertennis_program(epg):
                 return 0.0
-            if is_non_live_or_studio(epg.title, epg.description):
+            if is_non_live_or_studio(
+                epg.title,
+                epg.description,
+                epg_title=epg.epg_title,
+                content_title=epg.content_title,
+                content_url=epg.content_url,
+                season_number=epg.season_number,
+            ):
                 return 0.0
-            m_circ, m_city = _extract_tennis_circuit_and_city(m_eval)
-            ep_circ, ep_city = _extract_tennis_circuit_and_city(ep_eval)
+            m_circ = _extract_tennis_circuit(m_eval)
+            ep_circ = _extract_tennis_circuit(ep_eval)
             circ_ok = (m_circ == ep_circ) if (m_circ and ep_circ) else True
-            city_ok = bool(
-                m_city
-                and ep_city
-                and (
-                    m_city == ep_city
-                    or m_city in ep_eval.lower()
-                    or ep_city in m_eval.lower()
-                )
-            )
-            if circ_ok and city_ok:
+            ep_eval_low = re.sub(r"\s+", " ", _strip_accents(ep_eval).lower()).strip()
+            if circ_ok and _tennis_tournament_matches_text(match, ep_eval_low):
                 return 0.85 + _competition_tiebreak_bonus(epg, match)
             return 0.0
 
     # Pairwise team/athlete match
     if match.home_team and match.away_team and epg_home and epg_away:
-        alt_h2 = _translate_country_team(epg_home)
-        alt_a2 = _translate_country_team(epg_away)
+        m_home = match.home_team.name
+        m_away = match.away_team.name
+        m_alt_home = match.alt_home
+        m_alt_away = match.alt_away
+        if match.is_women:
+            m_home = _TRAILING_WOMEN_CODE_RE.sub("", m_home).strip()
+            m_away = _TRAILING_WOMEN_CODE_RE.sub("", m_away).strip()
+            m_alt_home = _TRAILING_WOMEN_CODE_RE.sub("", m_alt_home).strip()
+            m_alt_away = _TRAILING_WOMEN_CODE_RE.sub("", m_alt_away).strip()
+        alt_h2, alt_a2 = _extract_alt_epg_teams(epg, epg_home, epg_away)
         res = DEFAULT_TEAM_MATCHER.match_score(
-            match.home_team.name,
-            match.away_team.name,
+            m_home,
+            m_away,
             epg_home,
             epg_away,
-            alt_home_1=match.alt_home,
-            alt_away_1=match.alt_away,
+            alt_home_1=m_alt_home,
+            alt_away_1=m_alt_away,
             alt_home_2=alt_h2,
             alt_away_2=alt_a2,
             date_1_ms=match.date,
@@ -1380,10 +1419,10 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
 
     # Single-entity events (e.g. F1 / MotoGP / Boxing cards)
     if match.away_team is None and match.home_team is not None:
-        epg_single = epg.title if not epg_away else f"{epg_home} {epg_away}"
+        epg_single = (epg.content_title or epg.title) if not epg_away else f"{epg_home} {epg_away}"
         alt_epg = (
-            _normalize_motorsports_session(epg_single)
-            if match.silo == SportSilo.MOTORI
+            epg.title
+            if (not epg_away and epg.content_title and epg.content_title != epg.title)
             else ""
         )
         res = DEFAULT_TEAM_MATCHER.match_score(
@@ -1392,13 +1431,16 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
             epg_single,
             "",
             alt_home_1=match.alt_home or match.competition,
-            alt_home_2=alt_epg if alt_epg != epg_single else "",
+            alt_home_2=alt_epg,
             date_1_ms=match.date,
             date_2_ms=epg.start_ms if in_asym_window else 0,
             is_women_1=match.is_women,
             is_youth_1=match.is_youth,
             is_women_2=epg_women,
             is_youth_2=epg_youth,
+            silo=match.silo.value,
+            competition_1=match.competition,
+            competition_2=epg.competition_hint,
         )
         return (res.score + _competition_tiebreak_bonus(epg, match)) if res.matched else 0.0
 
@@ -1416,95 +1458,138 @@ def _merge_broadcasters(existing: list[str], additions: list[str]) -> list[str]:
     return merged
 
 
-def _is_allowlisted_orphan(epg: EPGProgram) -> bool:
-    """Strict Orphan Allowlist: admit only certified live simulcasts or legitimate non-1v1 live events."""
+def _is_allowlisted_orphan(
+    epg: EPGProgram,
+    diretta_tennis_matches: Optional[list[Match]] = None,
+) -> bool:
+    """Closed 6-category orphan allowlist: multicast, motori track, tennis multicourt, golf, padel, non-1v1 sports."""
     if not epg.is_live:
         return False
-    if _EPISODIC_SERIES_RE.search(f"{epg.title} {epg.description}"):
+    if is_non_live_or_studio(
+        epg.title,
+        epg.description,
+        epg_title=epg.epg_title,
+        content_title=epg.content_title,
+        content_url=epg.content_url,
+        season_number=epg.season_number,
+    ):
         return False
 
-    is_sim = epg.is_simulcast or _is_simulcast_title(epg.title)
     ch_names = _split_channel_names(epg.channel_name)
     all_generalist = bool(ch_names) and all(
         _is_generalist_channel(ch, epg.channel_id) for ch in ch_names
     )
-
     if all_generalist:
-        if is_non_live_or_studio(epg.title, epg.description):
+        duration_min = (epg.end_ms - epg.start_ms) / 60000.0 if epg.end_ms > epg.start_ms else 0.0
+        if 0 < duration_min < 25:
             return False
-        if not _passes_epg_program_guards(
-            is_generalist=True,
-            title=epg.title,
-            description=epg.description,
-            start_ms=epg.start_ms,
-            end_ms=epg.end_ms,
-            competition_hint=epg.competition_hint,
-        ):
+        if epg.description and _GENERALIST_STUDIO_DESC_RE.search(_strip_accents(epg.description)):
             return False
 
-    if is_sim:
+    # Category 1: Multicast / Simulcast containers (Diretta Gol, Zona DAZN, RedZone, Mosaico)
+    if epg.is_simulcast or _is_simulcast_title(epg.title) or _is_simulcast_title(epg.content_title):
         return True
 
-    title_norm = _strip_accents(epg.title or "")
-    if _HARD_NON_LIVE_TITLE_RE.search(title_norm):
+    # Strictly zero 1v1 orphan cards across Categories 2-6
+    _, _, epg_away = _extract_epg_teams(epg.title, epg.content_title)
+    if epg_away:
         return False
-    if is_non_live_or_studio(epg.title, epg.description):
-        has_explicit_live = bool(re.search(r"\b(?:live|diretta)\b", title_norm, re.I))
-        if all_generalist or not has_explicit_live:
-            return False
 
     silo = _infer_silo_from_epg(epg)
-    if silo in (
-        SportSilo.MOTORI,
-        SportSilo.TENNIS,
-        SportSilo.BASKET,
-        SportSilo.VOLLEY,
-        SportSilo.RUGBY,
-        SportSilo.COMBAT,
-        SportSilo.NFL,
-        SportSilo.HOCKEY,
-        SportSilo.BASEBALL,
-        SportSilo.HANDBALL,
-        SportSilo.ALTRI_SPORT,
-    ):
+    eval_text = _strip_accents(
+        f"{epg.sport_hint} {epg.competition_hint} {epg.title} {epg.content_title} {epg.content_url}"
+    )
+
+    # Category 2: Motori live track sessions (prove libere / FP1-3, qualifiche, sprint, gara, warm up)
+    if silo == SportSilo.MOTORI:
+        track_text = _strip_accents(f"{epg.title} {epg.content_title}")
+        return bool(_MOTORI_TRACK_SESSION_RE.search(track_text))
+
+    # Category 3: Tennis multicourt without 1v1 teams (active Diretta tournament + anti-replay >3.5h)
+    if silo == SportSilo.TENNIS:
+        if not diretta_tennis_matches:
+            return False
+        eval_low = re.sub(r"\s+", " ", eval_text.lower()).strip()
+        matching_tournaments = [
+            m for m in diretta_tennis_matches if _tennis_tournament_matches_text(m, eval_low)
+        ]
+        if not matching_tournaments:
+            return False
+        anti_replay_floor = epg.start_ms - _ROLLING_CACHE_WINDOW_MS
+        return any(
+            m.date >= anti_replay_floor
+            or (m.end_date > 0 and m.end_date >= anti_replay_floor)
+            for m in matching_tournaments
+        )
+
+    # Category 4: Golf live
+    if _GOLF_ORPHAN_RE.search(f"{eval_text} {epg.channel_name}"):
         return True
 
-    # Football / Calcio ITA non-simulcast: require dedicated sports channel and live/competition/1v1 signal
-    if all_generalist:
-        return False
-    _, _, epg_away = _extract_epg_teams(epg.title)
-    return bool(
-        epg_away
-        or epg.competition_hint
-        or re.search(r"\b(?:live|diretta)\b", title_norm, re.I)
-    )
+    # Category 5: Padel live
+    if _PADEL_ORPHAN_RE.search(eval_text):
+        return True
+
+    # Category 6: Recognized non-1v1 sports (Cycling, Skiing/Winter, Athletics, Swimming, Skating, Olympics)
+    if _RECOGNIZED_NON_1V1_SPORT_RE.search(eval_text):
+        return True
+
+    return False
 
 
 def reconcile_with_schedule(
     diretta_matches: list[Match],
     epg_programs: list[EPGProgram],
 ) -> tuple[list[Match], list[Match]]:
-    """Enrich `diretta_matches` with EPG broadcasters and build allowlisted orphan EPG `Match` objects."""
+    """Enrich `diretta_matches` with EPG broadcasters and build closed-allowlist orphan `Match` objects."""
     broadcaster_updates: dict[int, list[str]] = {
         idx: list(m.broadcasters) for idx, m in enumerate(diretta_matches)
     }
     end_date_updates: dict[int, int] = {
         idx: m.end_date for idx, m in enumerate(diretta_matches)
     }
+    football_family = (SportSilo.FOOTBALL, SportSilo.CALCIO_ITA)
+    diretta_by_silo: dict[SportSilo, list[tuple[int, Match]]] = {}
+    for idx, m in enumerate(diretta_matches):
+        diretta_by_silo.setdefault(m.silo, []).append((idx, m))
+    all_indexed: list[tuple[int, Match]] = list(enumerate(diretta_matches))
+    football_indexed = [
+        *diretta_by_silo.get(SportSilo.FOOTBALL, []),
+        *diretta_by_silo.get(SportSilo.CALCIO_ITA, []),
+    ]
+    diretta_tennis_matches = [m for _, m in diretta_by_silo.get(SportSilo.TENNIS, [])]
+
     orphan_matches: list[Match] = []
     seen_orphan_ids: set[str] = set()
     discarded_orphans = 0
 
     for epg in epg_programs:
         epg_channels = _split_channel_names(epg.channel_name)
+        is_sim = epg.is_simulcast or _is_simulcast_title(epg.title) or _is_simulcast_title(epg.content_title)
         best_idx: Optional[int] = None
         best_score = 0.0
 
-        for idx, match in enumerate(diretta_matches):
-            score = _epg_matches_diretta(epg, match)
-            if score > best_score:
-                best_score = score
-                best_idx = idx
+        if not is_sim and (epg.is_live or _is_fta_topdown_candidate(epg)):
+            epg_silo = _infer_silo_from_epg(epg)
+            if epg_silo in football_family:
+                candidates = football_indexed
+            elif epg_silo == SportSilo.ALTRI_SPORT:
+                combined_altri = _strip_accents(
+                    f"{epg.sport_hint} {epg.category} {epg.channel_name} {epg.title} {epg.content_title}"
+                )
+                candidates = (
+                    diretta_by_silo.get(SportSilo.ALTRI_SPORT, [])
+                    if _ALTRI_SPORT_EXPLICIT_RE.search(combined_altri)
+                    else all_indexed
+                )
+            else:
+                candidates = diretta_by_silo.get(epg_silo, [])
+
+            for idx, match in candidates:
+                score = _epg_matches_diretta(epg, match)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
 
         if best_idx is not None:
             broadcaster_updates[best_idx] = _merge_broadcasters(
@@ -1516,19 +1601,15 @@ def reconcile_with_schedule(
                     end_date_updates[best_idx] = target_end
             continue
 
-        if not _is_allowlisted_orphan(epg):
+        if not _is_allowlisted_orphan(epg, diretta_tennis_matches=diretta_tennis_matches):
             discarded_orphans += 1
             continue
 
-        # Build candidate orphan EPG Match for allowlisted live sports programs.
+        # Build candidate orphan EPG Match for closed-allowlist live non-1v1 programs.
         silo = _infer_silo_from_epg(epg)
-        league_hint, home_name, away_name = _extract_epg_teams(epg.title)
+        league_hint, home_name, away_name = _extract_epg_teams(epg.title, epg.content_title)
         comp_text = epg.competition_hint or league_hint or epg.sport_hint or epg.category
-        is_women, is_youth = detect_demographics(comp_text)
-        if not is_women or not is_youth:
-            title_w, title_y = detect_demographics_from_stream_title(epg.title)
-            is_women = is_women or title_w
-            is_youth = is_youth or title_y
+        is_women, is_youth = _detect_epg_demographics(epg)
 
         category, genres = DEFAULT_GENRE_CLASSIFIER.classify_event(
             silo=silo.value,
@@ -1590,14 +1671,6 @@ def filter_ghost_epg_matches(matches: list[Match]) -> list[Match]:
     return [m for m in matches if m.source_origin != "epg" or bool(m.sources)]
 
 
-_GENERIC_CONTAINER_KEYWORDS: tuple[str, ...] = (
-    "diretta gol", "zona gol", "zona dazn", "zona serie a", "zona serie b",
-    "studio", "speciale", "mondo gol", "magazine", "highlights", "tg24",
-    "sport24", "rubrica", "calcio show", "sky calcio club", "tutto il calcio",
-    "linea notte", "anteprima", "l'originale",
-)
-
-
 def filter_conflicting_italian_channels(
     matches: list[Match],
     epg_programs: list[EPGProgram],
@@ -1656,8 +1729,20 @@ def filter_conflicting_italian_channels(
                     continue
 
                 has_any_epg = True
-                ep_low = (ep.title or "").lower()
-                if ep.is_simulcast or any(k in ep_low for k in _GENERIC_CONTAINER_KEYWORDS):
+                is_container_or_studio = (
+                    ep.is_simulcast
+                    or _is_simulcast_title(ep.title)
+                    or _is_simulcast_title(ep.content_title)
+                    or is_non_live_or_studio(
+                        ep.title,
+                        ep.description,
+                        epg_title=ep.epg_title,
+                        content_title=ep.content_title,
+                        content_url=ep.content_url,
+                        season_number=ep.season_number,
+                    )
+                )
+                if is_container_or_studio:
                     if canon in ("dazn 1", "dazn 2", "dazn 3", "dazn 4") and not _is_simulcast_title(m.title):
                         conflicting_ep = conflicting_ep or ep
                         continue
@@ -1668,12 +1753,16 @@ def filter_conflicting_italian_channels(
                     has_match_or_ambiguous = True
                     break
 
-                ep_clean = _normalize_simulcast_title(ep.title)
-                ep_tokens = {t for t in ep_clean.split() if len(t) >= 3}
+                ep_clean = _normalize_simulcast_title(ep.content_title or ep.title)
+                ep_clean_alt = _normalize_simulcast_title(ep.title) if ep.content_title else ""
+                ep_tokens = {t for t in f"{ep_clean} {ep_clean_alt}".split() if len(t) >= 3}
                 if m_tokens & ep_tokens:
                     has_match_or_ambiguous = True
                     break
-                if m_title_clean and ep_clean and fuzz.token_set_ratio(m_title_clean, ep_clean) >= 55:
+                if m_title_clean and (
+                    (ep_clean and fuzz.token_set_ratio(m_title_clean, ep_clean) >= 55)
+                    or (ep_clean_alt and fuzz.token_set_ratio(m_title_clean, ep_clean_alt) >= 55)
+                ):
                     has_match_or_ambiguous = True
                     break
 
@@ -1789,6 +1878,7 @@ class ItalianEPGService:
             description,
             epg_title=epg_title,
             content_title=content_title,
+            content_url=content_url,
             season_number=season_number,
             current_year=current_year,
         ):
@@ -1932,11 +2022,7 @@ class ItalianEPGService:
                     season_number = int(raw_season.strip())
 
                 is_dedicated_sports = ch_id in SKY_SPORTS_CHANNEL_IDS
-                competition_hint = (
-                    extract_competition_from_sky_url(content_url)
-                    or _extract_competition_from_synopsis(description)
-                    or ""
-                )
+                competition_hint = extract_competition_from_sky_url(content_url) or ""
                 is_live = self._compute_sky_is_live(
                     channel_id=ch_id,
                     title=title,
@@ -1971,7 +2057,7 @@ class ItalianEPGService:
                         competition_hint=competition_hint,
                         poster_url=poster_url,
                         is_live=is_live,
-                        is_simulcast=_is_simulcast_title(title),
+                        is_simulcast=_is_simulcast_title(title) or _is_simulcast_title(content_title),
                         source="sky",
                     )
                 )
@@ -2232,6 +2318,7 @@ class ItalianEPGService:
                 prog.description,
                 epg_title=prog.epg_title,
                 content_title=prog.content_title,
+                content_url=prog.content_url,
                 season_number=prog.season_number,
                 current_year=ref_now.year,
             ):

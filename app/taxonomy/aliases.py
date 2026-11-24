@@ -79,6 +79,7 @@ STOPWORDS: frozenset[str] = frozenset(
         "albion",
         "bc",
         "basket",
+        "basketball",
         "pallacanestro",
         "volley",
         "ssd",

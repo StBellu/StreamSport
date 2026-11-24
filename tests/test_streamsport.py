@@ -268,20 +268,22 @@ async def test_pipeline_scheduler_run_once_and_poster_cleanup(tmp_path: Path) ->
         id="sky_1",
         channel_id="sky_sport_uno",
         channel_name="Sky Sport Uno",
-        title="Speciale Calcio Live",
+        title="Diretta Gol Serie A",
         start_ms=now_ms - 5 * 60_000,
         end_ms=now_ms + 90 * 60_000,
         sport_hint="calcio",
+        is_simulcast=True,
         source="sky",
     )
     epg_ghost = EPGProgram(
         id="sky_2",
-        channel_id="sky_ghost_ch",
+        channel_id="canale-fantasma",
         channel_name="Canale Fantasma",
-        title="Evento Senza Flussi",
+        title="Diretta Gol Serie B",
         start_ms=now_ms - 5 * 60_000,
         end_ms=now_ms + 90 * 60_000,
         sport_hint="calcio",
+        is_simulcast=True,
         source="sky",
     )
 
