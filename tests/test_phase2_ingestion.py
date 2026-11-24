@@ -325,57 +325,71 @@ def test_simulcast_deduplication_and_reconciliation() -> None:
 
 @pytest.mark.asyncio
 async def test_italian_epg_service_toggles_and_sky_clamp_query() -> None:
+    from app.ingestion import SKY_FTA_CHANNEL_IDS, SKY_PAY_CHANNEL_IDS
+
     seen_urls: list[str] = []
     now = datetime(2026, 11, 22, 18, 0, 0, tzinfo=timezone.utc)
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         seen_urls.append(url)
+        ch_list = request.url.params.get("channels", "").split(",")
         if "apid.sky.it" in url and "from=2026-11-22T15:00:00Z" in url:
-            return httpx.Response(
-                200,
-                json={
-                    "events": [
-                        {
-                            "eventId": "101",
-                            "starttime": "2026-11-22T19:00:00Z",
-                            "endtime": "2026-11-22T21:00:00Z",
-                            "eventTitle": "Serie A: Roma - Napoli",
-                            "eventSynopsis": "Telecronaca diretta",
-                            "channel": {"id": 9113, "name": "Sky Sport Calcio"},
-                            "content": {
-                                "genre": {"name": "Sport"},
-                                "subgenre": {"name": "Calcio"},
+            if "9113" in ch_list:
+                return httpx.Response(
+                    200,
+                    json={
+                        "events": [
+                            {
+                                "eventId": "101",
+                                "starttime": "2026-11-22T19:00:00Z",
+                                "endtime": "2026-11-22T21:00:00Z",
+                                "eventTitle": "Serie A: Roma - Napoli",
+                                "eventSynopsis": "Telecronaca diretta",
+                                "programHighlights": "L",
+                                "channel": {"id": 9113, "name": "Sky Sport Calcio"},
+                                "content": {
+                                    "genre": {"name": "Sport"},
+                                    "subgenre": {"name": "Calcio"},
+                                },
                             },
-                        },
-                        {
-                            "eventId": "102",
-                            "starttime": "2026-11-22T18:00:00Z",
-                            "endtime": "2026-11-22T18:30:00Z",
-                            "eventTitle": "Sky Sport 24",
-                            "eventSynopsis": "Notiziario",
-                            "channel": {"id": 9097, "name": "Sky Sport Uno"},
-                            "content": {
-                                "genre": {"name": "Sport"},
-                                "subgenre": {"name": "Calcio"},
+                            {
+                                "eventId": "102",
+                                "starttime": "2026-11-22T18:00:00Z",
+                                "endtime": "2026-11-22T18:30:00Z",
+                                "eventTitle": "Sky Sport 24",
+                                "eventSynopsis": "Notiziario",
+                                "channel": {"id": 9097, "name": "Sky Sport Uno"},
+                                "content": {
+                                    "genre": {"name": "Sport"},
+                                    "subgenre": {"name": "Calcio"},
+                                },
                             },
-                        },
-                        {
-                            "eventId": "103",
-                            "starttime": "2026-11-22T20:00:00Z",
-                            "endtime": "2026-11-22T22:00:00Z",
-                            "eventTitle": "Film: Il Gladiatore",
-                            "eventSynopsis": "Film drammatico",
-                            "channel": {"id": 8195, "name": "TV8 HD"},
-                            "content": {
-                                "genre": {"name": "Cinema"},
-                                "subgenre": {"name": "Azione"},
-                            },
-                        },
-                    ],
-                    "total": 3,
-                },
-            )
+                        ],
+                        "total": 2,
+                    },
+                )
+            if "8195" in ch_list:
+                return httpx.Response(
+                    200,
+                    json={
+                        "events": [
+                            {
+                                "eventId": "103",
+                                "starttime": "2026-11-22T20:00:00Z",
+                                "endtime": "2026-11-22T22:00:00Z",
+                                "eventTitle": "Film: Il Gladiatore",
+                                "eventSynopsis": "Film drammatico",
+                                "channel": {"id": 8195, "name": "TV8 HD"},
+                                "content": {
+                                    "genre": {"name": "Cinema"},
+                                    "subgenre": {"name": "Azione"},
+                                },
+                            }
+                        ],
+                        "total": 1,
+                    },
+                )
         return httpx.Response(200, json={"events": [], "total": 0})
 
     settings = Settings(ENABLE_SKY_EPG=True)
@@ -385,19 +399,31 @@ async def test_italian_epg_service_toggles_and_sky_clamp_query() -> None:
             requested_from=now - timedelta(hours=6),
             now_utc=now,
         )
-        # Second cycle 30m later refreshes only Day 0; Days +1/+2 hit 12h cache
+        # Second cycle 30m later refreshes only Day 0 (Pay + FTA); Days +1/+2 hit 12h cache
         await svc.fetch_epg(now_utc=now + timedelta(minutes=30))
         disabled = ItalianEPGService(settings=Settings(ENABLE_SKY_EPG=False), client=client)
         assert await disabled.fetch_epg(now_utc=now) == []
 
-    assert len(seen_urls) == 4  # 3 daily buckets (0, +1, +2) initially + 1 Day 0 refresh
-    assert "from=2026-11-22T15:00:00Z" in seen_urls[0]  # 18:00 - 3h = 15:00
-    channels_queried = seen_urls[0].split("channels=")[1].split("&")[0].split(",")
-    assert "807" in channels_queried  # Rai Sport included on Sky
-    for excluded_sky in ("9094", "9513", "9893", "8293", "7587", "12120"):
-        assert excluded_sky not in channels_queried
+    assert len(seen_urls) == 8  # (3 days * 2 groups) + (Day 0 refresh * 2 groups)
+    day0_urls = seen_urls[:2]
+    assert all("from=2026-11-22T15:00:00Z" in u for u in day0_urls)  # 18:00 - 3h = 15:00
+
+    pay_set = set(SKY_PAY_CHANNEL_IDS)
+    fta_set = set(SKY_FTA_CHANNEL_IDS)
+    assert pay_set.isdisjoint(fta_set)
+    assert {"807", "6000"} <= fta_set
+
+    day0_groups = [set(u.split("channels=")[1].split("&")[0].split(",")) for u in day0_urls]
+    assert any(g == pay_set for g in day0_groups)
+    assert any(g == fta_set for g in day0_groups)
+    for g in day0_groups:
+        assert not (g & pay_set and g & fta_set)  # Pay-TV and FTA NEVER mixed
+        for excluded_sky in ("9094", "9513", "9893", "8293", "7587", "12120"):
+            assert excluded_sky not in g
+
     assert len(progs) == 1
     assert progs[0].title == "Serie A: Roma - Napoli"
+    assert progs[0].is_live is True
     assert len(SKY_CHANNELS) >= 32
 
 
@@ -442,14 +468,29 @@ async def test_diretta_ott_exclude_and_outage_retains_tennis_cities() -> None:
 
 def test_epg_semantic_slug_bridge_and_strict_orphan_allowlist() -> None:
     from app.ingestion.epg_service import (
-        _parse_sky_semantic_url,
+        extract_competition_from_sky_url,
         filter_conflicting_italian_channels,
     )
 
-    comp, is_mag = _parse_sky_semantic_url("https://guidatv.sky.it/sport/serie-a/inter-milan")
-    assert comp == "Serie A" and is_mag is False
-    _, mag_flag = _parse_sky_semantic_url("https://guidatv.sky.it/programmi-tv/approfondimento/sky-sport-24-speciale")
-    assert mag_flag is True
+    assert extract_competition_from_sky_url("https://guidatv.sky.it/sport/serie-a/inter-milan") == "Serie A"
+    assert (
+        extract_competition_from_sky_url(
+            "/sport/cev-champions-league-femminile/conegliano-novara/e8c87a77-4e27-4097-aed7-b2ccb5e9e926"
+        )
+        == "CEV Champions League Femminile"
+    )
+    assert (
+        extract_competition_from_sky_url(
+            "/sport/sky-calcio-show/sky-calcio-show-ucl-24-11-2026/39044ac7-3310-4718-ad49-06599e84f3ea"
+        )
+        is None
+    )
+    assert (
+        extract_competition_from_sky_url(
+            "/programmi-tv/calcio/juventus-omonia-nicosia/c44a0ff7-a816-47df-88b6-9a95451aa9c3"
+        )
+        is None
+    )
 
     base_ms = int(datetime(2026, 11, 22, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
     tennis_match = Match(
@@ -733,14 +774,14 @@ async def test_diretta_real_status_ab_ac_ao_and_sky_extension() -> None:
 
 @pytest.mark.asyncio
 async def test_sky_epg_per_day_cache_rotation_422_retry_and_15m_expiry() -> None:
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, str]] = []
     state = {"raise_422_once": True}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
         from_val = request.url.params.get("from", "")
         to_val = request.url.params.get("to", "")
-        calls.append((from_val, to_val))
+        ch_param = request.url.params.get("channels", "")
+        calls.append((from_val, to_val, ch_param))
 
         if state["raise_422_once"]:
             state["raise_422_once"] = False
@@ -749,6 +790,9 @@ async def test_sky_epg_per_day_cache_rotation_422_retry_and_15m_expiry() -> None
                 json={"description": "Dates validation has failed"},
                 request=request,
             )
+
+        if "9113" not in ch_param.split(","):
+            return httpx.Response(200, json={"events": [], "total": 0})
 
         # Day 0: one program expired >15m ago (ignored), one program ending 10m ago (kept)
         if from_val.startswith("2026-11-24"):
@@ -761,6 +805,7 @@ async def test_sky_epg_per_day_cache_rotation_422_retry_and_15m_expiry() -> None
                             "starttime": "2026-11-24T12:00:00Z",
                             "endtime": "2026-11-24T14:40:00Z",  # 20m before 15:00Z -> discarded
                             "eventTitle": "Serie A: Fiorentina - Genoa",
+                            "programHighlights": "L",
                             "channel": {"id": 9113, "name": "Sky Sport Calcio"},
                             "content": {"genre": {"name": "Sport"}, "subgenre": {"name": "Calcio"}},
                         },
@@ -769,6 +814,7 @@ async def test_sky_epg_per_day_cache_rotation_422_retry_and_15m_expiry() -> None
                             "starttime": "2026-11-24T13:00:00Z",
                             "endtime": "2026-11-24T14:50:00Z",  # 10m before 15:00Z -> kept (+15m)
                             "eventTitle": "Serie A: Udinese - Parma",
+                            "programHighlights": "L",
                             "channel": {"id": 9113, "name": "Sky Sport Calcio"},
                             "content": {"genre": {"name": "Sport"}, "subgenre": {"name": "Calcio"}},
                         },
@@ -786,6 +832,7 @@ async def test_sky_epg_per_day_cache_rotation_422_retry_and_15m_expiry() -> None
                             "starttime": "2026-11-26T20:00:00Z",
                             "endtime": "2026-11-26T22:00:00Z",
                             "eventTitle": "Champions League: Milan - Liverpool",
+                            "programHighlights": "L",
                             "channel": {"id": 9097, "name": "Sky Sport Uno"},
                             "content": {"genre": {"name": "Sport"}, "subgenre": {"name": "Calcio"}},
                         }
@@ -808,16 +855,293 @@ async def test_sky_epg_per_day_cache_rotation_422_retry_and_15m_expiry() -> None
         assert "sky_d0_exp" not in ids
         assert "sky_d0_keep" in ids
         assert "sky_d2_future" in ids
-        # 4 calls: initial 422 on Day 0 + retry from now_utc + Day +1 + Day +2
-        assert len(calls) == 4
-        assert calls[1][0] == "2026-11-24T15:00:00Z"
+        # 7 calls: initial Day 0 (Pay 422 + retry + FTA) + Day +1 (Pay + FTA) + Day +2 (Pay + FTA)
+        assert len(calls) == 7
+        assert any(c[0] == "2026-11-24T15:00:00Z" for c in calls[1:3])
 
         calls.clear()
         await svc.fetch_epg(now_utc=t_pre_rot)
-        assert len(calls) == 1  # Only Day 0 requested before 00:20 rotation
+        assert len(calls) == 2  # Only Day 0 (Pay + FTA) requested before 00:20 rotation
 
         calls.clear()
         await svc.fetch_epg(now_utc=t_post_rot)
-        assert len(calls) == 3  # All 3 buckets (0, +1, +2) refreshed after 00:20 rotation
+        assert len(calls) == 6  # All 3 buckets (0, +1, +2) * 2 groups refreshed after 00:20 rotation
+
+
+@pytest.mark.asyncio
+async def test_sky_epg_phase_a_raw_extraction_pay_fta_posters_and_season_filter() -> None:
+    from app.ingestion.epg_service import _extract_sky_poster_url
+
+    # 1. Poster selection & validation unit checks: scene_key_art > scene, ignore background/cover_clean, reject 403/400
+    assert _extract_sky_poster_url(
+        {
+            "imagesMap": [
+                {"key": "background", "img": {"url": "/uuid/11111111-1111-1111-1111-111111111111/background"}},
+                {"key": "cover_clean", "img": {"url": "/uuid/11111111-1111-1111-1111-111111111111/COVER_CLEAN_TALL"}},
+                {"key": "scene", "img": {"url": "/uuid/11111111-1111-1111-1111-111111111111/16-9"}},
+                {"key": "scene_key_art", "img": {"url": "/uuid/11111111-1111-1111-1111-111111111111/COVER_TITLE_WIDE"}},
+            ]
+        }
+    ) == "https://guidatv.sky.it/uuid/11111111-1111-1111-1111-111111111111/COVER_TITLE_WIDE"
+    assert _extract_sky_poster_url(
+        {
+            "imagesMap": [
+                {"key": "background", "img": {"url": "/uuid/11111111-1111-1111-1111-111111111111/background"}},
+                {"key": "scene", "img": {"url": "/uuid/11111111-1111-1111-1111-111111111111/16-9"}},
+            ]
+        }
+    ) == "https://guidatv.sky.it/uuid/11111111-1111-1111-1111-111111111111/16-9"
+    assert _extract_sky_poster_url(
+        {
+            "imagesMap": [
+                {"key": "background", "img": {"url": "/uuid/11111111-1111-1111-1111-111111111111/background"}},
+                {"key": "cover_clean", "img": {"url": "/uuid/11111111-1111-1111-1111-111111111111/COVER_CLEAN_TALL"}},
+            ]
+        }
+    ) == ""
+    assert _extract_sky_poster_url(
+        {
+            "imagesMap": [
+                {"key": "scene_key_art", "img": {"url": "/uuid/SportCalcio_Scene_8PgF6U81O_.png"}},
+                {"key": "scene", "img": {"url": "/uuid/22222222-2222-2222-2222-222222222222/16-9?cgid=90&sid=566"}},
+            ]
+        }
+    ) == ""
+    assert _extract_sky_poster_url(
+        {
+            "imagesMap": [
+                {"key": "scene", "img": {"url": "/uuid/33333333-3333-3333-3333-333333333333/16-9?cgid=60"}},
+            ]
+        }
+    ) == "https://guidatv.sky.it/uuid/33333333-3333-3333-3333-333333333333/16-9?cgid=60"
+
+    # 2. End-to-end Phase A raw extraction (Pay-TV + FTA separated calls)
+    now = datetime(2026, 11, 24, 17, 0, 0, tzinfo=timezone.utc)
+    pay_events = [
+        # Identical titles -> epg_title / content_title kept empty; /programmi-tv/calcio match with seasonNumber=None stays LIVE
+        {
+            "eventId": "p_atalanta",
+            "starttime": "2026-11-24T17:30:00Z",
+            "endtime": "2026-11-24T19:30:00Z",
+            "eventTitle": "Atalanta U23 - Pineto",
+            "epgEventTitle": "Atalanta U23 - Pineto",
+            "eventSynopsis": "Serie C",
+            "programHighlights": "L",
+            "channel": {"id": 9116, "name": "Sky Sport"},
+            "content": {
+                "contentTitle": "Atalanta U23 - Pineto",
+                "seasonNumber": None,
+                "url": "/programmi-tv/calcio/atalanta-u23-pineto/44bce855-33f2-4fdd-99cd-264de7879dd7",
+                "genre": {"name": "Sport"},
+                "subgenre": {"name": "Calcio"},
+                "imagesMap": [
+                    {"key": "scene_key_art", "img": {"url": "/uuid/44bce855-33f2-4fdd-99cd-264de7879dd7/COVER_TITLE_WIDE"}}
+                ],
+            },
+        },
+        # Different contentTitle preserved cleanly
+        {
+            "eventId": "p_lipsia",
+            "starttime": "2026-11-24T19:00:00Z",
+            "endtime": "2026-11-24T21:00:00Z",
+            "eventTitle": "Lipsia - LENS",
+            "epgEventTitle": "Lipsia - LENS",
+            "eventSynopsis": "UEFA Champions League",
+            "programHighlights": "L",
+            "channel": {"id": 11497, "name": "Sky Sport 251"},
+            "content": {
+                "contentTitle": "RB Lipsia - Lens",
+                "seasonNumber": 2026,
+                "url": "/sport/uefa-champions-league/rb-lipsia-lens/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "genre": {"name": "Sport"},
+                "subgenre": {"name": "Calcio"},
+            },
+        },
+        # Docu-series exposed ONLY via epgEventTitle ("S1 Ep2 ...") -> filtered out as non-live/series
+        {
+            "eventId": "p_doc",
+            "starttime": "2026-11-24T17:00:00Z",
+            "endtime": "2026-11-24T18:00:00Z",
+            "eventTitle": "La reggia del basket",
+            "epgEventTitle": "S1 Ep2 - Scugnizzi per sempre",
+            "eventSynopsis": "Racconto sul basket.",
+            "programHighlights": None,
+            "channel": {"id": 11910, "name": "Sky Sport Legend"},
+            "content": {
+                "contentTitle": "La reggia del basket",
+                "seasonNumber": 2026,
+                "url": "/programmi-tv/sport/scugnizzi-per-sempre/stagione-1/episodio-2/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "genre": {"name": "Sport"},
+                "subgenre": {"name": "Basket"},
+            },
+        },
+        # Archival replay WITHOUT year in title, caught via seasonNumber=2021
+        {
+            "eventId": "p_archive",
+            "starttime": "2026-11-24T17:00:00Z",
+            "endtime": "2026-11-24T19:00:00Z",
+            "eventTitle": "Roma - Feyenoord",
+            "epgEventTitle": "Roma - Feyenoord",
+            "eventSynopsis": "Grande sfida europea.",
+            "programHighlights": None,
+            "channel": {"id": 11910, "name": "Sky Sport Legend"},
+            "content": {
+                "contentTitle": "Roma - Feyenoord",
+                "seasonNumber": 2021,
+                "url": "/sport/calcio/roma-feyenoord/cccccccc-cccc-cccc-cccc-cccccccccccc",
+                "genre": {"name": "Sport"},
+                "subgenre": {"name": "Calcio"},
+            },
+        },
+        # Synopsis containing "direttamente dalla stagione 2023" must NOT make F1 Notebook live!
+        {
+            "eventId": "p_f1_note",
+            "starttime": "2026-11-24T18:00:00Z",
+            "endtime": "2026-11-24T18:30:00Z",
+            "eventTitle": "F1 Notebook",
+            "epgEventTitle": "F1 Notebook",
+            "eventSynopsis": "Le immagini direttamente dalla stagione 2023",
+            "programHighlights": None,
+            "channel": {"id": 9096, "name": "Sky Sport F1"},
+            "content": {
+                "contentTitle": "F1 Notebook",
+                "seasonNumber": 2026,
+                "url": "/sport/f1-notebook/f1-notebook/dddddddd-dddd-dddd-dddd-dddddddddddd",
+                "genre": {"name": "Sport"},
+                "subgenre": {"name": "Motori"},
+            },
+        },
+        # Pay-TV placeholder genre != Sport -> dropped at upstream gate
+        {
+            "eventId": "p_empty",
+            "starttime": "2026-11-24T18:00:00Z",
+            "endtime": "2026-11-24T19:00:00Z",
+            "eventTitle": "Programmazione placeholder",
+            "eventSynopsis": "",
+            "channel": {"id": 11401, "name": "DAZN 2"},
+            "content": {"genre": {"name": "Altri Programmi"}, "subgenre": {"name": "Altri Canali"}},
+        },
+        # Pay-TV Sport/Altri with Padel live -> kept
+        {
+            "eventId": "p_padel",
+            "starttime": "2026-11-24T18:00:00Z",
+            "endtime": "2026-11-24T20:00:00Z",
+            "eventTitle": "Premier Padel",
+            "eventSynopsis": "Torneo di Padel",
+            "programHighlights": "L",
+            "channel": {"id": 9093, "name": "Sky Sport Arena"},
+            "content": {
+                "url": "/sport/premier-padel-roma/premier-padel/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+                "genre": {"name": "Sport"},
+                "subgenre": {"name": "Altri"},
+            },
+        },
+    ]
+
+    fta_events = [
+        # SuperTennis live with hl=None + city only in contentTitle
+        {
+            "eventId": "f_davis",
+            "starttime": "2026-11-24T17:30:00Z",
+            "endtime": "2026-11-24T20:30:00Z",
+            "eventTitle": "LIVE DAVIS CUP FINALS BY GENERALI",
+            "epgEventTitle": "LIVE DAVIS CUP FINALS BY GENERALI",
+            "eventSynopsis": "Tennis Coppa Davis",
+            "programHighlights": None,
+            "channel": {"id": 6000, "name": "SuperTennis HD"},
+            "content": {
+                "contentTitle": "LIVE DAVIS CUP FINALS 8 BOLOGNA",
+                "seasonNumber": None,
+                "url": "/sport/tennis-coppa-davis/live-davis-cup-finals-8-bologna/ffffffff-ffff-ffff-ffff-ffffffffffff",
+                "genre": {"name": "Sport"},
+                "subgenre": {"name": "Tennis"},
+                "imagesMap": [{"key": "scene_key_art", "img": {"url": "/uuid/SportCalcio_Scene_8PgF6U81O_.png"}}],
+            },
+        },
+        # RAI Sport event tagged Intrattenimento/Intrattenimento -> MUST NOT be dropped
+        {
+            "eventId": "f_raisport",
+            "starttime": "2026-11-24T18:00:00Z",
+            "endtime": "2026-11-24T19:00:00Z",
+            "eventTitle": "Atletica",
+            "eventSynopsis": "Meeting internazionale",
+            "programHighlights": None,
+            "channel": {"id": 807, "name": "RAI Sport "},
+            "content": {
+                "url": "/programmi-tv/intrattenimento/atletica/12121212-1212-1212-1212-121212121212",
+                "genre": {"name": "Intrattenimento"},
+                "subgenre": {"name": "Intrattenimento"},
+            },
+        },
+        # Generalist Soap Opera with programHighlights="1" (Prima Visione) -> dropped at genre gate
+        {
+            "eventId": "f_soap",
+            "starttime": "2026-11-24T18:00:00Z",
+            "endtime": "2026-11-24T19:00:00Z",
+            "eventTitle": "Ep. 16 - La promessa",
+            "programHighlights": "1",
+            "channel": {"id": 10464, "name": "Rete 4 HD"},
+            "content": {"genre": {"name": "Intrattenimento"}, "subgenre": {"name": "Soap Opera"}},
+        },
+        # TV8 HD Sport/Calcio live -> kept
+        {
+            "eventId": "f_tv8",
+            "starttime": "2026-11-24T20:00:00Z",
+            "endtime": "2026-11-24T22:00:00Z",
+            "eventTitle": "Lille OSC - FC Bayern Monaco",
+            "eventSynopsis": "UEFA Champions League",
+            "programHighlights": "L",
+            "channel": {"id": 8195, "name": "TV8 HD"},
+            "content": {
+                "seasonNumber": 2026,
+                "url": "/sport/uefa-champions-league/lille-osc-fc-bayern-monaco/34343434-3434-3434-3434-343434343434",
+                "genre": {"name": "Sport"},
+                "subgenre": {"name": "Calcio"},
+                "imagesMap": [{"key": "scene", "img": {"url": "/uuid/34343434-3434-3434-3434-343434343434/16-9?cgid=60"}}],
+            },
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        from_val = request.url.params.get("from", "")
+        ch_list = request.url.params.get("channels", "").split(",")
+        if from_val.startswith("2026-11-24"):
+            if "9113" in ch_list:
+                return httpx.Response(200, json={"events": pay_events, "total": len(pay_events)})
+            if "8195" in ch_list:
+                return httpx.Response(200, json={"events": fta_events, "total": len(fta_events)})
+        return httpx.Response(200, json={"events": [], "total": 0})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        svc = ItalianEPGService(settings=Settings(ENABLE_SKY_EPG=True), client=client)
+        raw_items = await svc.fetch_sky_epg(days=(0,), now_utc=now)
+        live_ready = await svc.fetch_epg(active_tennis_cities=frozenset({"bologna"}), days=(0,), now_utc=now)
+
+    raw_by_id = {p.id: p for p in raw_items}
+    assert "sky_p_empty" not in raw_by_id
+    assert "sky_f_soap" not in raw_by_id
+    assert {"sky_p_atalanta", "sky_p_lipsia", "sky_p_padel", "sky_f_davis", "sky_f_raisport", "sky_f_tv8"} <= set(raw_by_id.keys())
+
+    # Raw field fidelity checks
+    assert raw_by_id["sky_p_atalanta"].is_live is True
+    assert raw_by_id["sky_p_atalanta"].epg_title == ""
+    assert raw_by_id["sky_p_atalanta"].content_title == ""
+    assert raw_by_id["sky_p_atalanta"].content_url.startswith("/programmi-tv/calcio/")
+    assert raw_by_id["sky_p_lipsia"].content_title == "RB Lipsia - Lens"
+    assert raw_by_id["sky_p_lipsia"].competition_hint == "UEFA Champions League"
+    assert raw_by_id["sky_p_doc"].is_live is False
+    assert raw_by_id["sky_p_archive"].is_live is False
+    assert raw_by_id["sky_p_f1_note"].is_live is False
+    assert raw_by_id["sky_p_f1_note"].competition_hint == ""  # No fake "F1 Notebook" competition!
+    assert raw_by_id["sky_f_davis"].is_live is True
+    assert raw_by_id["sky_f_davis"].content_title == "LIVE DAVIS CUP FINALS 8 BOLOGNA"
+    assert raw_by_id["sky_f_davis"].poster_url == ""  # Non-UUID placeholder rejected
+    assert raw_by_id["sky_f_tv8"].poster_url.endswith("/16-9?cgid=60")
+
+    live_ids = {p.id for p in live_ready}
+    assert {"sky_p_atalanta", "sky_p_lipsia", "sky_p_padel", "sky_f_davis", "sky_f_raisport", "sky_f_tv8"} == live_ids
+    assert "sky_p_doc" not in live_ids
+    assert "sky_p_archive" not in live_ids
+    assert "sky_p_f1_note" not in live_ids
 
 

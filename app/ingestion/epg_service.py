@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -163,6 +164,20 @@ SKY_GENERALIST_CHANNELS: dict[str, str] = {
 SKY_CHANNELS: dict[str, str] = {**SKY_SPORTS_CHANNELS, **SKY_GENERALIST_CHANNELS}
 SKY_SPORTS_CHANNEL_IDS: frozenset[str] = frozenset(SKY_SPORTS_CHANNELS.keys())
 SKY_GENERALIST_CHANNEL_IDS: frozenset[str] = frozenset(SKY_GENERALIST_CHANNELS.keys())
+# Sky API silently drops all FTA channels (`isAvailableOnSkygo=False`) when mixed with Pay-TV IDs.
+SKY_FTA_SPORTS_CHANNEL_IDS: frozenset[str] = frozenset({"6000", "807"})
+SKY_FTA_CHANNEL_IDS: tuple[str, ...] = tuple(
+    cid
+    for cid in SKY_CHANNELS
+    if cid in SKY_FTA_SPORTS_CHANNEL_IDS or cid in SKY_GENERALIST_CHANNEL_IDS
+)
+SKY_PAY_CHANNEL_IDS: tuple[str, ...] = tuple(
+    cid
+    for cid in SKY_CHANNELS
+    if cid not in SKY_FTA_SPORTS_CHANNEL_IDS and cid not in SKY_GENERALIST_CHANNEL_IDS
+)
+SKY_FTA_CHANNEL_ID_SET: frozenset[str] = frozenset(SKY_FTA_CHANNEL_IDS)
+SKY_PAY_CHANNEL_ID_SET: frozenset[str] = frozenset(SKY_PAY_CHANNEL_IDS)
 
 _HARD_NON_LIVE_PATTERN = (
     r"\btg\b"
@@ -502,14 +517,47 @@ _SKY_SLUG_COMP_MAP: dict[str, str] = {
     "rugby-championship": "Rugby Championship",
     "pga-tour": "PGA Tour",
     "dp-world-tour": "DP World Tour",
+    "golf-dp-world-tour": "DP World Tour",
     "ryder-cup": "Ryder Cup",
+    "cev-champions-league-femminile": "CEV Champions League Femminile",
+    "fiba-qualificazioni-world-cup": "FIBA World Cup Qualifiers",
+    "diretta-gol-champions-league": "UEFA Champions League",
+    "diretta-gol-europa-and-conference-league": "UEFA Europa & Conference League",
+    "nations-championship": "Nations Championship",
 }
 
-_MAGAZINE_SLUG_RE = re.compile(
-    r"(?:-remix\b|\bremix\b|-magazine\b|\bmagazine\b|-speciale?\b|\bspeciale\b|"
-    r"-preview\b|\bpreview\b|\banteprima\b|-talk\b|\btalk\b|-stor(?:y|ies)\b|"
-    r"conf(?:erenza)?-stampa|\brubrica\b|calciomercato|/replica\b|/differita\b)",
-    re.IGNORECASE,
+_NON_SPORTS_GENRES: frozenset[str] = frozenset(
+    {"film", "cinema", "informazione", "ragazzi e musica", "mondo e tendenze"}
+)
+_NON_SPORTS_SUBGENRES: frozenset[str] = frozenset(
+    {
+        "fiction",
+        "soap opera",
+        "reality show",
+        "gioco",
+        "quiz",
+        "sit com",
+        "telefilm",
+        "talk show",
+        "show",
+        "documentario",
+        "cucina",
+        "meteo",
+        "cartoni animati",
+        "attualita",
+        "lifestyle",
+        "scienza",
+        "arte e cultura",
+        "avventura",
+        "religione",
+        "musica",
+        "societa",
+        "biografico",
+        "romantico",
+        "drammatico",
+        "azione",
+        "commedia",
+    }
 )
 
 
@@ -535,34 +583,24 @@ def _is_simulcast_title(title: str) -> bool:
     return bool(_SIMULCAST_TITLE_RE.search(_strip_accents(title or "")))
 
 
-def _parse_sky_semantic_url(content_url: str) -> tuple[Optional[str], bool]:
-    """Parse Sky Italia semantic URL `/(sport|programmi-tv)/{comp_slug}/{event_slug}`."""
+def extract_competition_from_sky_url(content_url: str) -> Optional[str]:
+    """Extract a known competition name from a Sky `content.url` slug; never invent from unknown slugs."""
     if not content_url or not isinstance(content_url, str):
-        return None, False
+        return None
 
-    m = re.search(r"/(sport|programmi-tv)/([^/]+)/([^/]+)", content_url)
+    m = re.search(r"/(?:sport|programmi-tv)/([^/]+)/([^/]+)", content_url)
     if not m:
-        return None, False
+        return None
 
-    section = m.group(1).lower()
-    comp_slug = m.group(2).lower()
-    event_slug = m.group(3).lower()
-    slug_combined = f"{comp_slug} {event_slug}"
-    is_magazine = bool(_MAGAZINE_SLUG_RE.search(slug_combined))
-
-    if section == "programmi-tv" and not any(
-        k in comp_slug for k in ("sport", "calcio", "tennis", "f1", "motogp", "basket", "volley")
-    ):
-        is_magazine = True
-
+    comp_slug = m.group(1).lower()
     if comp_slug in _SKY_SLUG_COMP_MAP:
-        return _SKY_SLUG_COMP_MAP[comp_slug], is_magazine
+        return _SKY_SLUG_COMP_MAP[comp_slug]
     if comp_slug == "tennis-wta":
-        return "WTA", is_magazine
+        return "WTA"
     if comp_slug == "tennis-atp":
-        return "ATP", is_magazine
+        return "ATP"
     if comp_slug == "tennis-challenger":
-        return "Challenger", is_magazine
+        return "Challenger"
 
     m_tennis = re.match(
         r"^tennis-(wta|atp|challenger)(?:-masters)?(?:-(\d{3,4}))?-([a-z0-9-]+)$",
@@ -577,22 +615,21 @@ def _parse_sky_semantic_url(content_url: str) -> tuple[Optional[str], bool]:
             w.capitalize() for w in raw_city.split("-") if w not in ("atp", "wta", "men", "women")
         )
         if circuit == "ATP" and (has_masters or tier == "1000"):
-            return f"ATP Masters 1000 {city}".strip(), is_magazine
+            return f"ATP Masters 1000 {city}".strip()
         if tier:
-            return f"{circuit} {tier} {city}".strip(), is_magazine
-        return f"{circuit} {city}".strip(), is_magazine
+            return f"{circuit} {tier} {city}".strip()
+        return f"{circuit} {city}".strip()
 
-    if "padel" in comp_slug:
-        clean_p = " ".join(w.capitalize() for w in comp_slug.replace("padel-", "").split("-"))
-        return f"Padel {clean_p}".strip(), is_magazine
+    if comp_slug == "padel":
+        return "Padel"
+    if comp_slug.startswith("padel-"):
+        clean_p = " ".join(w.capitalize() for w in comp_slug.removeprefix("padel-").split("-") if w)
+        return f"Padel {clean_p}".strip() if clean_p else "Padel"
+    if comp_slug.startswith("premier-padel"):
+        clean_p = " ".join(w.capitalize() for w in comp_slug.removeprefix("premier-padel").strip("-").split("-") if w)
+        return f"Premier Padel {clean_p}".strip() if clean_p else "Premier Padel"
 
-    clean_name = " ".join(
-        w.capitalize() for w in comp_slug.split("-") if w not in ("live", "diretta", "sport")
-    )
-    if clean_name and len(clean_name) >= 3:
-        return clean_name, is_magazine
-
-    return None, is_magazine
+    return None
 
 
 def _extract_competition_from_synopsis(synopsis: str) -> Optional[str]:
@@ -665,7 +702,7 @@ def _extract_competition_from_synopsis(synopsis: str) -> Optional[str]:
 
 
 def _extract_sky_poster_url(content: dict[str, Any]) -> str:
-    """Extract valid Sky 16:9 poster URL from `content.imagesMap`, skipping generic placeholders."""
+    """Extract valid 16:9 Sky poster URL (`scene_key_art` -> `scene`), dropping 403/400 placeholders."""
     images_map = content.get("imagesMap")
     if not isinstance(images_map, list):
         return ""
@@ -675,16 +712,14 @@ def _extract_sky_poster_url(content: dict[str, Any]) -> str:
             continue
         key = item.get("key")
         url = (item.get("img") or {}).get("url")
-        if isinstance(key, str) and isinstance(url, str) and _UUID_RE.search(url):
+        if (
+            key in ("scene_key_art", "scene")
+            and isinstance(url, str)
+            and _UUID_RE.search(url)
+            and "cgid=90" not in url.lower()
+        ):
             img_dict[key] = url
-    chosen = (
-        img_dict.get("scene_key_art")
-        or img_dict.get("scene")
-        or img_dict.get("cover_clean")
-        or img_dict.get("background")
-        or img_dict.get("cover")
-        or ""
-    )
+    chosen = img_dict.get("scene_key_art") or img_dict.get("scene") or ""
     if not chosen:
         return ""
     return f"https://guidatv.sky.it{chosen}" if chosen.startswith("/") else chosen
@@ -741,7 +776,20 @@ def _merge_and_handover_channel_blocks(programs: list[EPGProgram]) -> list[EPGPr
                     merged[-1] = prev.model_copy(
                         update={
                             "end_ms": max(prev.end_ms, curr.end_ms),
+                            "epg_title": prev.epg_title or curr.epg_title,
+                            "content_title": prev.content_title or curr.content_title,
                             "description": prev.description or curr.description,
+                            "content_url": prev.content_url or curr.content_url,
+                            "program_highlights": (
+                                "L"
+                                if (prev.program_highlights == "L" or curr.program_highlights == "L")
+                                else (prev.program_highlights or curr.program_highlights)
+                            ),
+                            "season_number": (
+                                prev.season_number
+                                if prev.season_number is not None
+                                else curr.season_number
+                            ),
                             "competition_hint": prev.competition_hint or curr.competition_hint,
                             "poster_url": prev.poster_url or curr.poster_url,
                             "is_live": prev.is_live or curr.is_live,
@@ -878,18 +926,29 @@ def is_non_live_or_studio(
     title: str,
     description: str = "",
     *,
+    epg_title: str = "",
+    content_title: str = "",
+    season_number: Optional[int] = None,
     current_year: Optional[int] = None,
 ) -> bool:
-    """Return True if the EPG entry is a studio show, news, magazine, highlights, or replay."""
+    """Return True if the EPG entry is a studio show, news, magazine, series, highlights, or replay."""
+    ref_year = current_year if current_year is not None else datetime.now(timezone.utc).year
+    if season_number is not None and season_number < ref_year:
+        return True
     clean_title = _strip_accents((title or "").strip())
     if not clean_title:
         return True
-    if _NON_LIVE_TITLE_RE.search(clean_title):
-        return True
-    ref_year = current_year if current_year is not None else datetime.now(timezone.utc).year
-    if _has_historical_year(clean_title, ref_year):
-        return True
+    clean_epg = _strip_accents((epg_title or "").strip())
+    clean_ct = _strip_accents((content_title or "").strip())
     clean_desc = _strip_accents((description or "").strip())
+    if _EPISODIC_SERIES_RE.search(f"{clean_title} {clean_epg} {clean_ct} {clean_desc}"):
+        return True
+    for candidate in (clean_title, clean_epg, clean_ct):
+        if candidate and _NON_LIVE_TITLE_RE.search(candidate):
+            return True
+    for candidate in (clean_title, clean_ct, clean_desc):
+        if candidate and _has_historical_year(candidate, ref_year):
+            return True
     if clean_desc and _NON_LIVE_DESC_RE.search(clean_desc):
         return True
     return False
@@ -1011,20 +1070,35 @@ def deduplicate_simulcasts(programs: list[EPGProgram]) -> list[EPGProgram]:
                     seen_channels.add(key)
                     channels.append(ch)
 
+        best_epg_title = next((g.epg_title for g in group if g.epg_title), "")
+        best_content_title = next((g.content_title for g in group if g.content_title), "")
         best_desc = max((g.description for g in group if g.description), key=len, default="")
         best_cat = next((g.category for g in group if g.category), "")
         best_hint = next((g.sport_hint for g in group if g.sport_hint), "")
+        best_url = next((g.content_url for g in group if g.content_url), "")
+        best_hl = (
+            "L"
+            if any(g.program_highlights == "L" for g in group)
+            else next((g.program_highlights for g in group if g.program_highlights), "")
+        )
+        best_season = next((g.season_number for g in group if g.season_number is not None), None)
         best_comp = next((g.competition_hint for g in group if g.competition_hint), "")
         best_poster = next((g.poster_url for g in group if g.poster_url), "")
         merged.append(
             primary.model_copy(
                 update={
+                    "is_dedicated_sports": any(g.is_dedicated_sports for g in group),
                     "channel_name": ", ".join(channels),
                     "start_ms": min(g.start_ms for g in group),
                     "end_ms": max(g.end_ms for g in group),
+                    "epg_title": best_epg_title,
+                    "content_title": best_content_title,
                     "description": best_desc,
                     "category": best_cat,
                     "sport_hint": best_hint,
+                    "content_url": best_url,
+                    "program_highlights": best_hl,
+                    "season_number": best_season,
                     "competition_hint": best_comp,
                     "poster_url": best_poster,
                     "is_live": any(g.is_live for g in group),
@@ -1637,20 +1711,29 @@ def _parse_iso_to_ms(value: str) -> int:
         return 0
 
 
-def _is_sports_program(
+def _should_ingest_sky_event(
     *,
-    is_dedicated_sports_channel: bool,
+    channel_id: str,
+    genre_name: str,
+    subgenre_name: str,
     title: str,
+    content_title: str,
     description: str,
-    category: str,
-    sport_hint: str,
 ) -> bool:
-    if is_dedicated_sports_channel:
+    """Upstream non-destructive gate filtering non-sports filler while preserving Rai Sport / SuperTennis."""
+    if channel_id in SKY_FTA_SPORTS_CHANNEL_IDS:
         return True
-    cat_low = _strip_accents(f"{category} {sport_hint}").lower()
-    if any(k in cat_low for k in ("sport", "calcio", "motori", "tennis", "basket", "ciclismo", "rugby", "volley")):
+    g_low = _strip_accents(genre_name or "").strip().lower()
+    sg_low = _strip_accents(subgenre_name or "").strip().lower()
+    if channel_id in SKY_PAY_CHANNEL_ID_SET:
+        if g_low and g_low != "sport":
+            return False
         return True
-    combined = _strip_accents(f"{title} {description}")
+    if g_low == "sport":
+        return True
+    if g_low in _NON_SPORTS_GENRES or sg_low in _NON_SPORTS_SUBGENRES:
+        return False
+    combined = _strip_accents(f"{title} {content_title} {description}")
     return bool(_SPORTS_EVENT_HINT_RE.search(combined))
 
 
@@ -1685,44 +1768,60 @@ class ItalianEPGService:
 
     @staticmethod
     def _compute_sky_is_live(
-        ev: dict[str, Any],
         *,
+        channel_id: str,
         title: str,
+        epg_title: str,
+        content_title: str,
         description: str,
         content_url: str,
+        program_highlights: str,
+        season_number: Optional[int],
+        current_year: int,
     ) -> bool:
-        raw_hl = ev.get("programHighlights")
-        hl = str(raw_hl).strip().upper() if raw_hl is not None else ""
         url_low = content_url.lower()
         if "/replica" in url_low or "/differita" in url_low:
             return False
-        if is_non_live_or_studio(title, description):
+        if season_number is not None and season_number < current_year:
             return False
-        if hl == "L":
-            return True
-        if raw_hl is not None and hl != "":
+        if is_non_live_or_studio(
+            title,
+            description,
+            epg_title=epg_title,
+            content_title=content_title,
+            season_number=season_number,
+            current_year=current_year,
+        ):
             return False
-        if "/live-" in url_low:
+        if program_highlights == "L":
             return True
-        combined_low = f"{title} {description}".lower()
-        if "diretta" in combined_low or re.search(r"\blive\b", title, re.I):
+        if program_highlights != "":
+            return False
+        if "/live-" in url_low or "/diretta-" in url_low:
             return True
+        if channel_id in SKY_FTA_CHANNEL_ID_SET:
+            if re.search(r"\b(?:live|diretta)\b", f"{title} {content_title}", re.I):
+                return True
         return False
 
-    async def _fetch_sky_window(
+    async def _fetch_sky_channel_group(
         self,
         client: httpx.AsyncClient,
         *,
+        channel_ids: tuple[str, ...],
         from_dt: datetime,
         to_dt: datetime,
         now_utc: datetime,
         allow_422_retry: bool = True,
     ) -> tuple[list[EPGProgram], bool]:
-        """Fetch paginated Sky Guida TV events for `[from_dt, to_dt]`, discarding >15m expired items."""
+        """Fetch paginated Sky Guida TV events for one channel group (Pay-TV or FTA)."""
+        if not channel_ids:
+            return [], False
         from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        ch_ids = ",".join(SKY_CHANNELS.keys())
+        ch_ids = ",".join(channel_ids)
         now_ms = int(now_utc.timestamp() * 1000)
+        ref_year = now_utc.year
 
         programs: list[EPGProgram] = []
         page_num = 0
@@ -1754,8 +1853,9 @@ class ItalianEPGService:
                     fallback_to = (
                         to_dt if to_dt > now_utc else (now_utc + timedelta(hours=1))
                     )
-                    return await self._fetch_sky_window(
+                    return await self._fetch_sky_channel_group(
                         client,
+                        channel_ids=channel_ids,
                         from_dt=now_utc,
                         to_dt=fallback_to,
                         now_utc=now_utc,
@@ -1781,34 +1881,34 @@ class ItalianEPGService:
                     continue
 
                 content = ev.get("content") or {}
-                title = (
-                    ev.get("eventTitle")
-                    or ev.get("epgEventTitle")
-                    or content.get("contentTitle")
-                    or ""
-                ).strip()
+                raw_event_title = (ev.get("eventTitle") or "").strip()
+                raw_epg_title = (ev.get("epgEventTitle") or "").strip()
+                raw_content_title = (content.get("contentTitle") or "").strip()
+                title = raw_event_title or raw_epg_title or raw_content_title
                 if not title:
                     continue
-
-                content_url = str(content.get("url") or ev.get("url") or "").strip()
-                url_comp, is_magazine_slug = _parse_sky_semantic_url(content_url)
-                if is_magazine_slug:
-                    continue
+                epg_title = (
+                    raw_epg_title if raw_epg_title and raw_epg_title != title else ""
+                )
+                content_title = (
+                    raw_content_title
+                    if raw_content_title and raw_content_title != title
+                    else ""
+                )
 
                 description = (ev.get("eventSynopsis") or "").strip()
                 genre_name = ((content.get("genre") or {}).get("name") or "").strip()
-                subgenre_name = ((content.get("subgenre") or {}).get("name") or "").strip()
+                subgenre_name = (
+                    (content.get("subgenre") or {}).get("name") or ""
+                ).strip()
 
-                is_dedicated_sports = (
-                    ch_id in SKY_SPORTS_CHANNEL_IDS
-                    or not _is_generalist_channel(ch_name, ch_id)
-                )
-                if not _is_sports_program(
-                    is_dedicated_sports_channel=is_dedicated_sports,
+                if not _should_ingest_sky_event(
+                    channel_id=ch_id,
+                    genre_name=genre_name,
+                    subgenre_name=subgenre_name,
                     title=title,
+                    content_title=content_title,
                     description=description,
-                    category=genre_name,
-                    sport_hint=subgenre_name,
                 ):
                     continue
 
@@ -1819,22 +1919,34 @@ class ItalianEPGService:
                 if now_ms > end_ms + SKY_EPG_POST_END_MS:
                     continue
 
-                competition_hint = url_comp or _extract_competition_from_synopsis(description) or ""
-                if not _passes_epg_program_guards(
-                    is_generalist=not is_dedicated_sports,
-                    title=title,
-                    description=description,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    competition_hint=competition_hint,
-                ):
-                    continue
+                content_url = str(content.get("url") or ev.get("url") or "").strip()
+                raw_hl = ev.get("programHighlights")
+                program_highlights = (
+                    str(raw_hl).strip().upper() if raw_hl is not None else ""
+                )
+                raw_season = content.get("seasonNumber")
+                season_number: Optional[int] = None
+                if isinstance(raw_season, int) and not isinstance(raw_season, bool):
+                    season_number = raw_season
+                elif isinstance(raw_season, str) and raw_season.strip().isdigit():
+                    season_number = int(raw_season.strip())
 
+                is_dedicated_sports = ch_id in SKY_SPORTS_CHANNEL_IDS
+                competition_hint = (
+                    extract_competition_from_sky_url(content_url)
+                    or _extract_competition_from_synopsis(description)
+                    or ""
+                )
                 is_live = self._compute_sky_is_live(
-                    ev,
+                    channel_id=ch_id,
                     title=title,
+                    epg_title=epg_title,
+                    content_title=content_title,
                     description=description,
                     content_url=content_url,
+                    program_highlights=program_highlights,
+                    season_number=season_number,
+                    current_year=ref_year,
                 )
                 poster_url = _extract_sky_poster_url(content)
                 ev_id = str(ev.get("eventId") or f"{ch_id}_{start_ms}")
@@ -1844,12 +1956,18 @@ class ItalianEPGService:
                         id=f"sky_{ev_id}",
                         channel_id=ch_id,
                         channel_name=ch_name,
+                        is_dedicated_sports=is_dedicated_sports,
                         title=title,
+                        epg_title=epg_title,
+                        content_title=content_title,
                         description=description,
                         category=genre_name,
                         start_ms=start_ms,
                         end_ms=end_ms,
                         sport_hint=subgenre_name,
+                        content_url=content_url,
+                        program_highlights=program_highlights,
+                        season_number=season_number,
                         competition_hint=competition_hint,
                         poster_url=poster_url,
                         is_live=is_live,
@@ -1863,9 +1981,46 @@ class ItalianEPGService:
                 break
             page_num += 1
 
+        return programs, fetch_failed
+
+    async def _fetch_sky_window(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        from_dt: datetime,
+        to_dt: datetime,
+        now_utc: datetime,
+        allow_422_retry: bool = True,
+    ) -> tuple[list[EPGProgram], bool]:
+        """Fetch Pay-TV and FTA Sky Guida TV groups in parallel for `[from_dt, to_dt]`."""
+        (pay_progs, pay_failed), (fta_progs, fta_failed) = await asyncio.gather(
+            self._fetch_sky_channel_group(
+                client,
+                channel_ids=SKY_PAY_CHANNEL_IDS,
+                from_dt=from_dt,
+                to_dt=to_dt,
+                now_utc=now_utc,
+                allow_422_retry=allow_422_retry,
+            ),
+            self._fetch_sky_channel_group(
+                client,
+                channel_ids=SKY_FTA_CHANNEL_IDS,
+                from_dt=from_dt,
+                to_dt=to_dt,
+                now_utc=now_utc,
+                allow_422_retry=allow_422_retry,
+            ),
+        )
+        combined: list[EPGProgram] = []
+        seen_ids: set[str] = set()
+        for prog in (*pay_progs, *fta_progs):
+            if prog.id not in seen_ids:
+                seen_ids.add(prog.id)
+                combined.append(prog)
+        fetch_failed = pay_failed and fta_failed
         if fetch_failed:
             return [], True
-        return (_merge_and_handover_channel_blocks(programs) if programs else []), False
+        return (_merge_and_handover_channel_blocks(combined) if combined else []), False
 
     async def _fetch_sky_with_client(
         self,
@@ -2072,10 +2227,22 @@ class ItalianEPGService:
         )
         filtered: list[EPGProgram] = []
         for prog in sky_items:
-            if is_non_live_or_studio(prog.title, prog.description, current_year=ref_now.year):
-                continue
-            if is_out_of_calendar_tennis(
+            if is_non_live_or_studio(
                 prog.title,
+                prog.description,
+                epg_title=prog.epg_title,
+                content_title=prog.content_title,
+                season_number=prog.season_number,
+                current_year=ref_now.year,
+            ):
+                continue
+            tennis_eval_title = (
+                f"{prog.title} {prog.content_title}".strip()
+                if prog.content_title
+                else prog.title
+            )
+            if is_out_of_calendar_tennis(
+                tennis_eval_title,
                 prog.sport_hint or prog.channel_name,
                 active_tennis_cities,
                 current_year=ref_now.year,

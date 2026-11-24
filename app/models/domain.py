@@ -95,12 +95,18 @@ class EPGProgram(BaseModel):
     id: str
     channel_id: str
     channel_name: str
+    is_dedicated_sports: bool = True
     title: str
+    epg_title: str = ""
+    content_title: str = ""
     description: str = ""
     category: str = ""
     start_ms: int
     end_ms: int
     sport_hint: str = ""
+    content_url: str = ""
+    program_highlights: str = ""
+    season_number: Optional[int] = None
     competition_hint: str = ""
     poster_url: str = ""
     is_live: bool = True
