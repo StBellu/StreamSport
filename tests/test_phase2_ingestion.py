@@ -1976,6 +1976,130 @@ def test_phase_c_post_deploy_epg_and_classifier_polishes() -> None:
     ) == ("tennis", ["WTA"])
 
 
+def test_sky_diretta_matcher_window_aliases_and_initial_guard() -> None:
+    from app.ingestion.epg_service import _epg_matches_diretta
+    from app.taxonomy.matcher import DEFAULT_TEAM_MATCHER, _string_similarity
+
+    # 1. Exonyms & canonical disjointness (AS Monaco != Bayern Monaco, Olanda == Paesi Bassi)
+    monaco_vs_bayern = DEFAULT_TEAM_MATCHER.match_score(
+        "AS Monaco", "PSG", "Bayern Monaco", "PSG"
+    )
+    assert monaco_vs_bayern.matched is False
+    assert monaco_vs_bayern.min_side_score == 0.0
+
+    bayern_exonym = DEFAULT_TEAM_MATCHER.match_score(
+        "Bayern Munich", "Lilla", "FC Bayern Monaco", "Lille"
+    )
+    assert bayern_exonym.matched is True
+
+    nl_exonym = DEFAULT_TEAM_MATCHER.match_score(
+        "Olanda", "Israele", "Paesi Bassi", "Israele"
+    )
+    assert nl_exonym.matched is True
+
+    # 2. Cross-order tennis initial+surname guard ("Muller A." vs "G. Muller")
+    muller_conflict_1 = DEFAULT_TEAM_MATCHER.match_score(
+        "Muller A.", "Sinner J.", "G. Muller", "J. Sinner"
+    )
+    assert muller_conflict_1.matched is False
+
+    muller_conflict_2 = DEFAULT_TEAM_MATCHER.match_score(
+        "Alexandre Muller", "Sinner J.", "Muller G.", "J. Sinner"
+    )
+    assert muller_conflict_2.matched is False
+
+    muller_same = DEFAULT_TEAM_MATCHER.match_score(
+        "Muller A.", "Sinner J.", "A. Muller", "J. Sinner"
+    )
+    assert muller_same.matched is True
+
+    # 3. 7-char single-token subset damping ("monaco" vs "fake monaco")
+    assert _string_similarity("monaco", "fake monaco") < 0.85
+
+    # 4. Aligned 60m standard window (FTA without overlap) + >60m Motori (120m) & Tennis 1v1 (360m)
+    base_ms = 1_795_611_600_000
+    fta_match = Match(
+        id="diretta-fta-50m",
+        title="Olympiakos vs Milan",
+        category="calcio_estero",
+        silo=SportSilo.FOOTBALL,
+        genres=["Europa e Conference League"],
+        date=base_ms + 50 * 60_000,
+        end_date=base_ms + 185 * 60_000,
+        competition="Europa League - Prima fase",
+        home_team=TeamInfo(name="Olympiakos"),
+        away_team=TeamInfo(name="Milan"),
+        source_origin="diretta",
+    )
+    fta_epg_50m = EPGProgram(
+        id="sky_tv8_50m",
+        channel_id="8195",
+        channel_name="TV8",
+        is_dedicated_sports=False,
+        title="Olympiakos - Milan",
+        start_ms=base_ms,
+        end_ms=base_ms + 170 * 60_000,
+        sport_hint="Calcio",
+        program_highlights="",
+        is_live=False,
+        source="sky",
+    )
+    assert _epg_matches_diretta(fta_epg_50m, fta_match) > 0.0
+
+    f1_match = Match(
+        id="diretta-f1-90m",
+        title="FORMULA 1: GP Qatar - Gara",
+        category="motori",
+        silo=SportSilo.MOTORI,
+        genres=["Formula 1"],
+        date=base_ms + 90 * 60_000,
+        end_date=base_ms + 210 * 60_000,
+        competition="FORMULA 1: GP Qatar (Qatar)",
+        home_team=TeamInfo(name="FORMULA 1: GP Qatar (Qatar) - Gara"),
+        source_origin="diretta",
+    )
+    f1_epg_90m = EPGProgram(
+        id="sky_f1_90m",
+        channel_id="9096",
+        channel_name="Sky Sport F1",
+        title="GP Qatar: Gara",
+        start_ms=base_ms,
+        end_ms=base_ms + 210 * 60_000,
+        sport_hint="Motori",
+        competition_hint="Formula 1",
+        is_live=True,
+        source="sky",
+    )
+    assert _epg_matches_diretta(f1_epg_90m, f1_match) > 0.0
+
+    tennis_match = Match(
+        id="diretta-ten-120m",
+        title="Sinner J. vs Alcaraz C.",
+        category="tennis",
+        silo=SportSilo.TENNIS,
+        genres=["ATP"],
+        date=base_ms + 120 * 60_000,
+        end_date=base_ms + 240 * 60_000,
+        competition="ATP Masters 1000 Roma",
+        home_team=TeamInfo(name="Sinner J."),
+        away_team=TeamInfo(name="Alcaraz C."),
+        source_origin="diretta",
+    )
+    tennis_epg_120m = EPGProgram(
+        id="sky_ten_120m",
+        channel_id="11237",
+        channel_name="Sky Sport Tennis",
+        title="Jannik Sinner - Carlos Alcaraz",
+        start_ms=base_ms,
+        end_ms=base_ms + 240 * 60_000,
+        sport_hint="Tennis",
+        is_live=True,
+        source="sky",
+    )
+    assert _epg_matches_diretta(tennis_epg_120m, tennis_match) > 0.0
+
+
+
 
 
 

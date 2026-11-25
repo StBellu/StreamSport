@@ -90,7 +90,7 @@ _ROME_TZ: tzinfo = _load_rome_tz()
 _SKY_MAX_LOOKBACK = timedelta(hours=3)
 _SIMULCAST_WINDOW_MS = 45 * 60 * 1000
 _RECONCILE_WINDOW_MS = 60 * 60 * 1000
-_LINEAR_PRE_MATCH_MS = 35 * 60 * 1000
+_LINEAR_PRE_MATCH_MS = 60 * 60 * 1000
 _LINEAR_POST_MATCH_MS = 30 * 60 * 1000
 _MOTORI_PRE_MATCH_MS = 120 * 60 * 1000
 _MOTORI_POST_MATCH_MS = 20 * 60 * 1000
@@ -1335,7 +1335,7 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
         return 0.0
 
     # Asymmetric linear TV window:
-    # - Standard: [match.date - 35m, match.date + 30m] (or active overlap up to 90m pre-match)
+    # - Standard: [match.date - 60m, match.date + 30m] (or active overlap up to 90m pre-match)
     # - Motori:   [match.date - 120m, match.date + 20m]
     # - Tennis 1v1: [match.date - 360m, match.date + 60m]
     if match.silo == SportSilo.MOTORI:
@@ -1410,7 +1410,7 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
             alt_home_2=alt_h2,
             alt_away_2=alt_a2,
             date_1_ms=match.date,
-            date_2_ms=epg.start_ms if in_asym_window else 0,
+            date_2_ms=0,  # Sport-specific time windows (60m/120m/360m) already enforced above.
             is_women_1=match.is_women,
             is_youth_1=match.is_youth,
             is_women_2=epg_women,
@@ -1434,7 +1434,7 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
             alt_home_1=match.alt_home or match.competition,
             alt_home_2=alt_epg,
             date_1_ms=match.date,
-            date_2_ms=epg.start_ms if in_asym_window else 0,
+            date_2_ms=0,  # Sport-specific time windows (60m/120m/360m) already enforced above.
             is_women_1=match.is_women,
             is_youth_1=match.is_youth,
             is_women_2=epg_women,

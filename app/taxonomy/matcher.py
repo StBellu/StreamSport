@@ -76,6 +76,17 @@ def _has_initial_surname_conflict(a: str, b: str) -> bool:
         if ta[-1][0] != tb[-1][0] and (len(ta[-1]) == 1 or len(tb[-1]) == 1):
             return True
 
+    # Case 3: cross-order "<surname> <initial>" vs "<initial/first> ... <surname>"
+    # (e.g. Flashscore "muller a" vs Sky/provider "g muller" or "gilles muller")
+    if len(ta[-1]) == 1 and len(ta[0]) >= 3 and ta[0] == tb[-1]:
+        if ta[-1][0] != tb[0][0]:
+            return True
+
+    # Case 4: reverse cross-order "<initial/first> ... <surname>" vs "<surname> <initial>"
+    if len(tb[-1]) == 1 and len(tb[0]) >= 3 and tb[0] == ta[-1]:
+        if tb[-1][0] != ta[0][0]:
+            return True
+
     return False
 
 
@@ -96,8 +107,8 @@ def _string_similarity(a: str, b: str) -> float:
     shorter_len = min(len(a), len(b))
 
     # Guard against short single-token subset inflation in token_set_ratio
-    # (e.g., "real" vs. "real betis" or "city" vs. "bristol city").
-    if min_tokens == 1 and max_tokens >= 2 and shorter_len <= 5:
+    # (e.g., "real" vs. "real betis", "city" vs. "bristol city", or "monaco" vs. "bayern monaco").
+    if min_tokens == 1 and max_tokens >= 2 and shorter_len <= 7:
         ts_or_sort = fuzz.token_sort_ratio(a, b) / 100.0
         wr = fuzz.WRatio(a, b) / 100.0
         return 0.65 * ts_or_sort + 0.35 * wr
