@@ -237,6 +237,8 @@ _ALIAS_GROUP_DEFINITIONS: tuple[tuple[str, ...], ...] = (
     ("fc kobenhavn", "kobenhavn", "copenhagen", "fc copenhagen", "copenaghen"),
     ("malmo ff", "malmo", "malmö"),
     ("lks lodz", "łks łódź"),
+    ("heart of midlothian", "hearts", "hearts fc"),
+    ("union saint gilloise", "royale union sg", "union sg", "royale union saint gilloise", "rusg"),
     # --- National Teams ---
     ("netherlands", "olanda", "paesi bassi", "holland"),
     # --- Basket cross-city aliases ---

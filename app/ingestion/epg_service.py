@@ -1603,6 +1603,9 @@ def reconcile_with_schedule(
     end_date_updates: dict[int, int] = {
         idx: m.end_date for idx, m in enumerate(diretta_matches)
     }
+    fallback_poster_updates: dict[int, str] = {
+        idx: m.fallback_poster for idx, m in enumerate(diretta_matches)
+    }
     football_family = (SportSilo.FOOTBALL, SportSilo.CALCIO_ITA)
     diretta_by_silo: dict[SportSilo, list[tuple[int, Match]]] = {}
     for idx, m in enumerate(diretta_matches):
@@ -1650,6 +1653,8 @@ def reconcile_with_schedule(
             broadcaster_updates[best_idx] = _merge_broadcasters(
                 broadcaster_updates[best_idx], epg_channels
             )
+            if epg.poster_url and not fallback_poster_updates[best_idx]:
+                fallback_poster_updates[best_idx] = epg.poster_url
             if epg.end_ms > 0:
                 target_end = epg.end_ms - (DIRETTA_POST_MATCH_MS - SKY_EPG_POST_END_MS)
                 if target_end > end_date_updates[best_idx]:
@@ -1717,6 +1722,8 @@ def reconcile_with_schedule(
             updates["broadcasters"] = broadcaster_updates[idx]
         if end_date_updates[idx] != m.end_date:
             updates["end_date"] = end_date_updates[idx]
+        if fallback_poster_updates[idx] != m.fallback_poster:
+            updates["fallback_poster"] = fallback_poster_updates[idx]
         enriched.append(m.model_copy(update=updates) if updates else m)
     return enriched, orphan_matches
 

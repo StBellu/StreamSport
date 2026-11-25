@@ -1336,4 +1336,322 @@ async def test_pipeline_scheduler_prunes_stale_db_rows_with_outage_guards(
         await db.close()
 
 
+@pytest.mark.asyncio
+async def test_thesportsdb_level1_level2_fixes_and_sky_fallback_poster(
+    tmp_path: Path,
+) -> None:
+    from app.graphics.thesportsdb_service import _leagues_compatible
+
+    settings = _test_settings(tmp_path)
+    settings.POSTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    settings.BASE_POSTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. Level 1 _parse_calendar_html: real /tiny event thumb -> /medium, zero badge hijack,
+    #    no f1->motori hash leak, and American-Football.svg -> nfl
+    cal_html = """
+    <table>
+      <tr>
+        <td class="text-nowrap">13:30</td>
+        <td class="text-nowrap"><img src="/images/icons/svg/sports/Soccer.svg"/> <a href="/browse_calendar?d=2026-11-25&amp;s=soccer">Soccer</a></td>
+        <td class="text-nowrap"><img alt="league badge" src="https://r2.thesportsdb.com/images/media/league/badge/abc123f1999.png/tiny"/> Italian Serie C Girone C</td>
+        <td class="text-nowrap"><a href="/event/2555120-audace-cerignola-vs-inter-milan-u23"><img alt="event thumbnail" src="https://r2.thesportsdb.com/images/media/event/thumb/qo5vhp1787394749.jpg/tiny"/><span>Audace Cerignola vs Inter Milan U23</span></a></td>
+      </tr>
+      <tr>
+        <td class="text-nowrap">14:00</td>
+        <td class="text-nowrap"><img src="/images/icons/svg/sports/Soccer.svg"/> <a href="/browse_calendar?d=2026-11-25&amp;s=soccer">Soccer</a></td>
+        <td class="text-nowrap"><img alt="league badge" src="https://r2.thesportsdb.com/images/media/league/badge/f1001.png/tiny"/> Japanese J1 League</td>
+        <td class="text-nowrap"><a href="/event/99001-kashima-vs-urawa"><img alt="event thumbnail" src="/images/no_thumb.png"/><span>Kashima vs Urawa</span></a></td>
+      </tr>
+      <tr>
+        <td class="text-nowrap">19:00</td>
+        <td class="text-nowrap"><img src="/images/icons/svg/sports/American-Football.svg"/> <a href="/browse_calendar?d=2026-11-25&amp;s=american-football">American Football</a></td>
+        <td class="text-nowrap"><img alt="league badge" src="https://r2.thesportsdb.com/images/media/league/badge/nfl1.png/tiny"/> NFL</td>
+        <td class="text-nowrap"><a href="/event/99002-rams-vs-packers"><img alt="event thumbnail" src="https://r2.thesportsdb.com/images/media/event/thumb/rmzcg2.jpg/tiny"/><span>Los Angeles Rams vs Green Bay Packers</span></a></td>
+      </tr>
+    </table>
+    """
+    tsdb_l1 = TheSportsDBService(settings=settings)
+    parsed = tsdb_l1._parse_calendar_html(cal_html, "2026-11-25")
+    assert len(parsed) == 3
+
+    cerignola_entry, j1_entry, nfl_entry = parsed
+    assert cerignola_entry["silo"] == "football"
+    assert cerignola_entry["poster_url"] == "https://r2.thesportsdb.com/images/media/event/thumb/qo5vhp1787394749.jpg/medium"
+    assert "/league/badge/" not in cerignola_entry["poster_url"]
+
+    assert j1_entry["silo"] == "football"
+    assert j1_entry["poster_url"] == ""  # no_thumb.png properly rejected
+
+    assert nfl_entry["silo"] == "nfl"
+    assert nfl_entry["poster_url"] == "https://r2.thesportsdb.com/images/media/event/thumb/rmzcg2.jpg/medium"
+
+    tsdb_l1.calendar_by_silo = {
+        "football": [cerignola_entry, j1_entry],
+        "nfl": [nfl_entry],
+    }
+
+    # U23 B-team Serie C match reconciles cleanly against calendar entry
+    day_ms = int(time.mktime(time.strptime("2026-11-25 13:30", "%Y-%m-%d %H:%M")))
+    from datetime import datetime, timezone
+
+    cer_dt_ms = int(datetime(2026, 11, 25, 13, 30, tzinfo=timezone.utc).timestamp() * 1000)
+    j1_dt_ms = int(datetime(2026, 11, 25, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    del day_ms
+
+    cer_match = _make_match(
+        "diretta-cer",
+        "Audace Cerignola vs Inter U23",
+        silo=SportSilo.CALCIO_ITA,
+        category="calcio_italiano",
+        genres=["Serie C"],
+        date_ms=cer_dt_ms,
+        end_ms=cer_dt_ms + 7200_000,
+        competition="Serie C - Girone C",
+        canonical_competition="serie-c",
+        home="Audace Cerignola",
+        away="Inter U23",
+    )
+    assert tsdb_l1.reconcile_match(cer_match) == "https://r2.thesportsdb.com/images/media/event/thumb/qo5vhp1787394749.jpg/medium"
+
+    # no_thumb calendar match short-circuits Level 2 HTTP search in resolve_poster_url
+    l2_called = False
+
+    async def fail_if_called(*args: Any, **kwargs: Any) -> Any:
+        nonlocal l2_called
+        l2_called = True
+        return "https://should.not.be/called.jpg"
+
+    tsdb_l1.semantic_orphan_search = fail_if_called  # type: ignore[method-assign]
+    j1_match = _make_match(
+        "diretta-j1",
+        "Kashima vs Urawa",
+        silo=SportSilo.FOOTBALL,
+        category="calcio_estero",
+        date_ms=j1_dt_ms,
+        end_ms=j1_dt_ms + 7200_000,
+        competition="J1 League",
+        canonical_competition="j1-league",
+        home="Kashima",
+        away="Urawa",
+    )
+    assert await tsdb_l1.resolve_poster_url(j1_match) is None
+    assert l2_called is False
+
+    # 2. Gatekeepers: Argentina Primera <-> Liga Profesional, Hearts, Royale Union SG, Combat +-8h
+    boca = _make_match(
+        "dir-boca",
+        "Boca Juniors vs Ind. Rivadavia",
+        silo=SportSilo.FOOTBALL,
+        category="calcio_estero",
+        date_ms=j1_dt_ms,
+        end_ms=j1_dt_ms + 7200_000,
+        competition="Liga Profesional - Clausura - Play Offs",
+        canonical_competition="liga-profesional-argentina",
+        home="Boca Juniors",
+        away="Ind. Rivadavia",
+    ).model_copy(update={"country": "Argentina"})
+    assert _leagues_compatible(boca, "Argentinian Primera Division") is True
+    assert _leagues_compatible(boca, "Italian Serie A") is False
+    assert _leagues_compatible(boca, "Argentinian Cup") is False
+
+    tsdb_l1.calendar_by_silo["football"].extend([
+        {
+            "title": "Heart of Midlothian vs Monaco",
+            "home": "Heart of Midlothian",
+            "away": "Monaco",
+            "league": "UEFA Conference League",
+            "silo": "football",
+            "date_ms": j1_dt_ms,
+            "poster_url": "https://r2.thesportsdb.com/images/media/event/thumb/hearts.jpg/tiny",
+            "is_women": False,
+            "is_youth": False,
+        },
+        {
+            "title": "Union Saint-Gilloise vs Lech Poznań",
+            "home": "Union Saint-Gilloise",
+            "away": "Lech Poznań",
+            "league": "UEFA Europa League",
+            "silo": "football",
+            "date_ms": j1_dt_ms,
+            "poster_url": "https://r2.thesportsdb.com/images/media/event/thumb/rusg.jpg/tiny",
+            "is_women": False,
+            "is_youth": False,
+        },
+    ])
+    tsdb_l1.calendar_by_silo["combat"] = [
+        {
+            "title": "Masamichi Yabuki vs Miel Fajardo",
+            "home": "Masamichi Yabuki",
+            "away": "Miel Fajardo",
+            "league": "Boxing",
+            "silo": "combat",
+            "date_ms": j1_dt_ms - int(5.5 * 3600_000),
+            "poster_url": "https://r2.thesportsdb.com/images/media/event/thumb/yabuki.jpg/tiny",
+            "is_women": False,
+            "is_youth": False,
+        }
+    ]
+    hearts_m = _make_match(
+        "dir-hearts", "Hearts vs Monaco", silo=SportSilo.FOOTBALL, category="calcio_estero",
+        date_ms=j1_dt_ms, end_ms=j1_dt_ms + 7200_000, competition="Conference League",
+        canonical_competition="conference-league", home="Hearts", away="Monaco",
+    )
+    rusg_m = _make_match(
+        "dir-rusg", "Royale Union SG vs Lech", silo=SportSilo.FOOTBALL, category="calcio_estero",
+        date_ms=j1_dt_ms, end_ms=j1_dt_ms + 7200_000, competition="Europa League",
+        canonical_competition="europa-league", home="Royale Union SG", away="Lech",
+    )
+    yabuki_m = _make_match(
+        "dir-yabuki", "Yabuki M. vs Fajardo M.", silo=SportSilo.COMBAT, category="combattimento",
+        date_ms=j1_dt_ms, end_ms=j1_dt_ms + 7200_000, competition="IBF Title",
+        canonical_competition="boxing", home="Yabuki M.", away="Fajardo M.",
+    )
+    assert tsdb_l1.reconcile_match(hearts_m) == "https://r2.thesportsdb.com/images/media/event/thumb/hearts.jpg/medium"
+    assert tsdb_l1.reconcile_match(rusg_m) == "https://r2.thesportsdb.com/images/media/event/thumb/rusg.jpg/medium"
+    assert tsdb_l1.reconcile_match(yabuki_m) == "https://r2.thesportsdb.com/images/media/event/thumb/yabuki.jpg/medium"
+    await tsdb_l1.aclose()
+
+    # 3. Level 2 semantic_orphan_search: shared <div class="col-sm-3"> per-link date/image,
+    #    English queries, NFL American-Football.svg, non-degenerate tokens, and dated SQLite cache
+    browse_queries_seen: list[str] = []
+
+    def browse_handler(request: httpx.Request) -> httpx.Response:
+        q = request.url.params.get("s", "")
+        browse_queries_seen.append(q)
+        if q == "Inter Stuttgart":
+            html = """
+            <div class="col-sm-3"><b>Events</b><br/>
+              <a href="/event/2598363-inter-milan-vs-stuttgart-return">
+                <img height="70PX" src="https://r2.thesportsdb.com/images/media/event/thumb/wrong2027.jpg/small"/><br/>
+                <img src="/images/icons/svg/sports/Soccer.svg" width="16"/> Inter Milan vs Stuttgart
+              </a> (2027-04-10)<br/><br/>
+              <a href="/event/2594612-inter-milan-vs-stuttgart">
+                <img height="70PX" src="https://r2.thesportsdb.com/images/media/event/thumb/right2026.jpg/small"/><br/>
+                <img src="/images/icons/svg/sports/Soccer.svg" width="16"/> Inter Milan vs Stuttgart
+              </a> (2026-11-25)<br/><br/>
+            </div>
+            """
+            return httpx.Response(200, text=html)
+        if q == "Los Angeles Rams Green Bay Packers":
+            html = """
+            <div class="col-sm-3"><b>Events</b><br/>
+              <a href="/event/3001-rams-vs-packers">
+                <img height="70PX" src="https://r2.thesportsdb.com/images/media/event/thumb/nfl_right.jpg/small"/><br/>
+                <img src="/images/icons/svg/sports/American-Football.svg" width="16"/> Los Angeles Rams vs Green Bay Packers
+              </a> (2026-11-26)<br/><br/>
+            </div>
+            """
+            return httpx.Response(200, text=html)
+        return httpx.Response(200, text='<div class="col-sm-3"><b>Events</b></div>')
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(browse_handler))
+    db = DatabaseManager(db_path=settings.DB_PATH)
+    await db.connect()
+    tsdb_l2 = TheSportsDBService(settings=settings, client=mock_client)
+
+    try:
+        # Check non-degenerate query generation
+        assert TheSportsDBService._build_search_queries("Ecuador U17", "Corea del Sud U17", "Ecuador U17 vs Corea del Sud U17", alt_home="Ecuador U17", alt_away="South Korea U17") == [
+            "Ecuador U17 South Korea U17",
+            "Ecuador U17 Corea del Sud U17",
+            "ecuador korea",
+        ]
+        assert "al al" not in TheSportsDBService._build_search_queries("Al Fateh", "Al Riyadh", "Al Fateh vs Al Riyadh")
+
+        ucl_dt_ms = int(datetime(2026, 11, 25, 20, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        ucl_match = _make_match(
+            "dir-inter-stuttgart",
+            "Inter vs Stoccarda",
+            silo=SportSilo.FOOTBALL,
+            category="calcio_estero",
+            date_ms=ucl_dt_ms,
+            end_ms=ucl_dt_ms + 7200_000,
+            competition="Champions League",
+            canonical_competition="champions-league",
+            home="Inter",
+            away="Stoccarda",
+        ).model_copy(update={"alt_home": "Inter", "alt_away": "Stuttgart"})
+        l2_url = await tsdb_l2.semantic_orphan_search(ucl_match, db=db)
+        assert l2_url == "https://r2.thesportsdb.com/images/media/event/thumb/right2026.jpg/medium"
+        assert "Inter Stuttgart" in browse_queries_seen
+        assert await db.get_tsdb_cache("football:2026-11-25:inter stuttgart") is not None
+
+        nfl_dt_ms = int(datetime(2026, 11, 26, 1, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        nfl_match = _make_match(
+            "dir-rams-packers",
+            "Los Angeles Rams vs Green Bay Packers",
+            silo=SportSilo.NFL,
+            category="football_americano",
+            genres=["NFL"],
+            date_ms=nfl_dt_ms,
+            end_ms=nfl_dt_ms + 10800_000,
+            competition="NFL",
+            canonical_competition="nfl",
+            home="Los Angeles Rams",
+            away="Green Bay Packers",
+        )
+        assert await tsdb_l2.semantic_orphan_search(nfl_match, db=db) == (
+            "https://r2.thesportsdb.com/images/media/event/thumb/nfl_right.jpg/medium"
+        )
+
+        # 4. Sky fallback_poster persisted in SQLite & used by BannerService ONLY when TSDB returns None
+        volley_miss = _make_match(
+            "dir-conegliano",
+            "Conegliano D vs Novara D",
+            silo=SportSilo.VOLLEY,
+            category="volley",
+            genres=["Volley Femminile"],
+            date_ms=ucl_dt_ms,
+            end_ms=ucl_dt_ms + 7200_000,
+            competition="Champions League Femminile",
+            canonical_competition="cev-champions-league-women",
+            home="Conegliano D",
+            away="Novara D",
+        ).model_copy(
+            update={"is_women": True, "fallback_poster": "https://guidatv.sky.it/uuid/sky_cev_poster.jpg"}
+        )
+        await db.upsert_matches([volley_miss])
+        reloaded = await db.load_active_matches(now_ms=ucl_dt_ms - 1000)
+        assert len(reloaded) == 1
+        assert reloaded[0].fallback_poster == "https://guidatv.sky.it/uuid/sky_cev_poster.jpg"
+
+        buf = io.BytesIO()
+        Image.new("RGB", (40, 20), (15, 110, 220)).save(buf, format="JPEG")
+        sky_jpeg = buf.getvalue()
+        buf_tsdb = io.BytesIO()
+        Image.new("RGB", (40, 20), (20, 180, 70)).save(buf_tsdb, format="JPEG")
+        tsdb_jpeg = buf_tsdb.getvalue()
+
+        fetched_urls: list[str] = []
+
+        async def mock_fetch_bytes(url: str) -> bytes | None:
+            fetched_urls.append(url)
+            if "sky_cev_poster" in url:
+                return sky_jpeg
+            if "right2026" in url:
+                return tsdb_jpeg
+            return None
+
+        tsdb_l2.fetch_poster_bytes = mock_fetch_bytes  # type: ignore[method-assign]
+        banner = BannerService(settings=settings, tsdb_service=tsdb_l2)
+
+        # TSDB fails -> falls back to Sky fallback_poster
+        resolved_bytes = await banner._resolve_base_poster(reloaded[0], db=db)
+        assert resolved_bytes == sky_jpeg
+        assert fetched_urls[-1] == "https://guidatv.sky.it/uuid/sky_cev_poster.jpg"
+
+        # TSDB succeeds -> Sky fallback_poster is NEVER used
+        ucl_with_fallback = ucl_match.model_copy(
+            update={"fallback_poster": "https://guidatv.sky.it/uuid/sky_should_not_win.jpg"}
+        )
+        fetched_urls.clear()
+        resolved_tsdb = await banner._resolve_base_poster(ucl_with_fallback, db=db)
+        assert resolved_tsdb == tsdb_jpeg
+        assert fetched_urls == ["https://r2.thesportsdb.com/images/media/event/thumb/right2026.jpg/medium"]
+    finally:
+        await mock_client.aclose()
+        await db.close()
+
+
+
 

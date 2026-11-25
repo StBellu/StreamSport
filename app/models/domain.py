@@ -62,6 +62,7 @@ class Match(BaseModel):
     date: int
     end_date: int
     poster: str = ""
+    fallback_poster: str = ""
     popular: bool = False
     competition: str = ""
     canonical_competition: str = ""

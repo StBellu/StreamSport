@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS matches (
     date INTEGER NOT NULL,
     end_date INTEGER NOT NULL,
     poster TEXT NOT NULL DEFAULT '',
+    fallback_poster TEXT NOT NULL DEFAULT '',
     popular INTEGER NOT NULL DEFAULT 0,
     competition TEXT NOT NULL DEFAULT '',
     canonical_competition TEXT NOT NULL DEFAULT '',
@@ -74,12 +75,12 @@ CREATE INDEX IF NOT EXISTS idx_tennis_slug ON tennis_athletes_cache (slug);
 
 _UPSERT_MATCH_SQL = """
 INSERT INTO matches (
-    id, title, category, silo, genres, date, end_date, poster, popular,
+    id, title, category, silo, genres, date, end_date, poster, fallback_poster, popular,
     competition, canonical_competition, country, stage, sources, teams,
     alt_home, alt_away, alt_league, alt_title, alt_competition, alt_country,
     is_women, is_youth, has_tvvoo, broadcasters, source_origin, updated_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 ON CONFLICT(id) DO UPDATE SET
     title = excluded.title,
@@ -89,6 +90,7 @@ ON CONFLICT(id) DO UPDATE SET
     date = excluded.date,
     end_date = excluded.end_date,
     poster = excluded.poster,
+    fallback_poster = excluded.fallback_poster,
     popular = excluded.popular,
     competition = excluded.competition,
     canonical_competition = excluded.canonical_competition,
@@ -134,6 +136,7 @@ def _match_to_row(match: Match) -> tuple[Any, ...]:
         match.date,
         match.end_date,
         match.poster,
+        match.fallback_poster,
         int(match.popular),
         match.competition,
         match.canonical_competition,
@@ -174,6 +177,7 @@ def _row_to_match(row: aiosqlite.Row) -> Match:
         date=row["date"],
         end_date=row["end_date"],
         poster=row["poster"],
+        fallback_poster=row["fallback_poster"] if "fallback_poster" in row.keys() else "",
         popular=bool(row["popular"]),
         competition=row["competition"],
         canonical_competition=row["canonical_competition"],
@@ -230,7 +234,7 @@ class DatabaseManager:
         # Idempotent schema migration for pre-existing SQLite databases.
         async with conn.execute("PRAGMA table_info(matches);") as cur:
             existing_cols = {r[1] for r in await cur.fetchall()}
-        for col in ("alt_title", "alt_competition", "alt_country"):
+        for col in ("alt_title", "alt_competition", "alt_country", "fallback_poster"):
             if col not in existing_cols:
                 await conn.execute(
                     f"ALTER TABLE matches ADD COLUMN {col} TEXT NOT NULL DEFAULT '';"

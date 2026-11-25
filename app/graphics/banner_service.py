@@ -395,6 +395,13 @@ class BannerService:
                 await self._atomic_write(base_path, raw)
                 return raw
 
+        fallback_url = match.fallback_poster.strip()
+        if fallback_url and "nostream" not in fallback_url.lower():
+            raw_fallback = await tsdb.fetch_poster_bytes(fallback_url)
+            if raw_fallback:
+                await self._atomic_write(base_path, raw_fallback)
+                return raw_fallback
+
         comp = match.canonical_competition or match.competition
         return await tsdb.render_dark_canvas_async(
             match.title,
