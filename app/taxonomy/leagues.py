@@ -107,6 +107,19 @@ _COUNTRY_ALIASES: dict[str, str] = {
     "mondo": "world",
     "international": "international",
     "internazionale": "international",
+    "asia": "asia",
+    "africa": "africa",
+    "america": "america",
+    "americas": "america",
+    "sud america": "south america",
+    "south america": "south america",
+    "nord e centro america": "north_central_america",
+    "north & central america": "north_central_america",
+    "australasia": "australasia",
+    "australia & oceania": "australasia",
+    "oceania": "australasia",
+    "galles": "wales",
+    "wales": "wales",
 }
 
 
@@ -224,43 +237,6 @@ def _rule(
     )
 
 
-# Explicit minor/rejected competition patterns per silo (used when not already Tier 1/2).
-_MINOR_COMPETITION_PATTERNS: dict[str, re.Pattern[str]] = {
-    "football": re.compile(
-        r"(?:"
-        r"\bserie\s*d\b"
-        r"|\beccellenza\b"
-        r"|\bpromozione\b"
-        r"|\bprima\s+categoria\b"
-        r"|\bseconda\s+categoria\b"
-        r"|\bterza\s+categoria\b"
-        r"|\bregionalliga\b"
-        r"|\boberliga\b"
-        r"|\bnational\s+league\s+(?:north|south)\b"
-        r"|\bisthmian\b"
-        r"|\bnorthern\s+premier\b"
-        r"|\bsouthern\s+league\b"
-        r"|\btercera\b"
-        r"|\bcampeonato\s+de\s+portugal\b"
-        r"|\bamateur\b"
-        r"|\breserve\s+league\b"
-        r"|\bregional\b"
-        r")",
-        re.IGNORECASE,
-    ),
-    "tennis": re.compile(
-        r"(?:"
-        r"\bitf\b"
-        r"|\b(?:m|w)(?:15|25|35|40)\b"
-        r"|\bfutures\b"
-        r"|\butr\s*pro\b"
-        r"|\bexhibition\b"
-        r")",
-        re.IGNORECASE,
-    ),
-}
-
-
 def _build_default_rules() -> list[LeagueRule]:
     rules: list[LeagueRule] = [
         # =====================================================================
@@ -270,7 +246,7 @@ def _build_default_rules() -> list[LeagueRule]:
             "brasileirao-serie-a",
             "Brasileirão Série A",
             "football",
-            r"(?:brasileir[aã]o(?:\s+s[eé]rie\s*a)?|s[eé]rie\s*a\s+betano|s[eé]rie\s*a.*brazil|brazil.*s[eé]rie\s*a)",
+            r"(?:brasileir[aã]o(?:\s+s[eé]rie\s*a)?|s[eé]rie\s*a\s+betano|copa\s+do\s+brasil|s[eé]rie\s*a.*brazil|brazil.*s[eé]rie\s*a)",
             tier=1,
             priority=10,
             country_exclude=("italy", "ecuador"),
@@ -293,74 +269,8 @@ def _build_default_rules() -> list[LeagueRule]:
             catalog_target="calcio_estero",
             genre="Americhe e Leghe Extra-UE",
         ),
-        _rule(
-            "brasileirao-serie-b",
-            "Brasileirão Série B",
-            "football",
-            r"(?:brasileir[aã]o\s+s[eé]rie\s*b|s[eé]rie\s*b.*brazil|brazil.*s[eé]rie\s*b)",
-            tier=2,
-            priority=12,
-            country_exclude=("italy", "ecuador"),
-            is_women=False,
-            is_youth=False,
-            catalog_target="calcio_estero",
-            genre="Americhe e Leghe Extra-UE",
-        ),
-        _rule(
-            "brasileirao-serie-b",
-            "Brasileirão Série B",
-            "football",
-            r"^s[eé]rie\s*b(?:\s*-\s*.*)?$",
-            tier=2,
-            priority=13,
-            country_include=("brazil",),
-            requires_country_match=True,
-            is_women=False,
-            is_youth=False,
-            catalog_target="calcio_estero",
-            genre="Americhe e Leghe Extra-UE",
-        ),
-        _rule(
-            "ecuador-ligapro-serie-a",
-            "LigaPro Serie A Ecuador",
-            "football",
-            r"(?:ligapro(?:\s+serie\s*a)?|serie\s*a.*ecuador|ecuador.*serie\s*a)",
-            tier=2,
-            priority=14,
-            country_exclude=("italy", "brazil"),
-            is_women=False,
-            is_youth=False,
-            catalog_target="calcio_estero",
-            genre="Americhe e Leghe Extra-UE",
-        ),
-        _rule(
-            "ecuador-ligapro-serie-a",
-            "LigaPro Serie A Ecuador",
-            "football",
-            r"^serie\s*a(?:\s*-\s*.*)?$",
-            tier=2,
-            priority=15,
-            country_include=("ecuador",),
-            requires_country_match=True,
-            is_women=False,
-            is_youth=False,
-            catalog_target="calcio_estero",
-            genre="Americhe e Leghe Extra-UE",
-        ),
-        _rule(
-            "colombia-primera-a",
-            "Categoría Primera A",
-            "football",
-            r"(?:liga\s+betplay|categor[ií]a\s+primera\s*a|primera\s*a.*colombia|colombia.*primera\s*a)",
-            tier=2,
-            priority=16,
-            is_women=False,
-            is_youth=False,
-            catalog_target="calcio_estero",
-            genre="Americhe e Leghe Extra-UE",
-        ),
         # =====================================================================
-        # FOOTBALL — PRIORITY 20: Women's & Youth Leagues (never senior men)
+        # FOOTBALL — PRIORITY 20: Women's & Selected Youth Leagues
         # =====================================================================
         _rule(
             "serie-a-femminile",
@@ -392,22 +302,9 @@ def _build_default_rules() -> list[LeagueRule]:
             "primavera-1",
             "Primavera 1",
             "football",
-            r"(?:primavera\s*1|campionato\s+primavera\s*1?)",
-            tier=2,
+            r"(?:primavera\s*1\b|campionato\s+primavera(?:\s*1)?\b(?!\s*2))",
+            tier=3,
             priority=22,
-            country_include=("italy",),
-            is_women=False,
-            is_youth=True,
-            catalog_target="calcio_italiano",
-            genre="Primavera e Giovanili",
-        ),
-        _rule(
-            "primavera-2",
-            "Primavera 2",
-            "football",
-            r"primavera\s*2",
-            tier=2,
-            priority=23,
             country_include=("italy",),
             is_women=False,
             is_youth=True,
@@ -419,8 +316,8 @@ def _build_default_rules() -> list[LeagueRule]:
             "Coppa Italia Primavera",
             "football",
             r"coppa\s+italia\s+primavera",
-            tier=2,
-            priority=24,
+            tier=3,
+            priority=23,
             country_include=("italy",),
             is_women=False,
             is_youth=True,
@@ -434,6 +331,7 @@ def _build_default_rules() -> list[LeagueRule]:
             r"(?:uwcl|women'?s?\s+champions\s+league|champions\s+league\s+(?:women|femminile|donne))",
             tier=1,
             priority=25,
+            country_include=("europe",),
             is_women=True,
             is_youth=False,
             catalog_target="calcio_estero",
@@ -443,97 +341,31 @@ def _build_default_rules() -> list[LeagueRule]:
             "uefa-youth-league",
             "UEFA Youth League",
             "football",
-            r"(?:uefa\s+)?youth\s+league",
-            tier=2,
+            r"\buefa\s+youth\s+league\b",
+            tier=3,
             priority=26,
+            country_include=("europe",),
             is_women=False,
             is_youth=True,
             catalog_target="calcio_estero",
             genre="Europei Under 21 e Nazionali Giovanili",
         ),
         _rule(
-            "euro-u21",
-            "UEFA Euro U21",
-            "football",
-            r"(?:euro\s*u[- ]?21|europei?\s+under\s*21|u[- ]?21\s+euro|under[- ]?21)",
-            tier=1,
-            priority=26,
-            is_women=False,
-            is_youth=True,
-            catalog_target="calcio_estero",
-            genre="Europei Under 21 e Nazionali Giovanili",
-        ),
-        _rule(
-            "u21-international",
+            "youth-national-football",
             "Nazionali Giovanili",
             "football",
-            r"\b(?:u[- ]?(?:17|18|19|20|21|23)|under[- ]?(?:17|18|19|20|21|23))\b",
-            tier=2,
-            priority=26,
-            is_women=False,
+            (
+                r"(?:(?:uefa\s+)?(?:euro|campionati\s+europei)|(?:fifa\s+)?(?:world\s+cup|mondiali|coppa\s+del\s+mondo)|sudamericano|south\s+american|concacaf|african|asian|olympic|olimpiad).*\b(?:u[- ]?(?:17|19|20|21|23)|under[- ]?(?:17|19|20|21|23))\b"
+                r"|\b(?:u[- ]?(?:17|19|20|21|23)|under[- ]?(?:17|19|20|21|23))\b.*(?:euro|world\s+cup|mondiali|championship|europei)"
+            ),
+            tier=3,
+            priority=27,
+            country_include=("world", "europe", "south america", "america", "africa", "asia", "international"),
+            requires_country_match=True,
+            is_women=None,
             is_youth=True,
             catalog_target="calcio_estero",
             genre="Europei Under 21 e Nazionali Giovanili",
-        ),
-        _rule(
-            "wsl-women",
-            "Women's Super League",
-            "football",
-            r"(?:\bwsl\b|women'?s?\s+super\s+league)",
-            tier=1,
-            priority=27,
-            is_women=True,
-            is_youth=False,
-            catalog_target="calcio_estero",
-            genre="Premier League",
-        ),
-        _rule(
-            "liga-f-women",
-            "Liga F",
-            "football",
-            r"(?:\bliga\s*f\b|primera\s+divisi[oó]n\s+femenina)",
-            tier=1,
-            priority=28,
-            is_women=True,
-            is_youth=False,
-            catalog_target="calcio_estero",
-            genre="La Liga",
-        ),
-        _rule(
-            "frauen-bundesliga",
-            "Frauen-Bundesliga",
-            "football",
-            r"frauen[- ]?bundesliga",
-            tier=1,
-            priority=28,
-            is_women=True,
-            is_youth=False,
-            catalog_target="calcio_estero",
-            genre="Bundesliga e Ligue 1",
-        ),
-        _rule(
-            "d1-arkema",
-            "Première Ligue Féminine",
-            "football",
-            r"(?:d1\s+arkema|premi[eè]re\s+ligue\s+(?:f[eé]minine|women))",
-            tier=1,
-            priority=28,
-            is_women=True,
-            is_youth=False,
-            catalog_target="calcio_estero",
-            genre="Bundesliga e Ligue 1",
-        ),
-        _rule(
-            "nwsl",
-            "NWSL",
-            "football",
-            r"\bnwsl\b",
-            tier=1,
-            priority=28,
-            is_women=True,
-            is_youth=False,
-            catalog_target="calcio_estero",
-            genre="Americhe e Leghe Extra-UE",
         ),
         # =====================================================================
         # FOOTBALL — PRIORITY 30: Italian Senior Football (calcio_ita)
@@ -580,7 +412,7 @@ def _build_default_rules() -> list[LeagueRule]:
             "serie-c",
             "Serie C",
             "football",
-            r"^(?:italy\s*[:-]?\s*)?(?:serie\s*c|lega\s*pro)(?:\s+(?:now|sky|girone\s+[abc]))?(?:\s*[-:]\s*.*)?$",
+            r"^(?:italy\s*[:-]?\s*)?(?:coppa\s+italia\s+serie\s*c|serie\s*c|lega\s*pro)(?:\s+(?:now|sky|girone\s+[abc]|group\s+[abc]))?(?:\s*[-:]\s*.*)?$",
             tier=2,
             priority=32,
             country_include=("italy",),
@@ -618,37 +450,43 @@ def _build_default_rules() -> list[LeagueRule]:
             genre="Coppa Italia e Supercoppa",
             is_popular=True,
         ),
-        # Rejected Italian Tier 3 (explicit so they match Tier 3 and get rejected without streams)
         _rule(
-            "serie-d",
-            "Serie D",
+            "coppa-italia-serie-d",
+            "Coppa Italia Serie D",
             "football",
-            r"\bserie\s*d\b",
+            r"\bcoppa\s+italia\s+serie\s*d\b",
             tier=3,
-            priority=38,
+            priority=35,
             country_include=("italy",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_italiano",
+            genre="Coppa Italia e Supercoppa",
         ),
+        # =====================================================================
+        # FOOTBALL — PRIORITY 39+: Asian Tier 3, European & Global Tier 1/2
+        # =====================================================================
         _rule(
-            "eccellenza",
-            "Eccellenza",
+            "afc-champions-league",
+            "AFC Champions League",
             "football",
-            r"\beccellenza\b",
+            r"(?:afc\s+champions\s+league(?:\s*(?:2|two|elite))?|gulf\s+club\s+champions\s+league)",
             tier=3,
             priority=39,
-            country_include=("italy",),
-            catalog_target="calcio_italiano",
+            country_include=("asia",),
+            is_women=False,
+            is_youth=False,
+            catalog_target="calcio_estero",
+            genre="Americhe e Leghe Extra-UE",
         ),
-        # =====================================================================
-        # FOOTBALL — PRIORITY 40: European & Global Tier 1/2
-        # =====================================================================
         _rule(
             "champions-league",
             "UEFA Champions League",
             "football",
-            r"(?:uefa\s+)?champions\s+league(?!.*\b(?:women|femminile|donne|youth|asia|afc|caf|concacaf)\b)",
+            r"^(?!.*\b(?:women|femminile|donne|youth|asia|afc|gulf|caf|concacaf)\b).*(?:uefa\s+)?champions\s+league",
             tier=1,
             priority=40,
+            country_exclude=("asia", "africa", "south america", "north_central_america", "world"),
             is_women=False,
             is_youth=False,
             catalog_target="calcio_estero",
@@ -688,6 +526,8 @@ def _build_default_rules() -> list[LeagueRule]:
             r"(?:uefa\s+super\s+cup|supercoppa\s+(?:uefa|europea))",
             tier=1,
             priority=43,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Champions League",
             is_popular=True,
@@ -699,6 +539,8 @@ def _build_default_rules() -> list[LeagueRule]:
             r"(?:uefa\s+)?nations\s+league",
             tier=1,
             priority=44,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Nazionali e Amichevoli",
             is_popular=True,
@@ -710,6 +552,8 @@ def _build_default_rules() -> list[LeagueRule]:
             r"(?:fifa\s+world\s+cup|world\s+cup(?:\s+-\s+qualification)?|mondiali|coppa\s+del\s+mondo)",
             tier=1,
             priority=45,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Nazionali e Amichevoli",
             is_popular=True,
@@ -721,6 +565,8 @@ def _build_default_rules() -> list[LeagueRule]:
             r"(?:uefa\s+euro(?:\s+\d{4})?|euro\s+\d{4}(?:\s+qualifiers?)?|campionati\s+europei)",
             tier=1,
             priority=46,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Nazionali e Amichevoli",
             is_popular=True,
@@ -732,6 +578,8 @@ def _build_default_rules() -> list[LeagueRule]:
             r"copa\s+am[eé]rica",
             tier=1,
             priority=47,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Nazionali e Amichevoli",
             is_popular=True,
@@ -743,6 +591,8 @@ def _build_default_rules() -> list[LeagueRule]:
             r"(?:africa\s+cup\s+of\s+nations|coppa\s+d'?africa|\bafcon\b)",
             tier=1,
             priority=48,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Nazionali e Amichevoli",
         ),
@@ -750,9 +600,12 @@ def _build_default_rules() -> list[LeagueRule]:
             "international-friendlies",
             "Amichevoli Internazionali",
             "football",
-            r"(?:international\s+friendl(?:y|ies)|amichevol[ei]\s+internazional[ei]|fifa\s+friendl(?:y|ies))",
-            tier=2,
+            r"(?:international\s+friendl(?:y|ies)|friendl(?:y|ies)\s+international|amichevol[ei]\s+internazional[ei]|fifa\s+friendl(?:y|ies))",
+            tier=3,
             priority=48,
+            country_include=("world", "europe", "international"),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Nazionali e Amichevoli",
         ),
@@ -763,6 +616,8 @@ def _build_default_rules() -> list[LeagueRule]:
             r"copa\s+libertadores",
             tier=1,
             priority=49,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Americhe e Leghe Extra-UE",
             is_popular=True,
@@ -774,6 +629,8 @@ def _build_default_rules() -> list[LeagueRule]:
             r"copa\s+sudamericana",
             tier=2,
             priority=50,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Americhe e Leghe Extra-UE",
         ),
@@ -784,16 +641,18 @@ def _build_default_rules() -> list[LeagueRule]:
             r"(?:club\s+world\s+cup|mondiale\s+per\s+club)",
             tier=1,
             priority=51,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Champions League",
             is_popular=True,
         ),
-        # Top European & International Domestic Leagues
+        # Top 5 European Domestic Leagues, Cups & 2nd Divisions
         _rule(
             "premier-league",
             "Premier League",
             "football",
-            r"^(?:england\s*[:-]?\s*)?premier\s+league(?!\s*2\b)(?:\s*[-:]\s*.*)?$",
+            r"^(?:england\s*[:-]?\s*)?premier\s+league(?!\s*(?:2\b|cup\b|international|u\d+))(?:\s*[-:]\s*.*)?$",
             tier=1,
             priority=52,
             country_include=("england",),
@@ -807,11 +666,13 @@ def _build_default_rules() -> list[LeagueRule]:
             "championship",
             "EFL Championship",
             "football",
-            r"(?:efl\s+)?championship",
+            r"^(?:efl\s+)?championship(?:\s*[-:]\s*.*)?$",
             tier=2,
             priority=53,
             country_include=("england",),
             requires_country_match=True,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Premier League",
         ),
@@ -823,6 +684,8 @@ def _build_default_rules() -> list[LeagueRule]:
             tier=1,
             priority=54,
             country_include=("england",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Premier League",
         ),
@@ -830,10 +693,12 @@ def _build_default_rules() -> list[LeagueRule]:
             "efl-cup",
             "Carabao Cup / EFL Cup",
             "football",
-            r"(?:efl\s+cup|carabao\s+cup|league\s+cup)",
+            r"(?:efl\s+cup|carabao\s+cup|(?<!premier\s)\bleague\s+cup\b)",
             tier=2,
             priority=55,
             country_include=("england",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Premier League",
         ),
@@ -859,6 +724,8 @@ def _build_default_rules() -> list[LeagueRule]:
             tier=2,
             priority=57,
             country_include=("spain",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="La Liga",
         ),
@@ -866,10 +733,12 @@ def _build_default_rules() -> list[LeagueRule]:
             "copa-del-rey",
             "Copa del Rey",
             "football",
-            r"copa\s+del\s+rey",
+            r"(?:copa\s+del\s+rey|supercopa\s+de\s+espa[nñ]a)",
             tier=1,
             priority=58,
             country_include=("spain",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="La Liga",
         ),
@@ -881,6 +750,8 @@ def _build_default_rules() -> list[LeagueRule]:
             tier=2,
             priority=59,
             country_include=("germany",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Bundesliga e Ligue 1",
         ),
@@ -902,10 +773,12 @@ def _build_default_rules() -> list[LeagueRule]:
             "dfb-pokal",
             "DFB-Pokal",
             "football",
-            r"dfb[- ]?pokal",
+            r"(?:dfb[- ]?pokal|dfl[- ]?supercup)",
             tier=1,
             priority=61,
             country_include=("germany",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Bundesliga e Ligue 1",
         ),
@@ -913,7 +786,7 @@ def _build_default_rules() -> list[LeagueRule]:
             "ligue-1",
             "Ligue 1",
             "football",
-            r"ligue\s*1(?:\s+mcdonald'?s|\s+uber\s+eats)?",
+            r"^(?:france\s*[:-]?\s*)?ligue\s*1(?:\s+mcdonald'?s|\s+uber\s+eats)?(?:\s*[-:]\s*.*)?$",
             tier=1,
             priority=62,
             country_include=("france",),
@@ -927,10 +800,12 @@ def _build_default_rules() -> list[LeagueRule]:
             "ligue-2",
             "Ligue 2",
             "football",
-            r"ligue\s*2",
+            r"^(?:france\s*[:-]?\s*)?ligue\s*2(?:\s*[-:]\s*.*)?$",
             tier=2,
             priority=63,
             country_include=("france",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Bundesliga e Ligue 1",
         ),
@@ -938,21 +813,26 @@ def _build_default_rules() -> list[LeagueRule]:
             "coupe-de-france",
             "Coupe de France",
             "football",
-            r"coupe\s+de\s+france",
+            r"(?:coupe\s+de\s+france|coppa\s+di\s+francia|troph[eé]e\s+des\s+champions)",
             tier=1,
             priority=64,
             country_include=("france",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Bundesliga e Ligue 1",
         ),
+        # Selected Other Europe & Extra-EU
         _rule(
             "primeira-liga",
             "Liga Portugal",
             "football",
-            r"(?:liga\s+portugal(?:\s+betclic)?|primeira\s+liga)",
+            r"(?:liga\s+portugal(?!\s*2\b)(?:\s+betclic)?|primeira\s+liga|ta[cç]a\s+de\s+portugal)",
             tier=1,
             priority=65,
             country_include=("portugal",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Altri Campionati Europei",
         ),
@@ -960,56 +840,12 @@ def _build_default_rules() -> list[LeagueRule]:
             "eredivisie",
             "Eredivisie",
             "football",
-            r"\beredivisie\b",
+            r"(?:\beredivisie\b|knvb\s+beker)",
             tier=1,
             priority=66,
             country_include=("netherlands",),
-            catalog_target="calcio_estero",
-            genre="Altri Campionati Europei",
-        ),
-        _rule(
-            "jupiler-pro-league",
-            "Jupiler Pro League",
-            "football",
-            r"jupiler\s+(?:pro\s+)?league",
-            tier=2,
-            priority=67,
-            country_include=("belgium",),
-            catalog_target="calcio_estero",
-            genre="Altri Campionati Europei",
-        ),
-        _rule(
-            "super-lig",
-            "Süper Lig",
-            "football",
-            r"s[uü]per\s+lig",
-            tier=2,
-            priority=68,
-            country_include=("turkey",),
-            catalog_target="calcio_estero",
-            genre="Altri Campionati Europei",
-        ),
-        _rule(
-            "scottish-premiership",
-            "Scottish Premiership",
-            "football",
-            r"(?:scottish\s+)?premiership",
-            tier=2,
-            priority=69,
-            country_include=("scotland",),
-            requires_country_match=True,
-            catalog_target="calcio_estero",
-            genre="Altri Campionati Europei",
-        ),
-        _rule(
-            "super-league-greece",
-            "Super League Greece",
-            "football",
-            r"super\s+league",
-            tier=2,
-            priority=70,
-            country_include=("greece",),
-            requires_country_match=True,
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Altri Campionati Europei",
         ),
@@ -1017,9 +853,12 @@ def _build_default_rules() -> list[LeagueRule]:
             "saudi-pro-league",
             "Saudi Pro League",
             "football",
-            r"(?:saudi\s+(?:pro|professional)\s+league|roshn\s+saudi\s+league)",
+            r"(?:saudi\s+(?:pro|professional)\s+league|roshn\s+saudi\s+league|king\s+cup)",
             tier=2,
             priority=71,
+            country_include=("saudi_arabia",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Americhe e Leghe Extra-UE",
         ),
@@ -1027,9 +866,12 @@ def _build_default_rules() -> list[LeagueRule]:
             "mls",
             "MLS",
             "football",
-            r"(?:\bmls\b|major\s+league\s+soccer)",
+            r"(?:\bmls\b(?!\s+next\s+pro)|major\s+league\s+soccer)",
             tier=2,
             priority=72,
+            country_include=("usa",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Americhe e Leghe Extra-UE",
         ),
@@ -1037,24 +879,17 @@ def _build_default_rules() -> list[LeagueRule]:
             "liga-profesional-argentina",
             "Liga Profesional Argentina",
             "football",
-            r"(?:liga\s+profesional|torneo\s+betano|primera\s+divisi[oó]n.*argentina)",
+            r"(?:liga\s+profesional|torneo\s+betano|copa\s+de\s+la\s+liga|primera\s+divisi[oó]n.*argentina)",
             tier=2,
             priority=73,
-            catalog_target="calcio_estero",
-            genre="Americhe e Leghe Extra-UE",
-        ),
-        _rule(
-            "liga-mx",
-            "Liga MX",
-            "football",
-            r"\bliga\s+mx\b",
-            tier=2,
-            priority=74,
+            country_include=("argentina",),
+            is_women=False,
+            is_youth=False,
             catalog_target="calcio_estero",
             genre="Americhe e Leghe Extra-UE",
         ),
         # =====================================================================
-        # TENNIS — Strict Silo Boundary
+        # TENNIS — Strict Silo Boundary (ZERO Challenger / ITF)
         # =====================================================================
         _rule(
             "australian-open",
@@ -1159,20 +994,10 @@ def _build_default_rules() -> list[LeagueRule]:
             is_popular=True,
         ),
         _rule(
-            "atp-challenger",
-            "ATP Challenger",
-            "tennis",
-            r"(?:atp\s+)?challenger",
-            tier=2,
-            priority=25,
-            is_women=False,
-            genre="Challenger e Altri",
-        ),
-        _rule(
             "atp-tour",
             "ATP Tour",
             "tennis",
-            r"\batp\b",
+            r"^(?!.*(?:challenger|itf)).*\batp\b",
             tier=1,
             priority=30,
             is_women=False,
@@ -1183,24 +1008,15 @@ def _build_default_rules() -> list[LeagueRule]:
             "wta-tour",
             "WTA Tour",
             "tennis",
-            r"\bwta\b",
+            r"^(?!.*(?:challenger|itf|wta\s*125)).*\bwta\b",
             tier=1,
             priority=31,
             is_women=True,
             genre="WTA",
             is_popular=True,
         ),
-        _rule(
-            "itf-tennis",
-            "ITF Futures",
-            "tennis",
-            r"(?:\bitf\b|\b(?:m|w)(?:15|25|35|40|50|60|75|80|100)\b|\bfutures\b)",
-            tier=3,
-            priority=90,
-            genre="Challenger e Altri",
-        ),
         # =====================================================================
-        # BASKET — Strict Silo Boundary
+        # BASKET — Strict Silo Boundary (ZERO NCAA / NBA G League)
         # =====================================================================
         _rule(
             "wnba",
@@ -1228,7 +1044,7 @@ def _build_default_rules() -> list[LeagueRule]:
             "euroleague-women",
             "EuroLeague Women",
             "basket",
-            r"euroleague\s+women",
+            r"(?:euroleague\s+women|eurolega\s+(?:femminil[ei]|donne))",
             tier=1,
             priority=15,
             is_women=True,
@@ -1246,6 +1062,17 @@ def _build_default_rules() -> list[LeagueRule]:
             genre="WNBA e Femminile",
         ),
         _rule(
+            "serie-a2-femminile-basket",
+            "Serie A2 Femminile Basket",
+            "basket",
+            r"serie\s*a2",
+            tier=3,
+            priority=16,
+            country_include=("italy",),
+            is_women=True,
+            genre="WNBA e Femminile",
+        ),
+        _rule(
             "euroleague",
             "EuroLeague",
             "basket",
@@ -1257,28 +1084,41 @@ def _build_default_rules() -> list[LeagueRule]:
             is_popular=True,
         ),
         _rule(
+            "eurocup-basket-women",
+            "EuroCup Women",
+            "basket",
+            r"\beurocup\b",
+            tier=3,
+            priority=17,
+            is_women=True,
+            genre="WNBA e Femminile",
+        ),
+        _rule(
             "eurocup-basket",
             "EuroCup",
             "basket",
             r"\beurocup\b",
             tier=2,
             priority=17,
+            is_women=False,
             genre="Eurolega ed Eurocup",
         ),
         _rule(
             "basketball-champions-league",
             "Basketball Champions League",
             "basket",
-            r"(?:basketball\s+champions\s+league|\bbcl\b)",
+            r"(?:(?:basketball\s+)?champions\s+league|\bbcl\b)",
             tier=2,
             priority=18,
+            country_include=("europe",),
+            is_women=False,
             genre="Eurolega ed Eurocup",
         ),
         _rule(
             "lba-serie-a",
             "LBA Serie A",
             "basket",
-            r"(?:lba|lega\s*a\b|serie\s*a(?:\s+unipolsai)?)",
+            r"(?:\blba\b|\blega\s*a\b|\bserie\s*a\b(?:\s+unipolsai)?|\bcoppa\s+italia\b|\bsupercoppa\b)",
             tier=1,
             priority=20,
             country_include=("italy",),
@@ -1294,60 +1134,29 @@ def _build_default_rules() -> list[LeagueRule]:
             tier=2,
             priority=21,
             country_include=("italy",),
+            is_women=False,
             genre="LBA Serie A",
         ),
         _rule(
             "liga-acb",
             "Liga ACB",
             "basket",
-            r"(?:liga\s+)?acb|liga\s+endesa",
+            r"(?:(?:liga\s+)?acb|liga\s+endesa)",
             tier=1,
             priority=22,
+            country_include=("spain",),
+            is_women=False,
             genre="Campionati Esteri ed NBL",
-        ),
-        _rule(
-            "bbl-germany",
-            "Basketball Bundesliga",
-            "basket",
-            r"\bbbl\b|easycredit\s+bbl",
-            tier=2,
-            priority=23,
-            genre="Campionati Esteri ed NBL",
-        ),
-        _rule(
-            "betclic-elite",
-            "Betclic Élite",
-            "basket",
-            r"(?:betclic\s+[eé]lite|lnb\s+pro\s*a)",
-            tier=2,
-            priority=24,
-            genre="Campionati Esteri ed NBL",
-        ),
-        _rule(
-            "nbl-australia",
-            "NBL Australia",
-            "basket",
-            r"\bnbl\b",
-            tier=2,
-            priority=24,
-            genre="Campionati Esteri ed NBL",
-        ),
-        _rule(
-            "ncaa-basketball",
-            "NCAA Basketball",
-            "basket",
-            r"\bncaa\b|march\s+madness",
-            tier=2,
-            priority=25,
-            genre="NCAA e College Basket",
         ),
         _rule(
             "fiba-international",
             "FIBA International",
             "basket",
-            r"(?:fiba\s+(?:world\s+cup|eurobasket|americup|olympic)|eurobasket)",
+            r"(?:\bfiba\b|eurobasket|\bworld\s+cup\b|\bmondiali\b|\beuropei\b|americup|olympic|olimpiad)",
             tier=1,
             priority=26,
+            country_include=("world", "europe", "america", "australasia", "international", "asia", "africa"),
+            is_youth=False,
             genre="FIBA e Tornei Nazionali",
         ),
         # =====================================================================
@@ -1467,11 +1276,11 @@ def _build_default_rules() -> list[LeagueRule]:
         # COMBAT — Strict Silo Boundary
         # =====================================================================
         _rule("ufc", "UFC", "combat", r"\bufc\b", tier=1, priority=10, genre="UFC", is_popular=True),
-        _rule("bellator", "Bellator MMA", "combat", r"\bbellator\b", tier=2, priority=15, genre="MMA"),
-        _rule("pfl", "PFL", "combat", r"\bpfl\b", tier=2, priority=16, genre="MMA"),
-        _rule("one-championship", "ONE Championship", "combat", r"\bone\s+championship\b|\bone\s+friday\b", tier=2, priority=17, genre="MMA"),
-        _rule("ksw", "KSW", "combat", r"\bksw\b", tier=2, priority=18, genre="MMA"),
-        _rule("oktagon", "Oktagon MMA", "combat", r"\boktagon\b", tier=2, priority=19, genre="MMA"),
+        _rule("bellator", "Bellator MMA", "combat", r"\bbellator\b", tier=3, priority=15, genre="MMA"),
+        _rule("pfl", "PFL", "combat", r"\bpfl\b", tier=3, priority=16, genre="MMA"),
+        _rule("one-championship", "ONE Championship", "combat", r"\bone\s+championship\b|\bone\s+friday\b", tier=3, priority=17, genre="MMA"),
+        _rule("ksw", "KSW", "combat", r"\bksw\b", tier=3, priority=18, genre="MMA"),
+        _rule("oktagon", "Oktagon MMA", "combat", r"\boktagon\b", tier=3, priority=19, genre="MMA"),
         _rule(
             "boxing",
             "Boxing",
@@ -1495,6 +1304,7 @@ def _build_default_rules() -> list[LeagueRule]:
             tier=1,
             priority=10,
             country_include=("italy",),
+            requires_country_match=True,
             is_women=False,
             genre="Superlega e Serie A1",
             is_popular=True,
@@ -1519,7 +1329,41 @@ def _build_default_rules() -> list[LeagueRule]:
             tier=2,
             priority=15,
             country_include=("italy",),
+            is_women=False,
             genre="Superlega e Serie A1",
+        ),
+        _rule(
+            "serie-a2-femminile-volley",
+            "Serie A2 Femminile Volley",
+            "volley",
+            r"serie\s*a2",
+            tier=3,
+            priority=16,
+            country_include=("italy",),
+            is_women=True,
+            genre="Volley Femminile",
+        ),
+        _rule(
+            "coppa-italia-volley",
+            "Coppa Italia Volley",
+            "volley",
+            r"coppa\s+italia",
+            tier=2,
+            priority=17,
+            country_include=("italy",),
+            is_women=False,
+            genre="Superlega e Serie A1",
+        ),
+        _rule(
+            "coppa-italia-femminile-volley",
+            "Coppa Italia Femminile Volley",
+            "volley",
+            r"coppa\s+italia",
+            tier=2,
+            priority=18,
+            country_include=("italy",),
+            is_women=True,
+            genre="Volley Femminile",
         ),
         _rule(
             "cev-champions-league",
@@ -1528,55 +1372,218 @@ def _build_default_rules() -> list[LeagueRule]:
             r"(?:cev\s+)?champions\s+league",
             tier=1,
             priority=20,
+            country_include=("europe",),
+            is_women=False,
             genre="Champions League Volley",
+        ),
+        _rule(
+            "cev-champions-league-women",
+            "CEV Champions League Femminile",
+            "volley",
+            r"(?:cev\s+)?champions\s+league",
+            tier=1,
+            priority=21,
+            country_include=("europe",),
+            is_women=True,
+            genre="Volley Femminile",
+        ),
+        _rule(
+            "cev-cup",
+            "CEV Cup",
+            "volley",
+            r"\bcev\s+cup\b",
+            tier=3,
+            priority=22,
+            country_include=("europe",),
+            is_women=False,
+            genre="Champions League Volley",
+        ),
+        _rule(
+            "cev-cup-women",
+            "CEV Cup Femminile",
+            "volley",
+            r"\bcev\s+cup\b",
+            tier=3,
+            priority=23,
+            country_include=("europe",),
+            is_women=True,
+            genre="Volley Femminile",
+        ),
+        _rule(
+            "cev-challenge-cup",
+            "CEV Challenge Cup",
+            "volley",
+            r"\bchallenge\s+cup\b",
+            tier=3,
+            priority=24,
+            country_include=("europe",),
+            is_women=False,
+            genre="Champions League Volley",
+        ),
+        _rule(
+            "cev-challenge-cup-women",
+            "CEV Challenge Cup Femminile",
+            "volley",
+            r"\bchallenge\s+cup\b",
+            tier=3,
+            priority=25,
+            country_include=("europe",),
+            is_women=True,
+            genre="Volley Femminile",
         ),
         _rule(
             "vnl-volley",
             "Volleyball Nations League",
             "volley",
-            r"(?:nations\s+league|\bvnl\b|world\s+championship)",
+            r"(?:nations\s+league|\bvnl\b|world\s+championship|\bmondiali\b|european\s+championship|campionati\s+europei)",
             tier=1,
-            priority=25,
+            priority=26,
+            is_youth=False,
             genre="Nazionali e Internazionale",
         ),
-        _rule("plusliga", "PlusLiga", "volley", r"\bplusliga\b", tier=2, priority=30, genre="Nazionali e Internazionale"),
-        _rule("sultanlar-ligi", "Sultanlar Ligi", "volley", r"sultanlar\s+ligi", tier=2, priority=31, is_women=True, genre="Volley Femminile"),
         # =====================================================================
         # NFL / HOCKEY / BASEBALL / RUGBY / HANDBALL
         # =====================================================================
         _rule("nfl", "NFL", "nfl", r"\bnfl\b", tier=1, priority=10, genre="NFL", is_popular=True),
-        _rule("ncaaf", "NCAA Football", "nfl", r"\bncaa\b|college\s+football", tier=2, priority=15, genre="NCAA College Football"),
-        _rule("cfl", "CFL", "nfl", r"\bcfl\b", tier=2, priority=20, genre="CFL e Altre Leghe"),
-        _rule("ufl", "UFL", "nfl", r"\bufl\b", tier=2, priority=21, genre="CFL e Altre Leghe"),
+        _rule(
+            "ncaaf",
+            "NCAA Football",
+            "nfl",
+            r"^(?!.*(?:fcs|div(?:ision)?\s*(?:ii|iii|2|3))).*(?:\bncaa\b|college\s+football)",
+            tier=2,
+            priority=15,
+            genre="NCAA College Football",
+        ),
         _rule("nhl", "NHL", "hockey", r"\bnhl\b", tier=1, priority=10, genre="NHL", is_popular=True),
-        _rule("khl", "KHL", "hockey", r"\bkhl\b", tier=2, priority=15, genre="KHL e Leghe Europee"),
-        _rule("shl", "SHL", "hockey", r"\bshl\b", tier=2, priority=16, genre="KHL e Leghe Europee"),
-        _rule("liiga", "Liiga", "hockey", r"\bliiga\b", tier=2, priority=17, genre="KHL e Leghe Europee"),
-        _rule("del-hockey", "DEL", "hockey", r"\bdel\b", tier=2, priority=18, country_include=("germany",), genre="KHL e Leghe Europee"),
-        _rule("nl-switzerland", "National League", "hockey", r"\bnational\s+league\b", tier=2, priority=19, genre="KHL e Leghe Europee"),
-        _rule("iihf-world-championship", "IIHF World Championship", "hockey", r"\biihf\b|world\s+championship", tier=1, priority=20, genre="Mondiali e Nazionali"),
         _rule("mlb", "MLB", "baseball", r"\bmlb\b", tier=1, priority=10, genre="MLB", is_popular=True),
-        _rule("ncaa-baseball", "NCAA College Baseball", "baseball", r"\bncaa\b|college\s+baseball", tier=2, priority=12, genre="NCAA College Baseball"),
-        _rule("npb", "NPB", "baseball", r"\bnpb\b", tier=2, priority=15, genre="Campionati Internazionali"),
-        _rule("kbo", "KBO", "baseball", r"\bkbo\b", tier=2, priority=16, genre="Campionati Internazionali"),
-        _rule("wbc", "World Baseball Classic", "baseball", r"world\s+baseball\s+classic|\bwbc\b", tier=1, priority=17, genre="Campionati Internazionali"),
-        _rule("six-nations", "Six Nations", "rugby", r"(?:six\s+nations|sei\s+nazioni)", tier=1, priority=10, catalog_target="altri_sport", genre="Rugby e AFL", is_popular=True),
-        _rule("rugby-championship", "Rugby Championship", "rugby", r"rugby\s+championship", tier=1, priority=11, catalog_target="altri_sport", genre="Rugby e AFL"),
-        _rule("rugby-world-cup", "Rugby World Cup", "rugby", r"(?:rugby\s+)?world\s+cup", tier=1, priority=12, catalog_target="altri_sport", genre="Rugby e AFL"),
-        _rule("rugby-champions-cup", "Investec Champions Cup", "rugby", r"champions\s+cup", tier=1, priority=15, catalog_target="altri_sport", genre="Rugby e AFL"),
-        _rule("rugby-challenge-cup", "EPCR Challenge Cup", "rugby", r"challenge\s+cup", tier=2, priority=16, catalog_target="altri_sport", genre="Rugby e AFL"),
-        _rule("urc-rugby", "United Rugby Championship", "rugby", r"(?:united\s+rugby\s+championship|\burc\b)", tier=1, priority=17, catalog_target="altri_sport", genre="Rugby e AFL"),
-        _rule("top-14", "Top 14", "rugby", r"\btop\s*14\b", tier=1, priority=18, catalog_target="altri_sport", genre="Rugby e AFL"),
-        _rule("premiership-rugby", "Premiership Rugby", "rugby", r"premiership", tier=1, priority=19, catalog_target="altri_sport", genre="Rugby e AFL"),
-        _rule("super-rugby", "Super Rugby", "rugby", r"super\s+rugby", tier=2, priority=20, catalog_target="altri_sport", genre="Rugby e AFL"),
-        _rule("serie-a-elite-rugby", "Serie A Elite Rugby", "rugby", r"serie\s*a\s+elite", tier=2, priority=21, country_include=("italy",), catalog_target="altri_sport", genre="Rugby e AFL"),
-        _rule("ehf-champions-league", "EHF Champions League", "handball", r"(?:ehf\s+)?champions\s+league", tier=1, priority=10, catalog_target="altri_sport", genre="Pallamano"),
-        _rule("ehf-european-league", "EHF European League", "handball", r"(?:ehf\s+)?european\s+league", tier=2, priority=15, catalog_target="altri_sport", genre="Pallamano"),
-        _rule("handball-bundesliga", "Handball-Bundesliga", "handball", r"bundesliga", tier=1, priority=16, catalog_target="altri_sport", genre="Pallamano"),
-        _rule("liga-asobal", "Liga ASOBAL", "handball", r"asobal", tier=2, priority=17, catalog_target="altri_sport", genre="Pallamano"),
-        _rule("starligue", "Liqui Moly StarLigue", "handball", r"starligue", tier=2, priority=18, catalog_target="altri_sport", genre="Pallamano"),
-        _rule("serie-a-gold-handball", "Serie A Gold Pallamano", "handball", r"serie\s*a\s+gold", tier=2, priority=19, country_include=("italy",), catalog_target="altri_sport", genre="Pallamano"),
-        _rule("ihf-handball", "IHF / EHF Championship", "handball", r"(?:world\s+championship|european\s+championship|\bihf\b|\behf\s+euro\b)", tier=1, priority=20, catalog_target="altri_sport", genre="Pallamano"),
+        _rule(
+            "six-nations",
+            "Six Nations",
+            "rugby",
+            r"^(?!.*(?:amichevol|friendly|esibizione|exhibition|test\s+match)).*(?:six\s+nations|sei\s+nazioni)",
+            tier=1,
+            priority=10,
+            country_include=("europe",),
+            is_women=False,
+            is_youth=False,
+            catalog_target="altri_sport",
+            genre="Rugby e AFL",
+            is_popular=True,
+        ),
+        _rule(
+            "nations-championship",
+            "Nations Championship",
+            "rugby",
+            r"^(?!.*(?:amichevol|friendly|esibizione|exhibition|test\s+match)).*(?:nations\s+championship|autumn\s+nations|world\s+rugby\s+nations\s+cup)",
+            tier=1,
+            priority=11,
+            country_include=("world", "international"),
+            is_women=False,
+            is_youth=False,
+            catalog_target="altri_sport",
+            genre="Rugby e AFL",
+        ),
+        _rule(
+            "rugby-championship",
+            "Rugby Championship",
+            "rugby",
+            r"^(?!.*(?:amichevol|friendly|esibizione|exhibition|test\s+match)).*rugby\s+championship",
+            tier=1,
+            priority=12,
+            country_include=("world", "international"),
+            is_women=False,
+            is_youth=False,
+            catalog_target="altri_sport",
+            genre="Rugby e AFL",
+        ),
+        _rule(
+            "rugby-world-cup",
+            "Rugby World Cup",
+            "rugby",
+            r"^(?!.*(?:amichevol|friendly|esibizione|exhibition|test\s+match)).*(?:(?:rugby\s+)?world\s+cup|coppa\s+del\s+mondo)",
+            tier=1,
+            priority=13,
+            country_include=("world", "international"),
+            is_women=False,
+            is_youth=False,
+            catalog_target="altri_sport",
+            genre="Rugby e AFL",
+        ),
+        _rule(
+            "rugby-champions-cup",
+            "Investec Champions Cup",
+            "rugby",
+            r"^(?!.*(?:amichevol|friendly|esibizione|exhibition|test\s+match)).*champions\s+cup",
+            tier=1,
+            priority=15,
+            country_include=("europe",),
+            is_women=False,
+            is_youth=False,
+            catalog_target="altri_sport",
+            genre="Rugby e AFL",
+        ),
+        _rule(
+            "rugby-challenge-cup",
+            "EPCR Challenge Cup",
+            "rugby",
+            r"^(?!.*(?:amichevol|friendly|esibizione|exhibition|test\s+match)).*challenge\s+cup",
+            tier=2,
+            priority=16,
+            country_include=("europe",),
+            is_women=False,
+            is_youth=False,
+            catalog_target="altri_sport",
+            genre="Rugby e AFL",
+        ),
+        _rule(
+            "urc-rugby",
+            "United Rugby Championship",
+            "rugby",
+            r"^(?!.*(?:amichevol|friendly|esibizione|exhibition|test\s+match)).*(?:united\s+rugby\s+championship|\burc\b)",
+            tier=1,
+            priority=17,
+            country_include=("europe",),
+            is_women=False,
+            is_youth=False,
+            catalog_target="altri_sport",
+            genre="Rugby e AFL",
+        ),
+        _rule(
+            "serie-a-elite-rugby",
+            "Serie A Elite Rugby",
+            "rugby",
+            r"^(?!.*(?:amichevol|friendly|esibizione|exhibition|test\s+match)).*(?:serie\s*a\s+elite|top\s*10|coppa\s+italia)",
+            tier=2,
+            priority=21,
+            country_include=("italy",),
+            requires_country_match=True,
+            is_women=False,
+            is_youth=False,
+            catalog_target="altri_sport",
+            genre="Rugby e AFL",
+        ),
+        _rule(
+            "ehf-champions-league",
+            "EHF Champions League",
+            "handball",
+            r"(?:ehf\s+)?champions\s+league",
+            tier=3,
+            priority=10,
+            country_include=("europe",),
+            catalog_target="altri_sport",
+            genre="Pallamano",
+        ),
+        _rule(
+            "ihf-handball",
+            "IHF / EHF Championship",
+            "handball",
+            r"(?:world\s+championship|european\s+championship|\bmondiali\b|\beuropei\b|\bihf\b|\behf\s+euro\b)",
+            tier=3,
+            priority=20,
+            country_include=("world", "europe", "international"),
+            catalog_target="altri_sport",
+            genre="Pallamano",
+        ),
         # =====================================================================
         # ALTRI SPORT — Strict Silo Boundary
         # =====================================================================
@@ -1592,6 +1599,48 @@ def _build_default_rules() -> list[LeagueRule]:
         _rule("olympics", "Olimpiadi", "altri_sport", r"(?:olympic|olimpiad)", tier=1, priority=40, genre="Sport Olimpici e Atletica"),
     ]
     return rules
+
+
+def _apply_demographic_genre(
+    target: str,
+    canonical_slug: str,
+    genre: str | None,
+    *,
+    is_women: bool,
+    is_youth: bool,
+) -> str | None:
+    if target in ("calcio_ita", "calcio_italiano"):
+        if is_youth:
+            return "Primavera e Giovanili"
+        if is_women:
+            return "Calcio Femminile"
+        return genre
+    if target in ("calcio_estero", "football"):
+        if is_youth:
+            return "Europei Under 21 e Nazionali Giovanili"
+        if is_women:
+            if "champions-league" in canonical_slug or "uwcl" in canonical_slug:
+                return "Champions League Femminile"
+            if genre in (
+                "Champions League Femminile",
+                "Premier League",
+                "La Liga",
+                "Bundesliga e Ligue 1",
+                "Altri Campionati Europei",
+                "Americhe e Leghe Extra-UE",
+            ):
+                return genre
+            return "Altri Campionati Europei"
+        return genre
+    if target == "basket":
+        if is_women:
+            return "WNBA e Femminile"
+        return genre
+    if target == "volley":
+        if is_women:
+            return "Volley Femminile"
+        return genre
+    return genre
 
 
 def _demographics_slug(base_slug: str, is_women: bool, is_youth: bool, country_norm: str) -> str:
@@ -1625,6 +1674,50 @@ class LeagueTaxonomy:
             self._rules_by_bucket.setdefault(bucket, []).append(r)
         for bucket in self._rules_by_bucket:
             self._rules_by_bucket[bucket].sort(key=lambda r: r.priority)
+
+        self._routing_by_slug: dict[str, tuple[str, str]] = {}
+        for bucket_rules in self._rules_by_bucket.values():
+            for r in bucket_rules:
+                target = r.catalog_target or _SILO_DEFAULT_CATALOG.get(r.silo, "altri_sport")
+                if r.genre and r.canonical_slug not in self._routing_by_slug:
+                    self._routing_by_slug[r.canonical_slug] = (target, r.genre)
+
+    def resolve_catalog_and_genre(self, canonical_slug: str) -> tuple[str, list[str]] | None:
+        """Resolve `(catalog_target, [genre])` from a canonical slug (Single Source of Truth)."""
+        slug = (canonical_slug or "").strip().lower()
+        if not slug:
+            return None
+        if slug in self._routing_by_slug:
+            target, genre = self._routing_by_slug[slug]
+            return target, [genre]
+
+        is_youth = False
+        is_women = False
+        base = slug
+        if base.endswith("-youth"):
+            is_youth = True
+            base = base[:-6]
+        if base.endswith("-femminile"):
+            is_women = True
+            base = base[:-10]
+        elif base.endswith("-women"):
+            is_women = True
+            base = base[:-6]
+
+        entry = self._routing_by_slug.get(base)
+        if entry is None:
+            return None
+        target, base_genre = entry
+        eff_genre = _apply_demographic_genre(
+            target,
+            base,
+            base_genre,
+            is_women=is_women,
+            is_youth=is_youth,
+        )
+        if not eff_genre:
+            return None
+        return target, [eff_genre]
 
     def match_league(
         self,
@@ -1666,23 +1759,13 @@ class LeagueTaxonomy:
             slug = _demographics_slug(rule.canonical_slug, is_women, is_youth, country_norm)
             name = _demographics_name(rule.canonical_name, is_women, is_youth, country_norm)
             target = rule.catalog_target or _SILO_DEFAULT_CATALOG.get(silo, "altri_sport")
-            genre = rule.genre
-            if is_women and bucket == "football":
-                if target in ("calcio_ita", "calcio_italiano"):
-                    genre = "Calcio Femminile"
-                elif "champions" in rule.canonical_slug:
-                    genre = "Champions League Femminile"
-                elif genre not in (
-                    "Champions League Femminile",
-                    "Premier League",
-                    "La Liga",
-                    "Bundesliga e Ligue 1",
-                    "Altri Campionati Europei",
-                    "Americhe e Leghe Extra-UE",
-                ):
-                    genre = "Altri Campionati Europei"
-            elif is_youth and target in ("calcio_ita", "calcio_italiano"):
-                genre = "Primavera e Giovanili"
+            genre = _apply_demographic_genre(
+                target,
+                rule.canonical_slug,
+                rule.genre,
+                is_women=is_women,
+                is_youth=is_youth,
+            )
 
             return LeagueMatch(
                 canonical_slug=slug,
@@ -1707,29 +1790,13 @@ class LeagueTaxonomy:
         has_broadcasters: bool = False,
         has_streams: bool = False,
     ) -> bool:
-        """Tier 1/2 admission filter.
-
-        Admits recognized Tier 1/2 competitions unconditionally. Rejects minor
-        leagues (Tier 3 or unrecognized low-tier regional/ITF competitions)
-        when neither official broadcasters nor live streams are present.
-        """
-        if has_streams:
-            return True
-
+        """Tier admission filter: Tier 1/2 always, Tier 3 only with Italian TV/stream coverage."""
         match = self.match_league(silo, competition, country)
-        if match is not None:
-            if match.tier in (1, 2):
-                return True
-            return bool(has_broadcasters or has_streams)
-
-        bucket = _silo_rule_bucket(silo)
-        minor_re = _MINOR_COMPETITION_PATTERNS.get(bucket)
-        clean_comp = _normalize_text(competition)
-        if minor_re and clean_comp and minor_re.search(clean_comp):
-            return bool(has_broadcasters or has_streams)
-
-        # Unrecognized football/tennis/minor competitions without coverage are dropped.
-        return bool(has_broadcasters)
+        if match is None:
+            return False
+        if match.tier in (1, 2):
+            return True
+        return bool(has_broadcasters or has_streams)
 
 
 DEFAULT_LEAGUE_TAXONOMY = LeagueTaxonomy()

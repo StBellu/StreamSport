@@ -459,169 +459,6 @@ def _resolve_simulcast(
         return "calcio_estero", ["Altri Campionati Europei"]
     return "calcio_italiano", ["Serie A"]
 
-# Canonical slug -> (catalog_id, genres) quick map for Level 1 when pre-validated
-_CANONICAL_SLUG_ROUTING: dict[str, tuple[str, list[str]]] = {
-    "serie-a": ("calcio_italiano", ["Serie A"]),
-    "serie-b": ("calcio_italiano", ["Serie B"]),
-    "serie-c": ("calcio_italiano", ["Serie C"]),
-    "coppa-italia": ("calcio_italiano", ["Coppa Italia e Supercoppa"]),
-    "supercoppa-italiana": ("calcio_italiano", ["Coppa Italia e Supercoppa"]),
-    "serie-a-femminile": ("calcio_italiano", ["Calcio Femminile"]),
-    "coppa-italia-femminile": ("calcio_italiano", ["Calcio Femminile"]),
-    "primavera-1": ("calcio_italiano", ["Primavera e Giovanili"]),
-    "primavera-2": ("calcio_italiano", ["Primavera e Giovanili"]),
-    "coppa-italia-primavera": ("calcio_italiano", ["Primavera e Giovanili"]),
-    "champions-league": ("calcio_estero", ["Champions League"]),
-    "uefa-super-cup": ("calcio_estero", ["Champions League"]),
-    "club-world-cup": ("calcio_estero", ["Champions League"]),
-    "uefa-womens-champions-league": ("calcio_estero", ["Champions League Femminile"]),
-    "europa-league": ("calcio_estero", ["Europa e Conference League"]),
-    "conference-league": ("calcio_estero", ["Europa e Conference League"]),
-    "premier-league": ("calcio_estero", ["Premier League"]),
-    "championship": ("calcio_estero", ["Premier League"]),
-    "fa-cup": ("calcio_estero", ["Premier League"]),
-    "efl-cup": ("calcio_estero", ["Premier League"]),
-    "wsl-women": ("calcio_estero", ["Premier League"]),
-    "la-liga": ("calcio_estero", ["La Liga"]),
-    "la-liga-2": ("calcio_estero", ["La Liga"]),
-    "copa-del-rey": ("calcio_estero", ["La Liga"]),
-    "liga-f-women": ("calcio_estero", ["La Liga"]),
-    "bundesliga": ("calcio_estero", ["Bundesliga e Ligue 1"]),
-    "2-bundesliga": ("calcio_estero", ["Bundesliga e Ligue 1"]),
-    "dfb-pokal": ("calcio_estero", ["Bundesliga e Ligue 1"]),
-    "frauen-bundesliga": ("calcio_estero", ["Bundesliga e Ligue 1"]),
-    "ligue-1": ("calcio_estero", ["Bundesliga e Ligue 1"]),
-    "ligue-2": ("calcio_estero", ["Bundesliga e Ligue 1"]),
-    "coupe-de-france": ("calcio_estero", ["Bundesliga e Ligue 1"]),
-    "d1-arkema": ("calcio_estero", ["Bundesliga e Ligue 1"]),
-    "primeira-liga": ("calcio_estero", ["Altri Campionati Europei"]),
-    "eredivisie": ("calcio_estero", ["Altri Campionati Europei"]),
-    "jupiler-pro-league": ("calcio_estero", ["Altri Campionati Europei"]),
-    "super-lig": ("calcio_estero", ["Altri Campionati Europei"]),
-    "scottish-premiership": ("calcio_estero", ["Altri Campionati Europei"]),
-    "super-league-greece": ("calcio_estero", ["Altri Campionati Europei"]),
-    "brasileirao-serie-a": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "brasileirao-serie-b": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "ecuador-ligapro-serie-a": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "colombia-primera-a": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "copa-libertadores": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "copa-sudamericana": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "liga-profesional-argentina": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "mls": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "liga-mx": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "saudi-pro-league": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "nwsl": ("calcio_estero", ["Americhe e Leghe Extra-UE"]),
-    "uefa-youth-league": ("calcio_estero", ["Europei Under 21 e Nazionali Giovanili"]),
-    "euro-u21": ("calcio_estero", ["Europei Under 21 e Nazionali Giovanili"]),
-    "u21-international": ("calcio_estero", ["Europei Under 21 e Nazionali Giovanili"]),
-    "nations-league": ("calcio_estero", ["Nazionali e Amichevoli"]),
-    "world-cup": ("calcio_estero", ["Nazionali e Amichevoli"]),
-    "euro-championship": ("calcio_estero", ["Nazionali e Amichevoli"]),
-    "copa-america": ("calcio_estero", ["Nazionali e Amichevoli"]),
-    "afcon": ("calcio_estero", ["Nazionali e Amichevoli"]),
-    "international-friendlies": ("calcio_estero", ["Nazionali e Amichevoli"]),
-    "australian-open": ("tennis", ["Grandi Slam"]),
-    "roland-garros": ("tennis", ["Grandi Slam"]),
-    "wimbledon": ("tennis", ["Grandi Slam"]),
-    "us-open": ("tennis", ["Grandi Slam"]),
-    "atp-finals": ("tennis", ["ATP"]),
-    "atp-tour": ("tennis", ["ATP"]),
-    "wta-finals": ("tennis", ["WTA"]),
-    "wta-tour": ("tennis", ["WTA"]),
-    "atp-challenger": ("tennis", ["Challenger e Altri"]),
-    "itf-tennis": ("tennis", ["Challenger e Altri"]),
-    "davis-cup": ("tennis", ["Coppa Davis e BJK Cup"]),
-    "bjk-cup": ("tennis", ["Coppa Davis e BJK Cup"]),
-    "united-cup": ("tennis", ["Coppa Davis e BJK Cup"]),
-    "laver-cup": ("tennis", ["Coppa Davis e BJK Cup"]),
-    "nba": ("basket", ["NBA"]),
-    "wnba": ("basket", ["WNBA e Femminile"]),
-    "euroleague-women": ("basket", ["WNBA e Femminile"]),
-    "serie-a1-femminile-basket": ("basket", ["WNBA e Femminile"]),
-    "euroleague": ("basket", ["Eurolega ed Eurocup"]),
-    "eurocup-basket": ("basket", ["Eurolega ed Eurocup"]),
-    "basketball-champions-league": ("basket", ["Eurolega ed Eurocup"]),
-    "fiba-international": ("basket", ["FIBA e Tornei Nazionali"]),
-    "lba-serie-a": ("basket", ["LBA Serie A"]),
-    "serie-a2-basket": ("basket", ["LBA Serie A"]),
-    "liga-acb": ("basket", ["Campionati Esteri ed NBL"]),
-    "bbl-germany": ("basket", ["Campionati Esteri ed NBL"]),
-    "betclic-elite": ("basket", ["Campionati Esteri ed NBL"]),
-    "nbl-australia": ("basket", ["Campionati Esteri ed NBL"]),
-    "ncaa-basketball": ("basket", ["NCAA e College Basket"]),
-    "formula-1": ("motori", ["Formula 1"]),
-    "formula-2": ("motori", ["Formula 1"]),
-    "formula-3": ("motori", ["Formula 1"]),
-    "formula-e": ("motori", ["Formula 1"]),
-    "motogp": ("motori", ["MotoGP e Superbike"]),
-    "moto2": ("motori", ["MotoGP e Superbike"]),
-    "moto3": ("motori", ["MotoGP e Superbike"]),
-    "wsbk": ("motori", ["MotoGP e Superbike"]),
-    "wrc": ("motori", ["Rally e WRC"]),
-    "indycar": ("motori", ["NASCAR e IndyCar"]),
-    "nascar": ("motori", ["NASCAR e IndyCar"]),
-    "wec": ("motori", ["NASCAR e IndyCar"]),
-    "ufc": ("combattimento", ["UFC"]),
-    "bellator": ("combattimento", ["MMA"]),
-    "pfl": ("combattimento", ["MMA"]),
-    "one-championship": ("combattimento", ["MMA"]),
-    "ksw": ("combattimento", ["MMA"]),
-    "oktagon": ("combattimento", ["MMA"]),
-    "boxing": ("combattimento", ["Boxe"]),
-    "wwe": ("combattimento", ["Wrestling e WWE"]),
-    "aew": ("combattimento", ["Wrestling e WWE"]),
-    "superlega-volley": ("volley", ["Superlega e Serie A1"]),
-    "serie-a2-volley": ("volley", ["Superlega e Serie A1"]),
-    "serie-a1-femminile-volley": ("volley", ["Volley Femminile"]),
-    "sultanlar-ligi": ("volley", ["Volley Femminile"]),
-    "cev-champions-league": ("volley", ["Champions League Volley"]),
-    "vnl-volley": ("volley", ["Nazionali e Internazionale"]),
-    "plusliga": ("volley", ["Nazionali e Internazionale"]),
-    "nfl": ("football_americano", ["NFL"]),
-    "ncaaf": ("football_americano", ["NCAA College Football"]),
-    "cfl": ("football_americano", ["CFL e Altre Leghe"]),
-    "ufl": ("football_americano", ["CFL e Altre Leghe"]),
-    "nhl": ("hockey", ["NHL"]),
-    "khl": ("hockey", ["KHL e Leghe Europee"]),
-    "shl": ("hockey", ["KHL e Leghe Europee"]),
-    "liiga": ("hockey", ["KHL e Leghe Europee"]),
-    "del-hockey": ("hockey", ["KHL e Leghe Europee"]),
-    "nl-switzerland": ("hockey", ["KHL e Leghe Europee"]),
-    "iihf-world-championship": ("hockey", ["Mondiali e Nazionali"]),
-    "mlb": ("baseball", ["MLB"]),
-    "ncaa-baseball": ("baseball", ["NCAA College Baseball"]),
-    "npb": ("baseball", ["Campionati Internazionali"]),
-    "kbo": ("baseball", ["Campionati Internazionali"]),
-    "wbc": ("baseball", ["Campionati Internazionali"]),
-    "six-nations": ("altri_sport", ["Rugby e AFL"]),
-    "rugby-championship": ("altri_sport", ["Rugby e AFL"]),
-    "rugby-world-cup": ("altri_sport", ["Rugby e AFL"]),
-    "rugby-champions-cup": ("altri_sport", ["Rugby e AFL"]),
-    "rugby-challenge-cup": ("altri_sport", ["Rugby e AFL"]),
-    "urc-rugby": ("altri_sport", ["Rugby e AFL"]),
-    "top-14": ("altri_sport", ["Rugby e AFL"]),
-    "premiership-rugby": ("altri_sport", ["Rugby e AFL"]),
-    "super-rugby": ("altri_sport", ["Rugby e AFL"]),
-    "serie-a-elite-rugby": ("altri_sport", ["Rugby e AFL"]),
-    "afl": ("altri_sport", ["Rugby e AFL"]),
-    "ehf-champions-league": ("altri_sport", ["Pallamano"]),
-    "ehf-european-league": ("altri_sport", ["Pallamano"]),
-    "handball-bundesliga": ("altri_sport", ["Pallamano"]),
-    "liga-asobal": ("altri_sport", ["Pallamano"]),
-    "starligue": ("altri_sport", ["Pallamano"]),
-    "serie-a-gold-handball": ("altri_sport", ["Pallamano"]),
-    "ihf-handball": ("altri_sport", ["Pallamano"]),
-    "golf-major": ("altri_sport", ["Golf"]),
-    "darts": ("altri_sport", ["Freccette / Darts"]),
-    "cycling-major": ("altri_sport", ["Ciclismo"]),
-    "cricket-major": ("altri_sport", ["Cricket"]),
-    "winter-sports": ("altri_sport", ["Sport Invernali"]),
-    "athletics": ("altri_sport", ["Sport Olimpici e Atletica"]),
-    "olympics": ("altri_sport", ["Sport Olimpici e Atletica"]),
-    "snooker": ("altri_sport", ["Biliardo, Padel e Altri"]),
-    "padel": ("altri_sport", ["Biliardo, Padel e Altri"]),
-}
-
 
 def build_stremio_catalogs(catalog_type: str = "tv") -> list[dict[str, Any]]:
     """Build Stremio `ManifestCatalog` entries with nested `genre` dropdown filters."""
@@ -712,10 +549,13 @@ class GenreClassifier:
         if simulcast_res is not None:
             return simulcast_res
 
-        # Level 1: Validated Canonical Competition routing
-        if canonical_competition and canonical_competition in _CANONICAL_SLUG_ROUTING:
-            cat_id, genres = _CANONICAL_SLUG_ROUTING[canonical_competition]
-            return cat_id, list(genres)
+        # Level 1: Validated Canonical Competition routing (Single Source of Truth in LeagueTaxonomy)
+        if canonical_competition:
+            resolved = self.taxonomy.resolve_catalog_and_genre(canonical_competition)
+            if resolved is not None:
+                cat_id = _normalize_catalog_id(resolved[0])
+                if cat_id in _CATALOG_BY_ID and resolved[1] and resolved[1][0] in _CATALOG_BY_ID[cat_id].genres:
+                    return cat_id, list(resolved[1])
 
         if competition:
             lookup_silo = silo_norm if silo_norm in SPORT_SILOS else "football"
@@ -726,9 +566,6 @@ class GenreClassifier:
                     cat_id = _SILO_TO_CATALOG_ID.get(league_match.silo, "altri_sport")
                 if league_match.genre and league_match.genre in _CATALOG_BY_ID[cat_id].genres:
                     return cat_id, [league_match.genre]
-                if league_match.canonical_slug in _CANONICAL_SLUG_ROUTING:
-                    mapped_cat, mapped_genres = _CANONICAL_SLUG_ROUTING[league_match.canonical_slug]
-                    return mapped_cat, list(mapped_genres)
 
         # Level 2 & Level 3: Sport Silo resolution + Sport Sub-classifiers
         if not silo_norm or silo_norm in ("other", "altri_sport", "altri-sport"):
@@ -791,7 +628,7 @@ class GenreClassifier:
                 return "basket", ["Eurolega ed Eurocup"]
             if "ncaa" in comp_low or "college" in comp_low:
                 return "basket", ["NCAA e College Basket"]
-            if "fiba" in comp_low or "eurobasket" in comp_low or "world cup" in comp_low:
+            if any(k in comp_low for k in ("fiba", "eurobasket", "world cup", "mondiali", "europei")):
                 return "basket", ["FIBA e Tornei Nazionali"]
             return "basket", ["Campionati Esteri ed NBL"]
 

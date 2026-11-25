@@ -652,7 +652,7 @@ class DirettaService:
             )
 
         eff_silo = base_silo
-        if league_match is not None and league_match.catalog_target == SportSilo.CALCIO_ITA.value:
+        if league_match is not None and league_match.catalog_target in (SportSilo.CALCIO_ITA.value, "calcio_italiano"):
             eff_silo = SportSilo.CALCIO_ITA
         elif base_silo == SportSilo.FOOTBALL and normalize_country(country) == "italy":
             eff_silo = SportSilo.CALCIO_ITA

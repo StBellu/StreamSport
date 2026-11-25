@@ -242,6 +242,8 @@ _ALIAS_GROUP_DEFINITIONS: tuple[tuple[str, ...], ...] = (
     ("derthona basket", "derthona", "tortona"),
     ("joventut badalona", "joventut", "badalona"),
     ("unicaja malaga", "unicaja", "malaga", "baloncesto malaga"),
+    # --- Volley ---
+    ("vero volley milano", "vero volley", "allianz vero volley milano", "numia vero volley milano"),
     # --- MLS / US / NBA / Motorsports ---
     ("inter miami", "inter miami cf"),
     ("los angeles fc", "lafc"),

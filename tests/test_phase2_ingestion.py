@@ -1751,4 +1751,193 @@ def test_phase_b_simulcast_topdown_matching_and_closed_orphan_allowlist() -> Non
     assert [s.title for s in cleaned_conf[0].sources] == ["Sky Sport Uno"]
 
 
+def test_leagues_phase_c_targeted_bugfixes() -> None:
+    from app.taxonomy import DEFAULT_LEAGUE_TAXONOMY
+
+    a2 = DEFAULT_LEAGUE_TAXONOMY.match_league("basket", "Serie A2", "Italia")
+    assert a2 is not None
+    assert a2.canonical_slug == "serie-a2-basket"
+    assert a2.tier == 2
+
+    a1 = DEFAULT_LEAGUE_TAXONOMY.match_league("basket", "Serie A", "Italia")
+    assert a1 is not None
+    assert a1.canonical_slug == "lba-serie-a"
+    assert a1.tier == 1
+
+    # Hockey keeps ONLY NHL; DEL, KHL, Coppa del Mondo are excluded.
+    nhl = DEFAULT_LEAGUE_TAXONOMY.match_league("hockey", "NHL", "USA")
+    assert nhl is not None
+    assert nhl.canonical_slug == "nhl"
+    assert nhl.tier == 1
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("hockey", "Coppa del Mondo", "") is None
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("hockey", "DEL", "Germania") is None
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("hockey", "KHL", "Russia") is None
+
+    # Women's youth Euro must stay in youth national genre and Tier 3 (broadcaster-gated).
+    u19_w = DEFAULT_LEAGUE_TAXONOMY.match_league(
+        "football", "Campionati Europei U19 - Femminile", "Europa"
+    )
+    assert u19_w is not None
+    assert u19_w.tier == 3
+    assert u19_w.genre == "Europei Under 21 e Nazionali Giovanili"
+    assert not DEFAULT_LEAGUE_TAXONOMY.is_admitted_event(
+        "football", "Campionati Europei U19 - Femminile", "Europa", has_broadcasters=False
+    )
+    assert DEFAULT_LEAGUE_TAXONOMY.is_admitted_event(
+        "football", "Campionati Europei U19 - Femminile", "Europa", has_broadcasters=True
+    )
+
+
+def test_phase_c_taxonomy_tiers_and_single_source_routing() -> None:
+    import app.taxonomy.classifier as classifier_mod
+    from app.taxonomy import DEFAULT_LEAGUE_TAXONOMY, classify_event, normalize_team_name
+
+    # 1. Unrecognized leagues NEVER enter even with Diretta broadcasters (OTT leak fix)
+    for silo, comp, country in (
+        ("football", "Ligue 1", "Congo"),
+        ("football", "Cymru Premier", "Galles"),
+        ("football", "National League", "Inghilterra"),
+    ):
+        assert DEFAULT_LEAGUE_TAXONOMY.match_league(silo, comp, country) is None
+        assert not DEFAULT_LEAGUE_TAXONOMY.is_admitted_event(
+            silo, comp, country, has_broadcasters=True, has_streams=True
+        )
+
+    # 2. Coppa Italia (T1) vs Coppa Italia Serie D (T3) vs Serie D (rejected)
+    ci = DEFAULT_LEAGUE_TAXONOMY.match_league("football", "Coppa Italia", "Italia")
+    assert ci is not None and ci.canonical_slug == "coppa-italia" and ci.tier == 1
+    assert DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("football", "Coppa Italia", "Italia")
+
+    cid = DEFAULT_LEAGUE_TAXONOMY.match_league("football", "Coppa Italia Serie D", "Italia")
+    assert cid is not None and cid.canonical_slug == "coppa-italia-serie-d" and cid.tier == 3
+    assert cid.catalog_target == "calcio_italiano" and cid.genre == "Coppa Italia e Supercoppa"
+    assert not DEFAULT_LEAGUE_TAXONOMY.is_admitted_event(
+        "football", "Coppa Italia Serie D", "Italia", has_broadcasters=False
+    )
+    assert DEFAULT_LEAGUE_TAXONOMY.is_admitted_event(
+        "football", "Coppa Italia Serie D", "Italia", has_broadcasters=True
+    )
+
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("football", "Serie D - Girone A", "Italia") is None
+    assert not DEFAULT_LEAGUE_TAXONOMY.is_admitted_event(
+        "football", "Serie D - Girone A", "Italia", has_broadcasters=True
+    )
+
+    # 3. Premier League Cup (rejected) vs EFL Cup (T2); Liga Portugal vs 2; Coupe de France
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("football", "Premier League Cup", "Inghilterra") is None
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("football", "Premier League", "Inghilterra") is not None
+    efl = DEFAULT_LEAGUE_TAXONOMY.match_league("football", "EFL Cup", "Inghilterra")
+    assert efl is not None and efl.canonical_slug == "efl-cup" and efl.tier == 2
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("football", "Liga Portugal", "Portogallo") is not None
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("football", "Liga Portugal 2", "Portogallo") is None
+    cdf = DEFAULT_LEAGUE_TAXONOMY.match_league("football", "Coppa di Francia", "Francia")
+    assert cdf is not None and cdf.canonical_slug == "coupe-de-france" and cdf.tier == 1
+
+    # 4. UEFA Champions League (T1) vs AFC / Gulf Champions League (T3 Extra-EU, no women)
+    ucl = DEFAULT_LEAGUE_TAXONOMY.match_league("football", "Champions League - Prima fase", "Europa")
+    assert ucl is not None and ucl.canonical_slug == "champions-league" and ucl.tier == 1
+    afc = DEFAULT_LEAGUE_TAXONOMY.match_league("football", "AFC Champions League 2", "Asia")
+    assert afc is not None and afc.canonical_slug == "afc-champions-league" and afc.tier == 3
+    assert afc.genre == "Americhe e Leghe Extra-UE"
+    gulf = DEFAULT_LEAGUE_TAXONOMY.match_league("football", "Gulf Club Champions League", "Asia")
+    assert gulf is not None and gulf.canonical_slug == "afc-champions-league" and gulf.tier == 3
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("football", "AFC Women's Champions League", "Asia") is None
+
+    # 5. Tennis: ZERO Challenger / ITF even with broadcasters
+    assert DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("tennis", "ATP - SINGOLARE: Torino (Italia)", "")
+    assert DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("tennis", "WTA - SINGOLARE: Roma (Italia)", "")
+    assert DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("tennis", "Wimbledon", "")
+    assert DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("tennis", "Coppa Davis", "")
+    for minor_t in (
+        "CHALLENGER UOMINI - SINGOLARE: Playford 2 (Australia)",
+        "ITF UOMINI - SINGOLARE: M15 Antalya 9 (Turchia)",
+        "ITF DONNE - SINGOLARE: W75 Florianopolis",
+    ):
+        assert DEFAULT_LEAGUE_TAXONOMY.match_league("tennis", minor_t, "") is None
+        assert not DEFAULT_LEAGUE_TAXONOMY.is_admitted_event(
+            "tennis", minor_t, "", has_broadcasters=True
+        )
+
+    # 6. Basket: NBA, FIBA IT/EN, Eurolega Femminile (T1), EuroCup Femminile (T3), zero NCAA / G League
+    assert DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("basket", "NBA", "USA")
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("basket", "NBA G League - Preliminari", "USA") is None
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("basket", "NCAA", "USA") is None
+    fiba_it = DEFAULT_LEAGUE_TAXONOMY.match_league("basket", "Mondiali - Qualificazione - Secondo turno", "Europa")
+    fiba_en = DEFAULT_LEAGUE_TAXONOMY.match_league("basket", "World Cup - Qualification - Second round", "Australasia")
+    assert fiba_it is not None and fiba_it.canonical_slug == "fiba-international" and fiba_it.tier == 1
+    assert fiba_en is not None and fiba_en.canonical_slug == "fiba-international" and fiba_en.tier == 1
+    el_w = DEFAULT_LEAGUE_TAXONOMY.match_league("basket", "Eurolega Femminile - Prima fase", "Europa")
+    assert el_w is not None and el_w.tier == 1 and el_w.genre == "WNBA e Femminile"
+    ec_w = DEFAULT_LEAGUE_TAXONOMY.match_league("basket", "EuroCup Femminile", "Europa")
+    assert ec_w is not None and ec_w.tier == 3 and ec_w.genre == "WNBA e Femminile"
+    assert not DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("basket", "EuroCup Femminile", "Europa", has_broadcasters=False)
+    assert DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("basket", "EuroCup Femminile", "Europa", has_broadcasters=True)
+
+    # 7. Volley: SuperLega IT vs SuperLiga BR, CEV CL M/F (T1), CEV Cup & Challenge Cup (T3), zero PlusLiga
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("volley", "SuperLega", "Italia") is not None
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("volley", "SuperLiga", "Brasile") is None
+    cev_w = DEFAULT_LEAGUE_TAXONOMY.match_league("volley", "Champions League Femminile", "Europa")
+    assert cev_w is not None and cev_w.tier == 1 and cev_w.genre == "Volley Femminile"
+    cev_cup_w = DEFAULT_LEAGUE_TAXONOMY.match_league("volley", "CEV Cup Femminile", "Europa")
+    assert cev_cup_w is not None and cev_cup_w.tier == 3 and cev_cup_w.genre == "Volley Femminile"
+    chal_w = DEFAULT_LEAGUE_TAXONOMY.match_league("volley", "Challenge Cup Femminile", "Europa")
+    assert chal_w is not None and chal_w.tier == 3 and chal_w.genre == "Volley Femminile"
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("volley", "PlusLiga", "Polonia") is None
+
+    # 8. Rugby & Handball
+    nat = DEFAULT_LEAGUE_TAXONOMY.match_league("rugby", "Nations Championship - Play Off", "Mondo")
+    assert nat is not None and nat.canonical_slug == "nations-championship" and nat.tier == 1
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("rugby", "Top 14", "Francia") is None
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("rugby", "Six Nations Women", "Europa") is None
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("rugby", "Test Match", "Mondo") is None
+    ehf = DEFAULT_LEAGUE_TAXONOMY.match_league("handball", "Champions League Uomini", "Europa")
+    assert ehf is not None and ehf.tier == 3 and ehf.genre == "Pallamano"
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("handball", "2. Bundesliga", "Germania") is None
+
+    # 9. Football Youth: Primavera 1, UEFA Youth League, Mondiali U17 T3 only; foreign club youth blocked
+    for y_ok, y_country in (
+        ("Primavera 1", "Italia"),
+        ("UEFA Youth League - Prima fase", "Europa"),
+        ("Mondiali U17", "Mondo"),
+    ):
+        ym = DEFAULT_LEAGUE_TAXONOMY.match_league("football", y_ok, y_country)
+        assert ym is not None and ym.tier == 3
+        assert not DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("football", y_ok, y_country, has_broadcasters=False)
+        assert DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("football", y_ok, y_country, has_broadcasters=True)
+
+    for y_bad, y_country in (
+        ("DFB Youth League - Preliminari", "Germania"),
+        ("Paraense U20 - Play Off", "Brasile"),
+        ("U19 League", "Ucraina"),
+        ("Liga MX U21", "Messico"),
+        ("Premier League U18", "Inghilterra"),
+    ):
+        assert DEFAULT_LEAGUE_TAXONOMY.match_league("football", y_bad, y_country) is None
+        assert not DEFAULT_LEAGUE_TAXONOMY.is_admitted_event("football", y_bad, y_country, has_broadcasters=True)
+
+    # 10. Combat: UFC/Boxe/WWE T1, Bellator T3
+    bellator = DEFAULT_LEAGUE_TAXONOMY.match_league("combat", "Bellator", "USA")
+    assert bellator is not None and bellator.tier == 3
+    assert DEFAULT_LEAGUE_TAXONOMY.match_league("combat", "Cage Warriors", "Europa") is None
+
+    # 11. Single Source of Truth in classifier + safe Vero Volley alias
+    assert not hasattr(classifier_mod, "_CANONICAL_SLUG_ROUTING")
+    assert classify_event(canonical_competition="coppa-italia-serie-d") == (
+        "calcio_italiano",
+        ["Coppa Italia e Supercoppa"],
+    )
+    assert classify_event(canonical_competition="eurocup-basket-women") == (
+        "basket",
+        ["WNBA e Femminile"],
+    )
+    assert classify_event(canonical_competition="euro-championship-women-youth") == (
+        "calcio_estero",
+        ["Europei Under 21 e Nazionali Giovanili"],
+    )
+    assert normalize_team_name("Vero Volley") == "vero volley milano"
+    assert normalize_team_name("Milano") == "milano"
+
+
+
+
 
