@@ -2099,6 +2099,151 @@ def test_sky_diretta_matcher_window_aliases_and_initial_guard() -> None:
     assert _epg_matches_diretta(tennis_epg_120m, tennis_match) > 0.0
 
 
+def test_sky_diretta_asymmetric_women_comp_conflict_and_time_tiebreak() -> None:
+    from app.ingestion.epg_service import _epg_matches_diretta
+    from app.taxonomy.matcher import DEFAULT_TEAM_MATCHER
+
+    base_ms = 1_795_611_600_000
+
+    # 1. Asymmetric women penalty: neutral Sky matches Women-only Diretta,
+    #    prefers Men when both exist, and still blocks Women Sky -> Men Diretta.
+    assert (
+        DEFAULT_TEAM_MATCHER.match_score(
+            "Vero Volley D", "Levallois Paris SC D",
+            "Milano", "Levallois",
+            is_women_1=True, is_women_2=False,
+        ).matched
+        is False
+    )
+
+    volley_w_dir = Match(
+        id="dir-volley-w",
+        title="Vero Volley D vs Levallois Paris SC D",
+        category="volley",
+        silo=SportSilo.VOLLEY,
+        genres=["Champions League Volley"],
+        date=base_ms,
+        end_date=base_ms + 120 * 60_000,
+        competition="Champions League Femminile",
+        canonical_competition="cev-champions-league-women",
+        country="Europa",
+        home_team=TeamInfo(name="Vero Volley D"),
+        away_team=TeamInfo(name="Levallois Paris SC D"),
+        is_women=True,
+        source_origin="diretta",
+    )
+    dazn_neutral = EPGProgram(
+        id="sky-dazn-neutral",
+        channel_id="11402",
+        channel_name="DAZN 1",
+        title="Milano - Levallois",
+        start_ms=base_ms,
+        end_ms=base_ms + 120 * 60_000,
+        sport_hint="Volley",
+        is_live=True,
+        source="sky",
+    )
+    assert _epg_matches_diretta(dazn_neutral, volley_w_dir) > 0.0
+
+    juve_roma_m = Match(
+        id="dir-jr-m",
+        title="Juventus vs Roma",
+        category="calcio_italiano",
+        silo=SportSilo.CALCIO_ITA,
+        genres=["Serie A"],
+        date=base_ms,
+        end_date=base_ms + 135 * 60_000,
+        competition="Serie A",
+        canonical_competition="serie-a",
+        country="Italia",
+        home_team=TeamInfo(name="Juventus"),
+        away_team=TeamInfo(name="Roma"),
+        is_women=False,
+        source_origin="diretta",
+    )
+    juve_roma_w = Match(
+        id="dir-jr-w",
+        title="Juventus D vs Roma D",
+        category="calcio_italiano",
+        silo=SportSilo.CALCIO_ITA,
+        genres=["Calcio Femminile"],
+        date=base_ms,
+        end_date=base_ms + 135 * 60_000,
+        competition="Serie A Femminile",
+        canonical_competition="serie-a-femminile",
+        country="Italia",
+        home_team=TeamInfo(name="Juventus D"),
+        away_team=TeamInfo(name="Roma D"),
+        is_women=True,
+        source_origin="diretta",
+    )
+    sky_jr_neutral = EPGProgram(
+        id="sky-jr-neutral",
+        channel_id="9097",
+        channel_name="Sky Sport Uno",
+        title="Juventus - Roma",
+        start_ms=base_ms,
+        end_ms=base_ms + 120 * 60_000,
+        sport_hint="Calcio",
+        is_live=True,
+        source="sky",
+    )
+    sky_jr_explicit_w = sky_jr_neutral.model_copy(
+        update={"id": "sky-jr-w", "title": "Juventus Femminile - Roma Femminile"}
+    )
+    assert _epg_matches_diretta(sky_jr_neutral, juve_roma_m) > _epg_matches_diretta(
+        sky_jr_neutral, juve_roma_w
+    )
+    assert _epg_matches_diretta(sky_jr_explicit_w, juve_roma_m) == 0.0
+    assert _epg_matches_diretta(sky_jr_explicit_w, juve_roma_w) > 0.0
+
+    # 2. Certified competition conflict guard (-0.30) vs generic URL (0.0) & base-slug women tolerance
+    sky_serie_a = sky_jr_neutral.model_copy(update={"competition_hint": "Serie A"})
+    juve_roma_coppa = juve_roma_m.model_copy(
+        update={"id": "dir-jr-coppa", "competition": "Coppa Italia", "canonical_competition": "coppa-italia"}
+    )
+    assert _epg_matches_diretta(sky_serie_a, juve_roma_coppa) == 0.0
+    assert _epg_matches_diretta(sky_jr_neutral, juve_roma_coppa) > 0.0
+
+    uwcl_dir = Match(
+        id="dir-uwcl",
+        title="Barcellona D vs Roma D",
+        category="calcio_estero",
+        silo=SportSilo.FOOTBALL,
+        genres=["Champions League Femminile"],
+        date=base_ms,
+        end_date=base_ms + 135 * 60_000,
+        competition="Champions League Femminile",
+        canonical_competition="uefa-womens-champions-league",
+        country="Europa",
+        home_team=TeamInfo(name="Barcellona D"),
+        away_team=TeamInfo(name="Roma D"),
+        is_women=True,
+        source_origin="diretta",
+    )
+    sky_ucl_w = EPGProgram(
+        id="sky-uwcl",
+        channel_id="9097",
+        channel_name="Sky Sport Uno",
+        title="Barcellona - Roma",
+        competition_hint="UEFA Champions League",
+        start_ms=base_ms,
+        end_ms=base_ms + 120 * 60_000,
+        sport_hint="Calcio",
+        is_live=True,
+        source="sky",
+    )
+    assert _epg_matches_diretta(sky_ucl_w, uwcl_dir) > 0.0
+
+    # 3. Time proximity tie-break (+0.03 max): 5m beats 60m
+    sky_5m = sky_serie_a.model_copy(update={"start_ms": base_ms - 5 * 60_000})
+    sky_60m = sky_serie_a.model_copy(update={"start_ms": base_ms - 60 * 60_000})
+    s5 = _epg_matches_diretta(sky_5m, juve_roma_m)
+    s60 = _epg_matches_diretta(sky_60m, juve_roma_m)
+    assert s5 > s60 > 0.0
+
+
+
 
 
 

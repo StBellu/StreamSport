@@ -35,6 +35,7 @@ from app.taxonomy.channels import (
     canonical_from_sky_id,
     canonicalize_channel_name,
 )
+from app.taxonomy.leagues import DEFAULT_LEAGUE_TAXONOMY
 from app.taxonomy.matcher import (
     _extract_motorsport_series,
     _extract_motorsport_session,
@@ -1296,11 +1297,39 @@ def _is_fta_topdown_candidate(epg: EPGProgram) -> bool:
     )
 
 
-def _competition_tiebreak_bonus(epg: EPGProgram, match: Match) -> float:
+def _base_competition_slug(slug: str) -> str:
+    clean = (slug or "").strip().lower()
+    for suffix in ("-women", "-femminile", "-youth"):
+        if clean.endswith(suffix):
+            clean = clean[: -len(suffix)]
+            break
+    if clean == "uefa-womens-champions-league":
+        return "champions-league"
+    return clean
+
+
+def _competition_score_modifier(epg: EPGProgram, match: Match) -> float:
+    """Return +0.05 on matching competition, -0.30 on certified slug conflict, or 0.0."""
+    if epg.competition_hint and match.canonical_competition:
+        lookup_silo = "football" if match.silo == SportSilo.CALCIO_ITA else match.silo.value
+        lm = DEFAULT_LEAGUE_TAXONOMY.match_league(lookup_silo, epg.competition_hint, "")
+        if lm is None:
+            lm = DEFAULT_LEAGUE_TAXONOMY.match_league(
+                lookup_silo, epg.competition_hint, "Italia"
+            )
+        if lm is not None:
+            if _base_competition_slug(lm.canonical_slug) == _base_competition_slug(
+                match.canonical_competition
+            ):
+                return 0.05
+            return -0.30
+
     hint = _strip_accents(f"{epg.competition_hint} {epg.sport_hint}").lower().strip()
     if not hint:
         return 0.0
-    m_comp = _strip_accents(f"{match.competition} {match.canonical_competition} {match.alt_league}").lower()
+    m_comp = _strip_accents(
+        f"{match.competition} {match.canonical_competition} {match.alt_league}"
+    ).lower()
     if not m_comp:
         return 0.0
     hint_tokens = {t for t in re.findall(r"[a-z0-9]+", hint) if len(t) >= 3}
@@ -1308,6 +1337,14 @@ def _competition_tiebreak_bonus(epg: EPGProgram, match: Match) -> float:
     if hint_tokens & comp_tokens:
         return 0.05
     return 0.0
+
+
+def _time_proximity_bonus(match_ms: int, epg_ms: int, window_ms: int) -> float:
+    """Return continuous [0.0, +0.03] tie-break favoring closer kickoff alignment."""
+    if match_ms <= 0 or epg_ms <= 0 or window_ms <= 0:
+        return 0.0
+    ratio = max(0.0, 1.0 - abs(match_ms - epg_ms) / float(window_ms))
+    return round(0.03 * ratio, 4)
 
 
 def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
@@ -1358,6 +1395,9 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
     if not in_asym_window and not overlaps:
         return 0.0
 
+    comp_mod = _competition_score_modifier(epg, match)
+    time_bonus = _time_proximity_bonus(match.date, epg.start_ms, max(pre_ms, 90 * 60 * 1000))
+
     _, epg_home, epg_away = _extract_epg_teams(epg.title, epg.content_title)
     epg_women, epg_youth = _detect_epg_demographics(epg, match=match)
 
@@ -1380,12 +1420,14 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
                 season_number=epg.season_number,
             ):
                 return 0.0
+            if comp_mod < 0:
+                return 0.0
             m_circ = _extract_tennis_circuit(m_eval)
             ep_circ = _extract_tennis_circuit(ep_eval)
             circ_ok = (m_circ == ep_circ) if (m_circ and ep_circ) else True
             ep_eval_low = re.sub(r"\s+", " ", _strip_accents(ep_eval).lower()).strip()
             if circ_ok and _tennis_tournament_matches_text(match, ep_eval_low):
-                return 0.85 + _competition_tiebreak_bonus(epg, match)
+                return 0.85 + comp_mod + time_bonus
             return 0.0
 
     # Pairwise team/athlete match
@@ -1415,8 +1457,14 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
             is_youth_1=match.is_youth,
             is_women_2=epg_women,
             is_youth_2=epg_youth,
+            allow_neutral_women_2=True,
         )
-        return (res.score + _competition_tiebreak_bonus(epg, match)) if res.matched else 0.0
+        if not res.matched:
+            return 0.0
+        adjusted = res.score + comp_mod
+        if comp_mod < 0 and adjusted < DEFAULT_TEAM_MATCHER.avg_threshold:
+            return 0.0
+        return adjusted + time_bonus
 
     # Single-entity events (e.g. F1 / MotoGP / Boxing cards)
     if match.away_team is None and match.home_team is not None:
@@ -1442,8 +1490,14 @@ def _epg_matches_diretta(epg: EPGProgram, match: Match) -> float:
             silo=match.silo.value,
             competition_1=match.competition,
             competition_2=epg.competition_hint,
+            allow_neutral_women_2=True,
         )
-        return (res.score + _competition_tiebreak_bonus(epg, match)) if res.matched else 0.0
+        if not res.matched:
+            return 0.0
+        adjusted = res.score + comp_mod
+        if comp_mod < 0 and adjusted < DEFAULT_TEAM_MATCHER.single_entity_threshold:
+            return 0.0
+        return adjusted + time_bonus
 
     return 0.0
 

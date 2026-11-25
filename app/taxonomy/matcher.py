@@ -16,6 +16,7 @@ from app.taxonomy.aliases import (
 
 MAX_TIME_DIFF_MS = 60 * 60 * 1000  # 60 minutes
 DEMOGRAPHIC_PENALTY = 0.30
+NEUTRAL_WOMEN_PENALTY = 0.08
 AVG_THRESHOLD = 0.75
 MIN_SIDE_THRESHOLD = 0.65
 SINGLE_ENTITY_THRESHOLD = 0.80
@@ -309,6 +310,7 @@ class TeamMatcher:
         silo: str = "",
         competition_1: str = "",
         competition_2: str = "",
+        allow_neutral_women_2: bool = False,
     ) -> MatchResult:
         """Compute bilateral (direct & inverted) similarity score with guards."""
         if date_1_ms > 0 and date_2_ms > 0:
@@ -320,11 +322,15 @@ class TeamMatcher:
                     reason="time_window_exceeded",
                 )
 
-        penalty = (
-            self.demographic_penalty
-            if (is_women_1 != is_women_2 or is_youth_1 != is_youth_2)
-            else 0.0
-        )
+        if is_youth_1 != is_youth_2:
+            penalty = self.demographic_penalty
+        elif is_women_1 != is_women_2:
+            if allow_neutral_women_2 and is_women_1 and not is_women_2:
+                penalty = NEUTRAL_WOMEN_PENALTY
+            else:
+                penalty = self.demographic_penalty
+        else:
+            penalty = 0.0
 
         h1_vars = expand_team_variants(home_1, alt_home_1)
         h2_vars = expand_team_variants(home_2, alt_home_2)
