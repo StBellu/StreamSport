@@ -299,6 +299,42 @@ class DatabaseManager:
 
         return await self._run_write_tx(_op)
 
+    async def prune_stale_matches(
+        self,
+        keep_ids: Iterable[str],
+        *,
+        origins: Optional[Iterable[str]] = None,
+    ) -> list[str]:
+        """Delete persisted matches not present in `keep_ids` (optionally scoped to `origins`)."""
+        keep_set = {str(mid).strip() for mid in keep_ids if str(mid or "").strip()}
+        origin_set = (
+            {str(o).strip() for o in origins if str(o or "").strip()}
+            if origins is not None
+            else None
+        )
+
+        async def _op(db: aiosqlite.Connection) -> list[str]:
+            async with db.execute("SELECT id, source_origin FROM matches;") as cursor:
+                rows = await cursor.fetchall()
+            stale_ids = [
+                row["id"]
+                for row in rows
+                if row["id"] not in keep_set
+                and (origin_set is None or row["source_origin"] in origin_set)
+            ]
+            if not stale_ids:
+                return []
+            for idx in range(0, len(stale_ids), 500):
+                chunk = stale_ids[idx : idx + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                await db.execute(
+                    f"DELETE FROM matches WHERE id IN ({placeholders});",
+                    chunk,
+                )
+            return stale_ids
+
+        return await self._run_write_tx(_op)
+
     async def load_active_matches(
         self,
         min_end_ms: Optional[int] = None,

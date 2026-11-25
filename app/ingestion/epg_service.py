@@ -362,7 +362,7 @@ _SEQUENTIAL_SLOT_SIDE_RE = re.compile(
 
 # Closed 6-category orphan allowlist & fallback silo matchers
 _CALCIO_ITA_HINT_RE = re.compile(
-    r"\b(?:serie\s*[abc]|coppa\s+italia|supercoppa\s+italiana|zona\s+dazn|zona\s+serie\s*[ab]|solocalcio)\b",
+    r"\b(?:serie\s*[abc]|coppa\s+italia|supercoppa\s+italiana|zona\s+dazn|zona\s+serie\s*[ab])\b",
     re.IGNORECASE,
 )
 _MOTORI_FALLBACK_RE = re.compile(
@@ -1165,6 +1165,7 @@ def _parse_teams_from_text(raw: str) -> tuple[str, str, str]:
     cleaned = re.sub(r"\s*[\(\[]\s*(?:diretta|live)\s*[\)\]]\s*", " ", raw or "", flags=re.IGNORECASE)
     cleaned = re.sub(r"^(?:diretta|live)\s*[:\-–]\s*", "", cleaned.strip(), flags=re.IGNORECASE)
     cleaned = _STAG_EP_TOKEN_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+[-–—](?:\s*[-–—])+\s+", " - ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—:")
 
     league_hint = ""
@@ -1840,6 +1841,7 @@ class ItalianEPGService:
         self._sky_day_cache: dict[str, tuple[float, list[EPGProgram]]] = {}
         self._sky_future_cache: dict[int, tuple[str, float, list[EPGProgram]]] = {}
         self._rolling_cache: list[EPGProgram] = []
+        self.last_fetch_failed: bool = False
 
     def _get_client(self) -> httpx.AsyncClient:
         """Return the injected or lazily created shared HTTP client."""
@@ -2117,6 +2119,7 @@ class ItalianEPGService:
         now_utc: Optional[datetime] = None,
     ) -> list[EPGProgram]:
         if not self._settings.ENABLE_SKY_EPG:
+            self.last_fetch_failed = False
             return []
 
         now = _ensure_utc(now_utc or datetime.now(timezone.utc))
@@ -2131,8 +2134,11 @@ class ItalianEPGService:
         ordered_days = sorted(dict.fromkeys(days))
         merged_programs: list[EPGProgram] = []
         seen_ids: set[str] = set()
+        attempted_buckets = 0
+        failed_buckets = 0
 
         for day_offset in ordered_days:
+            attempted_buckets += 1
             bucket_progs: list[EPGProgram] = []
             if day_offset == 0:
                 raw_from = (
@@ -2184,6 +2190,8 @@ class ItalianEPGService:
                                 )
                                 bucket_progs = still_valid
                                 break
+                    if not bucket_progs:
+                        failed_buckets += 1
             elif day_offset > 0:
                 cached_fut = self._sky_future_cache.get(day_offset)
                 if (
@@ -2219,12 +2227,19 @@ class ItalianEPGService:
                             for p in cached_fut[2]
                             if now_ms <= p.end_ms + SKY_EPG_POST_END_MS
                         ]
+                    if failed and not bucket_progs:
+                        failed_buckets += 1
 
             for prog in bucket_progs:
                 if prog.id not in seen_ids and now_ms <= prog.end_ms + SKY_EPG_POST_END_MS:
                     seen_ids.add(prog.id)
                     merged_programs.append(prog)
 
+        self.last_fetch_failed = (
+            attempted_buckets > 0
+            and failed_buckets == attempted_buckets
+            and not merged_programs
+        )
         return merged_programs
 
     async def fetch_sky_epg(
@@ -2338,4 +2353,7 @@ class ItalianEPGService:
             filtered.append(prog)
 
         deduped = deduplicate_simulcasts(filtered)
-        return self._apply_rolling_cache(deduped, now_ms=now_ms)
+        result = self._apply_rolling_cache(deduped, now_ms=now_ms)
+        if result:
+            self.last_fetch_failed = False
+        return result

@@ -203,6 +203,7 @@ class PipelineScheduler:
                 getattr(self._diretta, "last_discarded_match_ids", frozenset())
             )
             diretta_failed = bool(getattr(self._diretta, "last_fetch_failed", False))
+            diretta_failed_feeds = int(getattr(self._diretta, "last_failed_feeds", 0))
             if (diretta_failed or (self._settings.ENABLE_DIRETTA and not diretta_matches)) and prev_snapshot.active_tennis_cities:
                 active_tennis_cities = fetched_tennis_cities or prev_snapshot.active_tennis_cities
                 logger.warning(
@@ -220,6 +221,7 @@ class PipelineScheduler:
                 )
 
             # 2. Italian EPG ingestion (throttled by EPG_SYNC_INTERVAL_SECONDS, with stale fallback)
+            epg_failed = False
             if self._settings.ENABLE_SKY_EPG:
                 mono_now = time.monotonic()
                 if (
@@ -243,6 +245,9 @@ class PipelineScheduler:
                     for p in self._epg_cache
                     if p.end_ms <= 0 or current_ms <= p.end_ms + SKY_EPG_POST_END_MS
                 ]
+                epg_failed = bool(getattr(self._epg, "last_fetch_failed", False)) and not bool(
+                    epg_programs
+                )
             else:
                 self._epg_cache = []
                 epg_programs = []
@@ -323,15 +328,34 @@ class PipelineScheduler:
                 if (exp := get_match_expiry_ms(m)) <= 0 or current_ms <= exp
             ]
 
-            # 5. Persist to SQLite, delete discarded/expired matches, and clean disk posters
+            # 5. Persist to SQLite, prune stale/discarded/expired rows, and clean disk posters
+            diretta_prune_ok = (not self._settings.ENABLE_DIRETTA) or (
+                not diretta_failed
+                and diretta_failed_feeds == 0
+                and (bool(diretta_matches) or not prev_snapshot.active_matches)
+            )
+            epg_prune_ok = (not self._settings.ENABLE_SKY_EPG) or (not epg_failed)
+            active_ids = {m.id for m in matches}
+
             await self._db.upsert_matches(matches)
             deleted_ids = (
                 await self._db.delete_matches(discarded_ids)
                 if discarded_ids
                 else []
             )
+            stale_ids: list[str] = []
+            if diretta_prune_ok and epg_prune_ok:
+                stale_ids = await self._db.prune_stale_matches(active_ids)
+            elif epg_prune_ok:
+                stale_ids = await self._db.prune_stale_matches(
+                    active_ids, origins=("epg", "sky_epg")
+                )
+            elif diretta_prune_ok:
+                stale_ids = await self._db.prune_stale_matches(
+                    active_ids, origins=("diretta",)
+                )
             purged_ids = await self._db.purge_expired(now_ms=current_ms)
-            removed_ids = list(dict.fromkeys([*deleted_ids, *purged_ids]))
+            removed_ids = list(dict.fromkeys([*deleted_ids, *stale_ids, *purged_ids]))
             if removed_ids:
                 self._banner.cleanup_poster_files(removed_ids)
 
@@ -357,10 +381,11 @@ class PipelineScheduler:
 
             self._cleanup_tvvoo_sessions()
             logger.info(
-                "Pipeline cycle completed: %d ingested, %d active in RAM, %d purged",
+                "Pipeline cycle completed: %d ingested, %d active in RAM, %d removed (%d stale pruned)",
                 len(matches),
                 len(active_matches),
                 len(removed_ids),
+                len(stale_ids),
             )
             return len(active_matches)
 

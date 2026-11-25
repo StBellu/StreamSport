@@ -604,9 +604,19 @@ class GenreClassifier:
 
         if silo_norm == "tennis":
             comp_low = competition.lower()
-            if any(k in comp_low for k in ("wimbledon", "roland garros", "french open", "australian open", "us open")):
+            eval_low = combined_text.lower()
+            if any(
+                k in eval_low
+                for k in ("wimbledon", "roland garros", "french open", "australian open", "us open")
+            ):
                 return "tennis", ["Grandi Slam"]
-            if any(k in comp_low for k in ("davis", "bjk", "billie jean", "united cup", "laver cup")):
+            if any(
+                k in comp_low
+                for k in ("davis", "bjk", "billie jean", "united cup", "laver cup")
+            ) or any(
+                k in eval_low
+                for k in ("davis cup", "coppa davis", "bjk cup", "billie jean king", "united cup", "laver cup")
+            ):
                 return "tennis", ["Coppa Davis e BJK Cup"]
             if "challenger" in comp_low or "itf" in comp_low:
                 return "tennis", ["Challenger e Altri"]

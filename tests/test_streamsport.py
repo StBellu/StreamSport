@@ -1149,4 +1149,191 @@ async def test_two_state_catalog_realtime_ram_expiry_badge_and_immediate_discard
         await db.close()
 
 
+@pytest.mark.asyncio
+async def test_pipeline_scheduler_prunes_stale_db_rows_with_outage_guards(
+    tmp_path: Path,
+) -> None:
+    settings = _test_settings(tmp_path, ENABLE_THESPORTSDB=False)
+    settings.POSTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    settings.BASE_POSTER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    db = DatabaseManager(db_path=settings.DB_PATH)
+    await db.connect()
+    ram_cache = RAMCacheManager()
+    now_ms = int(time.time() * 1000)
+
+    stale_tivusat = _make_match(
+        "tivusat_295_rosario",
+        "Campionato Argentino Rosario Central-Gimnasia Mdz",
+        date_ms=now_ms + 3600_000,
+        end_ms=now_ms + 7200_000,
+        source_origin="epg",
+    )
+    stale_sky = _make_match(
+        "sky_11497_cerignola",
+        "Audace Cerignola - Inter U23",
+        date_ms=now_ms + 3600_000,
+        end_ms=now_ms + 7200_000,
+        source_origin="epg",
+    )
+    stale_diretta = _make_match(
+        "diretta-old-challenger",
+        "Old Challenger Match",
+        silo=SportSilo.TENNIS,
+        category="tennis",
+        genres=["Challenger e Altri"],
+        date_ms=now_ms + 3600_000,
+        end_ms=now_ms + 7200_000,
+        source_origin="diretta",
+    )
+    await db.upsert_matches([stale_tivusat, stale_sky, stale_diretta])
+
+    stale_posters = [
+        settings.BASE_POSTER_CACHE_DIR / "tivusat_295_rosario.jpg",
+        settings.POSTER_CACHE_DIR / "sky_11497_cerignola__v1.jpg",
+        settings.BASE_POSTER_CACHE_DIR / "diretta-old-challenger.jpg",
+    ]
+    for p in stale_posters:
+        p.write_bytes(b"stale")
+
+    live_match = _make_match(
+        "diretta-live",
+        "Inter vs Milan",
+        date_ms=now_ms + 1800_000,
+        end_ms=now_ms + 9000_000,
+        home="Inter",
+        away="Milan",
+        source_origin="diretta",
+    )
+    epg_simulcast = EPGProgram(
+        id="sky_sim_1",
+        channel_id="sky_sport_uno",
+        channel_name="Sky Sport Uno",
+        title="Diretta Gol Serie A",
+        start_ms=now_ms - 5 * 60_000,
+        end_ms=now_ms + 90 * 60_000,
+        sport_hint="calcio",
+        is_live=True,
+        is_simulcast=True,
+        source="sky",
+    )
+
+    class StatefulDiretta(DirettaService):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.fail_partial = False
+
+        async def fetch_schedule(self, **kwargs: Any) -> tuple[list[Match], frozenset[str]]:
+            self.last_discarded_match_ids = frozenset()
+            self.last_fetch_failed = False
+            self.last_failed_feeds = 1 if self.fail_partial else 0
+            return [live_match], frozenset()
+
+    class StatefulEPG(ItalianEPGService):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.fail_all = False
+
+        async def fetch_epg(
+            self, active_tennis_cities: frozenset[str] = frozenset(), **kwargs: Any
+        ) -> list[EPGProgram]:
+            if self.fail_all:
+                self.last_fetch_failed = True
+                return []
+            self.last_fetch_failed = False
+            return [epg_simulcast]
+
+    class MockTvVooProvider(TvVooService):
+        async def harvest(self) -> ProviderHarvestResult:
+            return ProviderHarvestResult(
+                provider="tvvoo",
+                linear_channels={
+                    "sky sport uno": [
+                        StreamSource(
+                            provider="tvvoo",
+                            title="SKY SPORT UNO",
+                            url="/live/manifest.m3u8?url=https%3A%2F%2Fvavoo.to%2Fvavoo-iptv%2Fplay%2F111",
+                            raw_url="https://vavoo.to/vavoo-iptv/play/111",
+                            language="ITA",
+                            quality="FHD",
+                            priority=1,
+                            requires_proxy=False,
+                            channel_name="sky sport uno",
+                        )
+                    ]
+                },
+            )
+
+    diretta_svc = StatefulDiretta(settings=settings)
+    epg_svc = StatefulEPG(settings=settings)
+    tvvoo = MockTvVooProvider(settings=settings)
+    orchestrator = StreamOrchestrator(providers=[tvvoo], settings=settings)
+    tsdb = TheSportsDBService(settings=settings)
+    banner = BannerService(settings=settings, tsdb_service=tsdb)
+    scheduler = PipelineScheduler(
+        settings=settings,
+        db=db,
+        ram_cache=ram_cache,
+        diretta=diretta_svc,
+        epg=epg_svc,
+        orchestrator=orchestrator,
+        tsdb=tsdb,
+        banner=banner,
+    )
+
+    try:
+        # 1. Healthy cycle prunes all 3 stale DB rows + deletes their poster files
+        await scheduler.run_once(now_ms=now_ms)
+        expected_sim_id = f"sky_sky_sport_uno_diretta-gol-serie-a_{epg_simulcast.start_ms}"
+        db_ids = {m.id for m in await db.load_active_matches(now_ms=now_ms)}
+        ram_ids = {m.id for m in ram_cache.snapshot.active_matches}
+        assert db_ids == {"diretta-live", expected_sim_id}
+        assert ram_ids == db_ids
+        assert all(not p.exists() for p in stale_posters)
+
+        # 2. Partial Diretta feed failure preserves persisted Diretta rows while still pruning stale EPG rows
+        diretta_kept = _make_match(
+            "diretta-kept",
+            "Kept On Partial Failure",
+            date_ms=now_ms + 3600_000,
+            end_ms=now_ms + 7200_000,
+            source_origin="diretta",
+        )
+        sky_stale_2 = _make_match(
+            "sky-stale-2",
+            "Stale Sky Row 2",
+            date_ms=now_ms + 3600_000,
+            end_ms=now_ms + 7200_000,
+            source_origin="epg",
+        )
+        await db.upsert_matches([diretta_kept, sky_stale_2])
+        diretta_svc.fail_partial = True
+        await scheduler.run_once(now_ms=now_ms)
+        db_ids_partial = {m.id for m in await db.load_active_matches(now_ms=now_ms)}
+        assert "diretta-kept" in db_ids_partial
+        assert "sky-stale-2" not in db_ids_partial
+
+        # 3. Total Sky EPG outage preserves persisted EPG rows while still pruning stale Diretta rows
+        sky_kept = _make_match(
+            "sky-kept",
+            "Kept On Sky Outage",
+            date_ms=now_ms + 3600_000,
+            end_ms=now_ms + 7200_000,
+            source_origin="epg",
+        )
+        await db.upsert_matches([sky_kept])
+        diretta_svc.fail_partial = False
+        epg_svc.fail_all = True
+        scheduler._epg_cache = []
+        scheduler._last_epg_sync_monotonic = 0.0
+        await scheduler.run_once(now_ms=now_ms)
+        db_ids_epg_outage = {m.id for m in await db.load_active_matches(now_ms=now_ms)}
+        assert "sky-kept" in db_ids_epg_outage
+        assert "diretta-kept" not in db_ids_epg_outage
+    finally:
+        await orchestrator.aclose()
+        await tsdb.aclose()
+        await db.close()
+
+
 

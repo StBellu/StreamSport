@@ -1938,6 +1938,45 @@ def test_phase_c_taxonomy_tiers_and_single_source_routing() -> None:
     assert normalize_team_name("Milano") == "milano"
 
 
+def test_phase_c_post_deploy_epg_and_classifier_polishes() -> None:
+    from app.ingestion.epg_service import _infer_silo_from_epg, _parse_teams_from_text
+    from app.taxonomy.classifier import classify_event
+
+    assert _parse_teams_from_text(
+        "Benevento - Meta Catania - Stag. 2026 Ep. 10 - Benevento - Meta Catania (diretta)"
+    ) == ("Benevento - Meta Catania", "Benevento", "Meta Catania")
+    assert _parse_teams_from_text("Paris Saint-Germain - Al-Hilal") == (
+        "",
+        "Paris Saint-Germain",
+        "Al-Hilal",
+    )
+
+    solocalcio_epg = EPGProgram(
+        id="legacy_1",
+        channel_id="295",
+        channel_name="SOLOCALCIO",
+        title="Campionato Argentino Rosario Central-Gimnasia Mdz",
+        sport_hint="Calcio",
+        start_ms=1_795_611_600_000,
+        end_ms=1_795_618_800_000,
+        source="sky",
+    )
+    assert _infer_silo_from_epg(solocalcio_epg) == SportSilo.FOOTBALL
+
+    assert classify_event(
+        silo="tennis",
+        competition="Tennis",
+        title="LIVE DAVIS CUP FINALS BY GENERALI",
+    ) == ("tennis", ["Coppa Davis e BJK Cup"])
+    assert classify_event(
+        silo="tennis",
+        competition="Tennis",
+        title="Lauren Davis vs Coco Gauff",
+        is_women=True,
+    ) == ("tennis", ["WTA"])
+
+
+
 
 
 
