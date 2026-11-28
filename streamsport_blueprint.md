@@ -162,7 +162,7 @@ Il sistema agisce come orchestratore centrale:
   6. **Soglie Minime**: Richiedere punteggio medio aggregato $\ge 0.75$ e singolo team $\ge 0.65$ per considerare valido l'abbinamento.
 * **Formato ID Univoci Stremio**:
   * Da calendario Diretta: `streamsport:diretta-{flashscore_id}` (es. `streamsport:diretta-O0r8yHkP`).
-  * Da EPG: `streamsport:sky_{channel_id}_{slug}_{timestamp}` o `streamsport:tivusat_{...}`.
+  * Da EPG: `streamsport:sky_{channel_id}_{slug}_{timestamp}`.
   * Da Provider orfano convalidato: `streamsport:{provider}:{id}`.
 
 ---

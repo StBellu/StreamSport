@@ -1162,8 +1162,8 @@ async def test_pipeline_scheduler_prunes_stale_db_rows_with_outage_guards(
     ram_cache = RAMCacheManager()
     now_ms = int(time.time() * 1000)
 
-    stale_tivusat = _make_match(
-        "tivusat_295_rosario",
+    stale_legacy_epg = _make_match(
+        "legacy_epg_295_rosario",
         "Campionato Argentino Rosario Central-Gimnasia Mdz",
         date_ms=now_ms + 3600_000,
         end_ms=now_ms + 7200_000,
@@ -1186,10 +1186,10 @@ async def test_pipeline_scheduler_prunes_stale_db_rows_with_outage_guards(
         end_ms=now_ms + 7200_000,
         source_origin="diretta",
     )
-    await db.upsert_matches([stale_tivusat, stale_sky, stale_diretta])
+    await db.upsert_matches([stale_legacy_epg, stale_sky, stale_diretta])
 
     stale_posters = [
-        settings.BASE_POSTER_CACHE_DIR / "tivusat_295_rosario.jpg",
+        settings.BASE_POSTER_CACHE_DIR / "legacy_epg_295_rosario.jpg",
         settings.POSTER_CACHE_DIR / "sky_11497_cerignola__v1.jpg",
         settings.BASE_POSTER_CACHE_DIR / "diretta-old-challenger.jpg",
     ]
