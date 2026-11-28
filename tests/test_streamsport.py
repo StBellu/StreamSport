@@ -1653,5 +1653,107 @@ async def test_thesportsdb_level1_level2_fixes_and_sky_fallback_poster(
         await db.close()
 
 
+@pytest.mark.asyncio
+async def test_logging_isolation_and_provider_diagnostics(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    from app.main import _NOISY_THIRD_PARTY_LOGGERS, _configure_logging
+
+    # Save prior logger levels to restore cleanly after assertions
+    saved_levels: dict[str, int] = {
+        name: logging.getLogger(name).level
+        for name in ("", "app", *_NOISY_THIRD_PARTY_LOGGERS)
+    }
+    try:
+        # 1. DEBUG must apply to `app` only, keeping root at INFO and noisy libs at WARNING
+        _configure_logging("DEBUG")
+        assert logging.getLogger("app").level == logging.DEBUG
+        assert logging.getLogger().level == logging.INFO
+        for noisy in ("aiosqlite", "PIL", "httpx", "httpcore", "asyncio"):
+            assert logging.getLogger(noisy).level == logging.WARNING
+
+        _configure_logging("WARNING")
+        assert logging.getLogger("app").level == logging.WARNING
+        assert logging.getLogger().level == logging.WARNING
+
+        # 2. MandraKodi HTTP 200 blocked/empty response -> clear diagnostic without leaking secrets
+        def _mk_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="GEO BLOCKED FROM SERVER IP")
+
+        mk_client = httpx.AsyncClient(transport=httpx.MockTransport(_mk_handler))
+        mk_settings = _test_settings(
+            tmp_path,
+            MANDRAKODI_API_URL="https://mk.example/filter.php",
+            MANDRAKODI_PASSWORD="SECRET_MK_PASSWORD",
+            MANDRAKODI_DEVICE_ID="SECRET_DEVICE_ID",
+        )
+        mk = MandraKodiService(settings=mk_settings, client=mk_client)
+        mk._st_ott_cache = []
+        mk._st_ott_cache_time = time.time()  # skip live SuperTennis probe
+        with caplog.at_level(logging.WARNING):
+            mk_res = await mk.harvest()
+        assert mk_res.error == ""
+        assert "packs=0/" in mk_res.diagnostic
+        assert "HTTP 200" in mk_res.diagnostic
+        assert "GEO BLOCKED" in mk_res.diagnostic
+        assert "SECRET_MK_PASSWORD" not in mk_res.diagnostic
+        assert "SECRET_DEVICE_ID" not in mk_res.diagnostic
+        await mk_client.aclose()
+
+        # 3. FCTV33 HTTP 403 on /api/common/bs + failing legacy -> diagnostic mentions HTTP 403
+        def _fc_handler(request: httpx.Request) -> httpx.Response:
+            if "/api/common/bs" in request.url.path:
+                return httpx.Response(403, text="Forbidden")
+            return httpx.Response(503, text="Unavailable")
+
+        fc_client = httpx.AsyncClient(transport=httpx.MockTransport(_fc_handler))
+        fc = Fctv33Service(settings=_test_settings(tmp_path), client=fc_client, sport_types=(1,))
+        fc_res = await fc.harvest()
+        assert "HTTP 403" in fc_res.diagnostic
+        await fc_client.aclose()
+
+        # 4. TvVoo, SPON, DaddyLive, StreamFree diagnostics on empty/failed harvests
+        def _fail_403_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, text="Forbidden")
+
+        fail_client = httpx.AsyncClient(transport=httpx.MockTransport(_fail_403_handler))
+
+        tv = TvVooService(
+            settings=_test_settings(tmp_path),
+            client=fail_client,
+            m3u_fallback_path=tmp_path / "missing.m3u",
+        )
+        tv_res = await tv.harvest()
+        assert "geil=empty" in tv_res.diagnostic and "ping=failed" in tv_res.diagnostic
+
+        sp = SponService(
+            settings=_test_settings(tmp_path),
+            client=fail_client,
+            prog_urls=("https://spon.example/prog.txt",),
+        )
+        sp_res = await sp.harvest()
+        assert "tried 1 mirrors" in sp_res.diagnostic and "HTTP 403" in sp_res.error
+
+        dl = DaddyLiveService(
+            settings=_test_settings(tmp_path),
+            client=fail_client,
+            mirrors=("https://dl.example",),
+        )
+        dl_res = await dl.harvest()
+        assert "schedule_failed" in dl_res.diagnostic and "HTTP 403" in dl_res.diagnostic
+
+        sf = StreamFreeService(settings=_test_settings(tmp_path), client=fail_client)
+        sf_res = await sf.harvest()
+        assert "0 live events" in sf_res.diagnostic and "canonical only" in sf_res.diagnostic
+
+        await fail_client.aclose()
+    finally:
+        for name, lvl in saved_levels.items():
+            logging.getLogger(name).setLevel(lvl)
+
+
+
 
 

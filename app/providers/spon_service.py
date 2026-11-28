@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import logging
 import re
 import time
@@ -424,6 +425,7 @@ class SponService(BaseStreamProvider):
             client = self._get_client()
             last_error = ""
             prog_text = ""
+            used_url = ""
 
             for url in self._prog_urls:
                 try:
@@ -438,6 +440,7 @@ class SponService(BaseStreamProvider):
                     cleaned = resp.text.lstrip("\ufeff")
                     if _is_valid_prog_text(cleaned):
                         prog_text = cleaned
+                        used_url = url
                         break
                     last_error = f"Invalid or HTML/Cloudflare response from {url}"
                 except Exception as exc:
@@ -447,14 +450,28 @@ class SponService(BaseStreamProvider):
             if not prog_text:
                 if self._cache_result is not None:
                     logger.warning("SponService using stale cache after mirror failure: %s", last_error)
-                    return self._cache_result
-                return ProviderHarvestResult(provider=self.name, error=last_error or "All SPON mirrors failed")
+                    return replace(
+                        self._cache_result,
+                        diagnostic=f"stale_cache ({last_error})",
+                    )
+                return ProviderHarvestResult(
+                    provider=self.name,
+                    error=last_error or "All SPON mirrors failed",
+                    diagnostic=f"tried {len(self._prog_urls)} mirrors",
+                )
 
             events = parse_prog_txt(prog_text)
+            host = urlparse(used_url).netloc or used_url
+            diagnostic = (
+                f"source={host}"
+                if events
+                else f"source={host}, 0 events parsed ({len(prog_text)}B)"
+            )
             result = ProviderHarvestResult(
                 provider=self.name,
                 events=events,
                 raw_count=len(events),
+                diagnostic=diagnostic,
             )
             if ttl > 0:
                 self._cache_result = result

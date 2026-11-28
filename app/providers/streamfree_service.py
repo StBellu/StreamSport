@@ -762,6 +762,7 @@ class StreamFreeService(BaseStreamProvider):
 
         events: list[ProviderEvent] = []
         last_error = ""
+        fail_notes: list[str] = []
         effective_now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
 
         for mirror in candidate_mirrors:
@@ -776,6 +777,12 @@ class StreamFreeService(BaseStreamProvider):
                 try:
                     resp = await client.get(url, headers=headers)
                     if resp.status_code != 200 or not resp.text.strip():
+                        if endpoint in ("/streams", "/"):
+                            fail_notes.append(
+                                f"{mirror}{endpoint}=HTTP {resp.status_code}"
+                                if resp.status_code != 200
+                                else f"{mirror}{endpoint}=empty"
+                            )
                         continue
                     parsed = parse_streamfree_matches(
                         resp.text, mirror, now_ms=effective_now_ms
@@ -784,8 +791,12 @@ class StreamFreeService(BaseStreamProvider):
                         self._active_mirror = mirror
                         events = parsed
                         break
+                    if endpoint in ("/streams", "/"):
+                        fail_notes.append(f"{mirror}{endpoint}=0 parsed")
                 except Exception as exc:
                     last_error = str(exc)
+                    if endpoint in ("/streams", "/"):
+                        fail_notes.append(f"{mirror}{endpoint}={type(exc).__name__}")
                     logger.debug("StreamFree fetch failed for %s: %s", url, exc)
             if events:
                 break
@@ -794,10 +805,22 @@ class StreamFreeService(BaseStreamProvider):
         linear_channels = self._build_linear_channels(events, active)
         raw_count = len(events) + sum(len(v) for v in linear_channels.values())
 
+        if events:
+            diagnostic = f"mirror={self._active_mirror}"
+        else:
+            detail = "; ".join(fail_notes[:2]) or (last_error or "no matches parsed")
+            diagnostic = f"0 live events ({detail}); {len(linear_channels)} canonical only"
+            logger.warning(
+                "StreamFree harvest returned 0 live events across %d mirrors (%s)",
+                len(candidate_mirrors),
+                detail,
+            )
+
         return ProviderHarvestResult(
             provider=self.name,
             events=events,
             linear_channels=linear_channels,
             raw_count=raw_count,
             error=last_error if not events else "",
+            diagnostic=diagnostic,
         )

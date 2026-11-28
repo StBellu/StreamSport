@@ -1090,6 +1090,8 @@ class TvVooService(BaseStreamProvider):
             sig = await self.live_manifest_manager.fetch_addon_sig()
 
         live2_cache: Optional[list[dict[str, Any]]] = None
+        used_sources: list[str] = []
+        m3u_checked_found = False
 
         async def _get_live2() -> list[dict[str, Any]]:
             nonlocal live2_cache
@@ -1099,8 +1101,11 @@ class TvVooService(BaseStreamProvider):
 
         for group in VAVOO_GROUPS:
             group_items: list[dict[str, Any]] = geil_grouped.get(group, []) if geil_grouped else []
+            src_tag = "geil" if group_items else ""
             if not group_items and sig:
                 group_items = await self._fetch_catalog_group(group, sig)
+                if group_items:
+                    src_tag = "mediahubmx"
 
             if not group_items:
                 accepted_groups = set(_GROUP_ALIASES.get(group, (group,)))
@@ -1108,18 +1113,26 @@ class TvVooService(BaseStreamProvider):
                 group_items = [
                     it for it in all_live2 if str(it.get("group") or "") in accepted_groups
                 ]
+                if group_items:
+                    src_tag = "live2"
 
             if not group_items and group == "Italy":
                 m3u_path = self._find_local_m3u_path()
                 if m3u_path is not None:
+                    m3u_checked_found = True
                     try:
                         m3u_text = m3u_path.read_text(encoding="utf-8", errors="ignore")
                         group_items = [
                             {"name": ch_name, "url": ch_url}
                             for ch_name, ch_url in parse_m3u_vavoo_channels(m3u_text)
                         ]
+                        if group_items:
+                            src_tag = "local_m3u"
                     except Exception as exc:
                         logger.warning("TvVoo failed reading local M3U fallback %s: %s", m3u_path, exc)
+
+            if group_items and src_tag and src_tag not in used_sources:
+                used_sources.append(src_tag)
 
             for item in group_items:
                 raw_name = str(item.get("name") or "").strip()
@@ -1151,8 +1164,20 @@ class TvVooService(BaseStreamProvider):
                     new_siblings[u] = [other for other in sib_urls if other != u]
         self._siblings_by_url = new_siblings
 
+        if linear_channels:
+            diagnostic = f"sources={','.join(used_sources)}, raw={raw_count}"
+        else:
+            diagnostic = (
+                f"geil={'ok' if geil_grouped else 'empty'}, "
+                f"ping={'ok' if sig else 'failed'}, "
+                f"live2={'ok' if live2_cache else 'empty'}, "
+                f"local_m3u={'found' if m3u_checked_found else 'none'}"
+            )
+            logger.warning("TvVoo harvest returned 0 linear channels (%s)", diagnostic)
+
         return ProviderHarvestResult(
             provider=self.name,
             linear_channels=linear_channels,
             raw_count=raw_count,
+            diagnostic=diagnostic,
         )

@@ -279,18 +279,27 @@ class PipelineScheduler:
             # 3. Concurrent stream harvesting & top-down attachment (+ conflict & ghost EPG filters)
             harvest_results = await self._orchestrator.harvest_all()
             for provider_name, res in harvest_results.items():
+                diag_suffix = f" ({res.diagnostic})" if res.diagnostic else ""
                 if res.error:
                     logger.warning(
-                        "Provider '%s' harvest error: %s",
+                        "Provider '%s' harvest error: %s%s",
                         provider_name,
                         res.error,
+                        diag_suffix,
+                    )
+                elif not res.events and not res.linear_channels:
+                    logger.warning(
+                        "Provider '%s' harvested: 0 events, 0 linear channels%s",
+                        provider_name,
+                        diag_suffix,
                     )
                 else:
                     logger.info(
-                        "Provider '%s' harvested: %d events, %d linear channels",
+                        "Provider '%s' harvested: %d events, %d linear channels%s",
                         provider_name,
                         len(res.events),
                         len(res.linear_channels),
+                        diag_suffix,
                     )
             matches = self._orchestrator.attach_streams(combined_matches, harvest_results)
             matches = filter_conflicting_italian_channels(matches, epg_programs)

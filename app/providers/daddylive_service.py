@@ -910,6 +910,8 @@ class DaddyLiveService(BaseStreamProvider):
         client: httpx.AsyncClient,
         mirror: str,
         paths: tuple[str, ...],
+        *,
+        reasons: Optional[list[str]] = None,
     ) -> str:
         headers = {
             "User-Agent": CHROME_USER_AGENT,
@@ -923,7 +925,14 @@ class DaddyLiveService(BaseStreamProvider):
                 resp = await client.get(url, headers=headers)
                 if resp.status_code == 200 and _is_valid_schedule_payload(resp.text):
                     return resp.text
+                if reasons is not None:
+                    if resp.status_code != 200:
+                        reasons.append(f"{mirror}{path}=HTTP {resp.status_code}")
+                    else:
+                        reasons.append(f"{mirror}{path}=invalid({len(resp.content)}B)")
             except Exception as exc:
+                if reasons is not None:
+                    reasons.append(f"{mirror}{path}={type(exc).__name__}")
                 logger.debug("DaddyLive fetch failed for %s: %s", url, exc)
         return ""
 
@@ -1030,17 +1039,23 @@ class DaddyLiveService(BaseStreamProvider):
 
         events: list[ProviderEvent] = []
         errors: list[str] = []
+        mirror_notes: list[str] = []
         scraped_any = False
+        parsed_count = 0
+        used_stale = False
 
         mirrors = await self._discover_mirrors(client)
         for mirror in mirrors:
             try:
-                sched_payload = await self._fetch_first_valid(client, mirror, _SCHEDULE_PATHS)
+                sched_payload = await self._fetch_first_valid(
+                    client, mirror, _SCHEDULE_PATHS, reasons=mirror_notes
+                )
                 if not sched_payload:
                     continue
                 parsed_events = parse_daddylive_schedule(
                     sched_payload, mirror, reference_dt=utc_now
                 )
+                parsed_count = len(parsed_events)
                 if parsed_events:
                     events = filter_daddylive_events_by_window(
                         parsed_events,
@@ -1052,6 +1067,7 @@ class DaddyLiveService(BaseStreamProvider):
                     self._last_good_events = list(events)
                     scraped_any = True
                     break
+                mirror_notes.append(f"{mirror}=0 parsed events")
             except Exception as exc:
                 errors.append(f"{mirror}: {exc}")
                 logger.warning("DaddyLive mirror %s failed: %s", mirror, exc)
@@ -1064,6 +1080,7 @@ class DaddyLiveService(BaseStreamProvider):
                 timezone_name=self.settings.TIMEZONE,
             )
             self._last_good_events = list(events)
+            used_stale = True
             logger.warning(
                 "DaddyLive harvest failed across all mirrors; retaining %d cached events",
                 len(events),
@@ -1071,6 +1088,20 @@ class DaddyLiveService(BaseStreamProvider):
 
         active_mirror = self._active_mirror or (mirrors[0] if mirrors else DEFAULT_MIRRORS[0])
         linear_channels = self._build_canonical_channels(active_mirror)
+
+        if scraped_any:
+            diagnostic = f"mirror={self._active_mirror}, parsed={parsed_count}, in_window={len(events)}"
+        elif used_stale:
+            stale_reason = "; ".join(mirror_notes[:2]) or "all mirrors failed"
+            diagnostic = f"stale_cache={len(events)} ({stale_reason})"
+        else:
+            diag_detail = "; ".join((errors + mirror_notes)[:2]) or "no valid payload"
+            diagnostic = f"schedule_failed ({diag_detail}); {len(linear_channels)} canonical only"
+            logger.warning(
+                "DaddyLive schedule harvest failed across %d mirrors (%s)",
+                len(mirrors),
+                diag_detail,
+            )
 
         raw_count = len(events) + sum(len(v) for v in linear_channels.values())
         error_msg = "; ".join(errors) if (not scraped_any and not events and errors) else ""
@@ -1080,4 +1111,5 @@ class DaddyLiveService(BaseStreamProvider):
             linear_channels=linear_channels,
             raw_count=raw_count,
             error=error_msg,
+            diagnostic=diagnostic,
         )

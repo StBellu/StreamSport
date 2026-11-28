@@ -21,7 +21,7 @@ import httpx
 from app.config import Settings
 from app.core.network import create_standard_client
 from app.models.domain import ProviderEvent, StreamSource
-from app.providers.base import BaseStreamProvider, ProviderHarvestResult
+from app.providers.base import BaseStreamProvider, ProviderHarvestResult, compact_preview
 from app.providers.tvvoo_service import normalize_channel_name
 from app.taxonomy.channels import SKY_CHID_TO_CANONICAL
 from app.taxonomy.demographics import (
@@ -1097,7 +1097,9 @@ class MandraKodiService(BaseStreamProvider):
             self._st_ott_cache_time = time.time()
             return list(active)
 
-    async def _fetch_num_test(self, client: httpx.AsyncClient, api_url: str, num_test: str) -> ProviderHarvestResult:
+    async def _fetch_num_test(
+        self, client: httpx.AsyncClient, api_url: str, num_test: str
+    ) -> tuple[ProviderHarvestResult, int, int, str]:
         resp = await client.get(
             api_url,
             params={"numTest": num_test},
@@ -1105,7 +1107,8 @@ class MandraKodiService(BaseStreamProvider):
             timeout=15.0,
         )
         resp.raise_for_status()
-        return self.parse_payload(resp.content)
+        parsed = self.parse_payload(resp.content)
+        return parsed, resp.status_code, len(resp.content), compact_preview(resp.content, max_len=90)
 
     async def harvest(self) -> ProviderHarvestResult:
         """Fetch and parse MandraKodi streams across all numTest packs."""
@@ -1114,7 +1117,10 @@ class MandraKodiService(BaseStreamProvider):
             logger.warning(
                 "MandraKodiService: MANDRAKODI_API_URL is empty; skipping remote fetch."
             )
-            return ProviderHarvestResult(provider=self.name)
+            return ProviderHarvestResult(
+                provider=self.name,
+                diagnostic="MANDRAKODI_API_URL empty",
+            )
 
         client = self._get_client()
         results = await asyncio.gather(
@@ -1128,13 +1134,20 @@ class MandraKodiService(BaseStreamProvider):
         seen_ev_streams: dict[tuple[str, int], set[tuple[str, str]]] = {}
         total_raw = 0
         errors: list[str] = []
+        ok_packs = 0
+        empty_samples: list[str] = []
 
-        for nt, res in zip(MANDRAKODI_NUM_TESTS, results):
-            if isinstance(res, Exception):
-                logger.warning("MandraKodiService numTest=%s failed: %s", nt, res)
-                errors.append(f"{nt}: {res}")
+        for nt, outcome in zip(MANDRAKODI_NUM_TESTS, results):
+            if isinstance(outcome, Exception):
+                logger.warning("MandraKodiService numTest=%s failed: %s", nt, outcome)
+                errors.append(f"{nt}: {outcome}")
                 continue
+            res, status_code, nbytes, preview = outcome
             total_raw += res.raw_count
+            if res.linear_channels or res.events:
+                ok_packs += 1
+            else:
+                empty_samples.append(f"{nt}=HTTP {status_code} {nbytes}B '{preview}'")
 
             for ch_key, sources in res.linear_channels.items():
                 bucket = merged_linear.setdefault(ch_key, [])
@@ -1167,7 +1180,11 @@ class MandraKodiService(BaseStreamProvider):
                         merged_events[ev_key].streams.append(src)
 
         if not merged_linear and not merged_events and len(errors) == len(MANDRAKODI_NUM_TESTS):
-            return ProviderHarvestResult(provider=self.name, error="; ".join(errors[:3]))
+            return ProviderHarvestResult(
+                provider=self.name,
+                error="; ".join(errors[:3]),
+                diagnostic=f"all {len(MANDRAKODI_NUM_TESTS)} packs failed",
+            )
 
         st_ott_streams = await self.get_active_supertennis_ott_streams()
         for src in st_ott_streams:
@@ -1184,9 +1201,21 @@ class MandraKodiService(BaseStreamProvider):
         for ev in events_list:
             ev.streams.sort(key=lambda s: (0 if s.language == "ITA" else 1, 0 if s.clearkey else 1, s.priority))
 
+        if merged_linear or events_list:
+            diagnostic = f"packs={ok_packs}/{len(MANDRAKODI_NUM_TESTS)} ok, st_ott={len(st_ott_streams)}"
+            if errors:
+                diagnostic += f", failed={len(errors)}"
+        else:
+            sample = "; ".join(empty_samples[:2])
+            diagnostic = f"packs=0/{len(MANDRAKODI_NUM_TESTS)}, failed={len(errors)}"
+            if sample:
+                diagnostic += f", sample={sample}"
+            logger.warning("MandraKodi harvest returned 0 channels/events (%s)", diagnostic)
+
         return ProviderHarvestResult(
             provider=self.name,
             events=events_list,
             linear_channels=merged_linear,
             raw_count=total_raw,
+            diagnostic=diagnostic,
         )

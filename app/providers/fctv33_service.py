@@ -864,6 +864,7 @@ class Fctv33Service(BaseStreamProvider):
         self._detail_cache: dict[tuple[int, int], tuple[float, list[StreamSource]]] = {}
         self._detail_sem: Optional[asyncio.Semaphore] = None
         self._known_matches_by_sport: dict[int, list[dict[str, Any]]] = {}
+        self._last_bs_diag: str = ""
 
     @property
     def known_matches(self) -> list[dict[str, Any]]:
@@ -910,6 +911,7 @@ class Fctv33Service(BaseStreamProvider):
         """Fetch 32-char `sfver` signature via `/api/common/bs` with 600s TTL cache."""
         now = time.monotonic()
         if self._sfver_cache and now - self._sfver_cache[0] < SFVER_CACHE_TTL_SECONDS:
+            self._last_bs_diag = "ok(cached)"
             return self._sfver_cache[1]
 
         try:
@@ -923,13 +925,24 @@ class Fctv33Service(BaseStreamProvider):
                 ],
                 headers=self._live_headers(),
             )
-            if resp.status_code == 200 and resp.content:
-                sig = extract_sfver_from_bs(resp.content)
-                if sig:
-                    self._sfver_cache = (now, sig)
-                    return sig
+            if resp.status_code != 200:
+                self._last_bs_diag = f"HTTP {resp.status_code}"
+                logger.warning("FCTV33 /api/common/bs returned HTTP %s", resp.status_code)
+                return ""
+            if not resp.content:
+                self._last_bs_diag = "empty body"
+                logger.warning("FCTV33 /api/common/bs returned empty response")
+                return ""
+            sig = extract_sfver_from_bs(resp.content)
+            if sig:
+                self._sfver_cache = (now, sig)
+                self._last_bs_diag = "ok"
+                return sig
+            self._last_bs_diag = f"no sfver ({len(resp.content)}B)"
+            logger.warning("FCTV33 /api/common/bs had no sfver (%dB)", len(resp.content))
         except Exception as exc:
-            logger.debug("FCTV33 /api/common/bs handshake failed: %s", exc)
+            self._last_bs_diag = f"{type(exc).__name__}: {exc}"
+            logger.warning("FCTV33 /api/common/bs handshake failed: %s", exc)
         return ""
 
     async def _fetch_domains_and_handshake(
@@ -1092,7 +1105,9 @@ class Fctv33Service(BaseStreamProvider):
             params={"sportType": str(sport_type), "stream": "true"},
             headers=self._live_headers(),
         )
-        if resp.status_code != 200 or not resp.content:
+        if resp.status_code != 200:
+            raise RuntimeError(f"sportType={sport_type} HTTP {resp.status_code}")
+        if not resp.content:
             return []
 
         matches, _ = parse_fctv33_live_catalog(
@@ -1166,18 +1181,27 @@ class Fctv33Service(BaseStreamProvider):
                 for st in self._sport_types
             ]
             live_results = await asyncio.gather(*live_tasks, return_exceptions=True)
+            sports_ok = 0
             for res in live_results:
                 if isinstance(res, Exception):
                     errors.append(str(res))
                 else:
+                    if res:
+                        sports_ok += 1
                     events.extend(res)
 
             if events or not errors:
+                diagnostic = f"mode=live_sfver, sports={sports_ok}/{len(self._sport_types)}"
+                if errors:
+                    diagnostic += f", failed={len(errors)}"
+                if not events:
+                    logger.warning("FCTV33 harvest returned 0 events (%s)", diagnostic)
                 return ProviderHarvestResult(
                     provider=self.name,
                     events=events,
                     raw_count=len(events),
                     error="",
+                    diagnostic=diagnostic,
                 )
 
         # Fallback to legacy domains.json + /api/common/params handshake
@@ -1194,9 +1218,18 @@ class Fctv33Service(BaseStreamProvider):
             else:
                 events.extend(res)
 
+        bs_info = self._last_bs_diag or "skipped"
+        if events:
+            diagnostic = f"mode=legacy_fallback, bs={bs_info}"
+        else:
+            err_detail = f", errors={'; '.join(errors[:2])}" if errors else ""
+            diagnostic = f"bs={bs_info}; legacy_events=0{err_detail}"
+            logger.warning("FCTV33 harvest returned 0 events (%s)", diagnostic)
+
         return ProviderHarvestResult(
             provider=self.name,
             events=events,
             raw_count=len(events),
             error="; ".join(errors) if (not events and errors) else "",
+            diagnostic=diagnostic,
         )

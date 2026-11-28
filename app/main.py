@@ -38,16 +38,32 @@ class HealthResponse(BaseModel):
     updated_at: int
 
 
+_NOISY_THIRD_PARTY_LOGGERS: tuple[str, ...] = (
+    "aiosqlite",
+    "httpx",
+    "httpcore",
+    "hpack",
+    "PIL",
+    "asyncio",
+    "urllib3",
+    "charset_normalizer",
+    "multipart",
+    "watchfiles",
+)
+
+
 def _configure_logging(level_name: str) -> None:
-    """Configure application-wide logging level without disrupting test capture."""
+    """Configure application-wide logging level without letting 3rd-party libs spam DEBUG."""
     level = getattr(logging, (level_name or "INFO").strip().upper(), logging.INFO)
+    root_level = max(level, logging.INFO)
     logging.basicConfig(
-        level=level,
+        level=root_level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    logging.getLogger().setLevel(root_level)
     logging.getLogger("app").setLevel(level)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    for lib_name in _NOISY_THIRD_PARTY_LOGGERS:
+        logging.getLogger(lib_name).setLevel(logging.WARNING)
 
 
 def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
