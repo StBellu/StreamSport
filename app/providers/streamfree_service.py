@@ -15,7 +15,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.config import Settings
-from app.core.network import create_doh_client
+from app.core.network import create_doh_client, resolve_proxy_url
 from app.models.domain import ProviderEvent, StreamSource
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult
 from app.taxonomy import detect_demographics_from_stream_title
@@ -493,7 +493,10 @@ class StreamFreeService(BaseStreamProvider):
         if self._external_client is not None:
             return self._external_client
         if self._owned_client is None or self._owned_client.is_closed:
-            self._owned_client = create_doh_client(timeout=15.0)
+            self._owned_client = create_doh_client(
+                timeout=15.0,
+                proxy=resolve_proxy_url(self.settings, "streamfree"),
+            )
         return self._owned_client
 
     async def aclose(self) -> None:

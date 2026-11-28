@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     SPON_FALLBACK_URL: str = "https://sportsonline.cx/prog.txt"
     SPON_CACHE_TTL: int = 7200
 
+    # Modular outbound HTTP/SOCKS5 proxy routing (empty=inherit GLOBAL_PROXY, "direct"=bypass)
+    GLOBAL_PROXY: str = ""
+    DIRETTA_PROXY: str = ""
+    SKY_EPG_PROXY: str = ""
+    THESPORTSDB_PROXY: str = ""
+    TENNIS_POSTERS_PROXY: str = ""
+    TVVOO_PROXY: str = ""
+    MANDRAKODI_PROXY: str = ""
+    SPON_PROXY: str = ""
+    DADDYLIVE_PROXY: str = ""
+    STREAMFREE_PROXY: str = ""
+    FCTV33_PROXY: str = ""
+
     @property
     def DIRETTA_X_FSIGN(self) -> str:
         """Backward-compatible alias for `FLASHSCORE_FSIGN`."""

@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from app.config import Settings
-from app.core.network import create_doh_client
+from app.core.network import create_doh_client, resolve_proxy_url
 from app.models.domain import ProviderEvent, StreamSource
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult
 from app.taxonomy.demographics import (
@@ -402,7 +402,10 @@ class SponService(BaseStreamProvider):
         if self._external_client is not None:
             return self._external_client
         if self._owned_client is None or self._owned_client.is_closed:
-            self._owned_client = create_doh_client(timeout=15.0)
+            self._owned_client = create_doh_client(
+                timeout=15.0,
+                proxy=resolve_proxy_url(self.settings, "spon"),
+            )
         return self._owned_client
 
     async def aclose(self) -> None:

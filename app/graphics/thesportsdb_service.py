@@ -18,7 +18,7 @@ from rapidfuzz import fuzz
 
 from app.config import Settings, get_settings
 from app.core.database import DatabaseManager
-from app.core.network import create_standard_client
+from app.core.network import create_standard_client, resolve_proxy_url
 from app.graphics._utils import (
     get_timezone,
     image_to_jpeg_bytes,
@@ -438,7 +438,11 @@ class TheSportsDBService:
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = create_standard_client(timeout=15.0, follow_redirects=True)
+            self._client = create_standard_client(
+                timeout=15.0,
+                follow_redirects=True,
+                proxy=resolve_proxy_url(self._settings, "thesportsdb"),
+            )
             self._owns_client = True
         return self._client
 

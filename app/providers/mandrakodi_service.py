@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from app.config import Settings
-from app.core.network import create_standard_client
+from app.core.network import create_standard_client, resolve_proxy_url
 from app.models.domain import ProviderEvent, StreamSource
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult, compact_preview
 from app.providers.tvvoo_service import normalize_channel_name
@@ -330,7 +330,10 @@ class MandraKodiService(BaseStreamProvider):
         if self._external_client is not None:
             return self._external_client
         if self._owned_client is None or self._owned_client.is_closed:
-            self._owned_client = create_standard_client(timeout=15.0)
+            self._owned_client = create_standard_client(
+                timeout=15.0,
+                proxy=resolve_proxy_url(self.settings, "mandrakodi"),
+            )
         return self._owned_client
 
     async def aclose(self) -> None:

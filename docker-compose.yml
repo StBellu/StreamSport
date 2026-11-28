@@ -50,3 +50,35 @@ services:
       DEFAULT_EP_URL: ${DEFAULT_EP_URL:-}
       DEFAULT_EP_PASS: ${DEFAULT_EP_PASS:-}
       PUBLIC_URL: ${PUBLIC_URL:-}
+
+      # Modular Outbound Proxy Routing (empty=inherit GLOBAL_PROXY, "direct"=bypass)
+      GLOBAL_PROXY: ${GLOBAL_PROXY:-}
+      DIRETTA_PROXY: ${DIRETTA_PROXY:-}
+      SKY_EPG_PROXY: ${SKY_EPG_PROXY:-}
+      THESPORTSDB_PROXY: ${THESPORTSDB_PROXY:-}
+      TENNIS_POSTERS_PROXY: ${TENNIS_POSTERS_PROXY:-}
+      TVVOO_PROXY: ${TVVOO_PROXY:-}
+      MANDRAKODI_PROXY: ${MANDRAKODI_PROXY:-}
+      SPON_PROXY: ${SPON_PROXY:-}
+      DADDYLIVE_PROXY: ${DADDYLIVE_PROXY:-}
+      STREAMFREE_PROXY: ${STREAMFREE_PROXY:-}
+      FCTV33_PROXY: ${FCTV33_PROXY:-}
+
+  warp:
+    image: caomingjun/warp:latest
+    container_name: warp
+    restart: unless-stopped
+    device_cgroup_rules:
+      - "c 10:200 rwm"
+    environment:
+      WARP_SLEEP: ${WARP_SLEEP:-2}
+      WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
+    cap_add:
+      - NET_ADMIN
+      - MKNOD
+      - AUDIT_WRITE
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 0
+      net.ipv4.conf.all.src_valid_mark: 1
+    volumes:
+      - ./data/warp:/var/lib/cloudflare-warp

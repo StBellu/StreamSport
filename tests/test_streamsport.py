@@ -1754,6 +1754,65 @@ async def test_logging_isolation_and_provider_diagnostics(
             logging.getLogger(name).setLevel(lvl)
 
 
+@pytest.mark.asyncio
+async def test_modular_proxy_resolution_and_clients(tmp_path: Path) -> None:
+    from app.core.network import (
+        DoHAsyncHTTPTransport,
+        create_doh_client,
+        create_standard_client,
+        format_proxy_label,
+        resolve_proxy_url,
+    )
+
+    s = _test_settings(
+        tmp_path,
+        GLOBAL_PROXY="socks5h://warp:1080",
+        SKY_EPG_PROXY="direct",
+        MANDRAKODI_PROXY="http://user:secret@gluetun:8888",
+        FCTV33_PROXY="none",
+    )
+
+    # 1. Inheritance, explicit override, and "direct"/"none" bypass
+    assert resolve_proxy_url(s, "tvvoo") == "socks5h://warp:1080"
+    assert resolve_proxy_url(s, "daddylive") == "socks5h://warp:1080"
+    assert resolve_proxy_url(s, "sky_epg") is None
+    assert resolve_proxy_url(s, "fctv33") is None
+    assert resolve_proxy_url(s, "mandrakodi") == "http://user:secret@gluetun:8888"
+
+    # 2. Credential redaction in logs
+    assert format_proxy_label("http://user:secret@gluetun:8888") == "http://gluetun:8888"
+    assert format_proxy_label("socks5h://warp:1080") == "socks5h://warp:1080"
+    assert format_proxy_label(None) == "direct"
+
+    # 3. Direct client factory + DoH proxy-delegating client instantiation (with socksio)
+    c_std = create_standard_client(proxy="socks5h://warp:1080")
+    c_doh = create_doh_client(proxy="socks5h://warp:1080")
+    assert isinstance(c_doh._transport, DoHAsyncHTTPTransport)
+    assert type(c_doh._transport._pool).__name__ == "AsyncSOCKSProxy"
+    await c_std.aclose()
+    await c_doh.aclose()
+
+    # 4. Services inherit resolved proxies while DaddyLive EasyProxy probe stays direct
+    dl = DaddyLiveService(settings=s)
+    mk = MandraKodiService(settings=s)
+    fc = Fctv33Service(settings=s)
+    tv = TvVooService(settings=s)
+    try:
+        assert dl._get_client() is not dl._get_easyproxy_client()
+        probe_url = httpx.URL("https://example.com")
+        assert type(dl._get_client()._transport_for_url(probe_url)._pool).__name__ == "AsyncSOCKSProxy"
+        assert type(dl._get_easyproxy_client()._transport_for_url(probe_url)._pool).__name__ == "AsyncConnectionPool"
+        assert type(mk._get_client()._transport_for_url(probe_url)._pool).__name__ == "AsyncHTTPProxy"
+        assert type(fc._get_client()._transport_for_url(probe_url)._pool).__name__ == "AsyncConnectionPool"
+        assert type(tv._get_client()._transport_for_url(probe_url)._pool).__name__ == "AsyncSOCKSProxy"
+        assert type(tv.live_manifest_manager._get_client()._transport_for_url(probe_url)._pool).__name__ == "AsyncSOCKSProxy"
+    finally:
+        await dl.aclose()
+        await mk.aclose()
+        await fc.aclose()
+        await tv.aclose()
+
+
 
 
 

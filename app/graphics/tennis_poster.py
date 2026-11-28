@@ -21,7 +21,7 @@ from rapidfuzz import fuzz
 
 from app.config import Settings, get_settings
 from app.core.database import DatabaseManager
-from app.core.network import DEFAULT_USER_AGENT, create_standard_client
+from app.core.network import DEFAULT_USER_AGENT, create_standard_client, resolve_proxy_url
 from app.graphics._utils import (
     image_to_jpeg_bytes,
     load_font,
@@ -527,10 +527,17 @@ async def _fetch_espn_cutout(
     return None
 
 
-async def _fetch_atp_cutout(query_name: str) -> Optional[tuple[str, bytes]]:
+async def _fetch_atp_cutout(
+    query_name: str,
+    *,
+    proxy: Optional[str] = None,
+) -> Optional[tuple[str, bytes]]:
     """Query ATP Tour player finder via Safari 15.5 impersonation and reject 4729B silhouettes."""
     try:
-        async with CurlAsyncSession(impersonate="safari15_5", timeout=15) as session:
+        session_kwargs: dict[str, Any] = {"impersonate": "safari15_5", "timeout": 15}
+        if proxy:
+            session_kwargs["proxy"] = proxy
+        async with CurlAsyncSession(**session_kwargs) as session:
             best_pid = ""
             best_score = -1.0
             for q in _build_player_queries(query_name):
@@ -686,6 +693,7 @@ async def fetch_athlete_cutout(
     client: httpx.AsyncClient,
     *,
     assets_dir: Optional[Path] = None,
+    proxy: Optional[str] = None,
 ) -> bytes:
     """Resolve an athlete cutout PNG/image bytes via 4-step waterfall with fallback silhouette."""
     query_name = _deabbreviate_player_name(name, slug)
@@ -729,7 +737,7 @@ async def fetch_athlete_cutout(
 
         # Step 3: Strict gender-partitioned official tours (ATP vs WTA).
         if not is_women:
-            atp_res = await _fetch_atp_cutout(query_name)
+            atp_res = await _fetch_atp_cutout(query_name, proxy=proxy)
             if atp_res is not None:
                 img_url, img_bytes = atp_res
                 if db is not None and cache_slug:
@@ -1065,6 +1073,7 @@ class TennisPosterService:
                 timeout=15.0,
                 headers={"User-Agent": DEFAULT_USER_AGENT},
                 follow_redirects=True,
+                proxy=resolve_proxy_url(self._settings, "tennis_posters"),
             )
             self._owns_client = True
         return self._client
@@ -1158,6 +1167,7 @@ class TennisPosterService:
         home_name = match.home_team.name
         away_name = match.away_team.name
         client = self._get_client()
+        poster_proxy = resolve_proxy_url(self._settings, "tennis_posters")
         fallback_bytes = load_fallback_silhouette_bytes(
             match.is_women,
             assets_dir=self._settings.TENNIS_ASSETS_DIR,
@@ -1173,10 +1183,10 @@ class TennisPosterService:
                 away_pair.append(away_pair[0] if away_pair else "Player")
 
             la, lb, ra, rb = await asyncio.gather(
-                fetch_athlete_cutout(home_pair[0], "", match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR),
-                fetch_athlete_cutout(home_pair[1], "", match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR),
-                fetch_athlete_cutout(away_pair[0], "", match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR),
-                fetch_athlete_cutout(away_pair[1], "", match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR),
+                fetch_athlete_cutout(home_pair[0], "", match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR, proxy=poster_proxy),
+                fetch_athlete_cutout(home_pair[1], "", match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR, proxy=poster_proxy),
+                fetch_athlete_cutout(away_pair[0], "", match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR, proxy=poster_proxy),
+                fetch_athlete_cutout(away_pair[1], "", match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR, proxy=poster_proxy),
             )
             left_lbl = f"{_extract_surname(home_pair[0])} / {_extract_surname(home_pair[1])}"
             right_lbl = f"{_extract_surname(away_pair[0])} / {_extract_surname(away_pair[1])}"
@@ -1200,8 +1210,8 @@ class TennisPosterService:
 
         # Layout 3: Singles.
         left_bytes, right_bytes = await asyncio.gather(
-            fetch_athlete_cutout(home_name, match.home_team.slug, match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR),
-            fetch_athlete_cutout(away_name, match.away_team.slug, match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR),
+            fetch_athlete_cutout(home_name, match.home_team.slug, match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR, proxy=poster_proxy),
+            fetch_athlete_cutout(away_name, match.away_team.slug, match.is_women, db, client, assets_dir=self._settings.TENNIS_ASSETS_DIR, proxy=poster_proxy),
         )
         left_sur = _extract_surname(_deabbreviate_player_name(home_name, match.home_team.slug))
         right_sur = _extract_surname(_deabbreviate_player_name(away_name, match.away_team.slug))

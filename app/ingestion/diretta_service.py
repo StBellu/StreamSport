@@ -14,7 +14,7 @@ from typing import Any, Iterable, NamedTuple, Optional
 import httpx
 
 from app.config import Settings, get_settings
-from app.core.network import DEFAULT_USER_AGENT, create_standard_client
+from app.core.network import DEFAULT_USER_AGENT, create_standard_client, resolve_proxy_url
 from app.graphics._utils import get_timezone
 from app.models.domain import DIRETTA_POST_MATCH_MS, Match, SportSilo, TeamInfo
 from app.taxonomy import (
@@ -562,7 +562,10 @@ class DirettaService:
         if self._client is not None:
             return self._client
         if self._owned_client is None or self._owned_client.is_closed:
-            self._owned_client = create_standard_client(timeout=20.0)
+            self._owned_client = create_standard_client(
+                timeout=20.0,
+                proxy=resolve_proxy_url(self._settings, "diretta"),
+            )
         return self._owned_client
 
     async def aclose(self) -> None:

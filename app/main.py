@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from app.config import Settings, get_settings
 from app.core.database import DatabaseManager
+from app.core.network import _SERVICE_PROXY_FIELDS, format_proxy_label, resolve_proxy_url
 from app.core.ram_cache import RAMCacheManager
 from app.graphics import BannerService, TennisPosterService, TheSportsDBService
 from app.ingestion import DirettaService, ItalianEPGService, PipelineScheduler
@@ -129,6 +130,16 @@ def create_app(settings_override: Optional[Settings] = None) -> FastAPI:
         app.state.scheduler = scheduler
 
         await scheduler.hydrate_from_db()
+
+        proxy_routes = [
+            f"{svc}={format_proxy_label(resolved)}"
+            for svc in _SERVICE_PROXY_FIELDS
+            if (resolved := resolve_proxy_url(settings, svc))
+        ]
+        if proxy_routes:
+            logger.info("Outbound proxy routing: %s", ", ".join(proxy_routes))
+        else:
+            logger.info("Outbound proxy routing: all direct")
 
         disable_bg = os.environ.get("DISABLE_BACKGROUND_SCHEDULER", "").strip().lower() in (
             "1",

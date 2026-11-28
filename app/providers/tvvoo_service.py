@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, quote, urljoin, urlparse, urlsplit
 import httpx
 
 from app.config import Settings
-from app.core.network import create_standard_client, is_safe_public_ip
+from app.core.network import create_standard_client, is_safe_public_ip, resolve_proxy_url
 from app.models.domain import StreamSource
 from app.providers.base import BaseStreamProvider, ProviderHarvestResult
 from app.taxonomy.channels import (
@@ -380,6 +380,7 @@ class LiveManifestManager:
         throttle_seconds: float = _THROTTLE_SECONDS,
         max_sessions: int = MAX_SESSIONS,
         sibling_lookup: Optional[Callable[[str], list[str]]] = None,
+        proxy: Optional[str] = None,
     ) -> None:
         self._external_client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
@@ -394,6 +395,7 @@ class LiveManifestManager:
         self._throttle_seconds = throttle_seconds
         self._max_sessions = max(1, max_sessions)
         self._sibling_lookup = sibling_lookup
+        self._proxy = proxy
 
         self._thread_lock = threading.RLock()
         self._sessions: OrderedDict[tuple[str, str], _LiveStreamSession] = OrderedDict()
@@ -413,6 +415,7 @@ class LiveManifestManager:
             self._owned_client = create_standard_client(
                 timeout=max(self._resolve_timeout, self._playlist_timeout),
                 verify=False,
+                proxy=self._proxy,
             )
         return self._owned_client
 
@@ -881,7 +884,11 @@ class TvVooService(BaseStreamProvider):
         super().__init__(settings)
         self._external_client = client
         self._owned_client: Optional[httpx.AsyncClient] = None
-        self.live_manifest_manager = live_manifest_manager or LiveManifestManager(client=client)
+        self._proxy_url = resolve_proxy_url(self.settings, "tvvoo")
+        self.live_manifest_manager = live_manifest_manager or LiveManifestManager(
+            client=client,
+            proxy=self._proxy_url,
+        )
         self._m3u_fallback_path = m3u_fallback_path
         self._siblings_by_url: dict[str, list[str]] = {}
         self.live_manifest_manager.set_sibling_lookup(self._lookup_siblings)
@@ -897,7 +904,11 @@ class TvVooService(BaseStreamProvider):
         if self._external_client is not None:
             return self._external_client
         if self._owned_client is None or self._owned_client.is_closed:
-            self._owned_client = create_standard_client(timeout=15.0, verify=False)
+            self._owned_client = create_standard_client(
+                timeout=15.0,
+                verify=False,
+                proxy=self._proxy_url,
+            )
         return self._owned_client
 
     async def aclose(self) -> None:

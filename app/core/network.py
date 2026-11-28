@@ -6,6 +6,7 @@ import ssl
 import time
 import typing
 from typing import Iterable, Optional
+from urllib.parse import urlsplit
 
 import httpcore
 import httpx
@@ -13,6 +14,52 @@ import httpx
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 _BLOCKED_IPS = frozenset({"169.254.169.254", "172.16.0.2"})
 _MIN_TTL_SECONDS = 60
+
+_DIRECT_PROXY_TOKENS = frozenset({"direct", "none", "off", "false", "0"})
+_SERVICE_PROXY_FIELDS: dict[str, str] = {
+    "diretta": "DIRETTA_PROXY",
+    "sky_epg": "SKY_EPG_PROXY",
+    "thesportsdb": "THESPORTSDB_PROXY",
+    "tennis_posters": "TENNIS_POSTERS_PROXY",
+    "tvvoo": "TVVOO_PROXY",
+    "mandrakodi": "MANDRAKODI_PROXY",
+    "spon": "SPON_PROXY",
+    "daddylive": "DADDYLIVE_PROXY",
+    "streamfree": "STREAMFREE_PROXY",
+    "fctv33": "FCTV33_PROXY",
+}
+
+
+def resolve_proxy_url(settings: typing.Any, service: str) -> Optional[str]:
+    """Resolve effective outbound proxy URL for `service` (`None` means direct)."""
+    if settings is None:
+        return None
+    field_name = _SERVICE_PROXY_FIELDS.get(service.strip().lower())
+    if field_name:
+        raw_override = str(getattr(settings, field_name, "") or "").strip()
+        if raw_override:
+            if raw_override.lower() in _DIRECT_PROXY_TOKENS:
+                return None
+            return raw_override
+    raw_global = str(getattr(settings, "GLOBAL_PROXY", "") or "").strip()
+    if raw_global and raw_global.lower() not in _DIRECT_PROXY_TOKENS:
+        return raw_global
+    return None
+
+
+def format_proxy_label(proxy: Optional[str]) -> str:
+    """Format a proxy URL without embedded credentials (`scheme://host[:port]` or `direct`)."""
+    raw = (proxy or "").strip()
+    if not raw:
+        return "direct"
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme and parsed.hostname:
+            port_part = f":{parsed.port}" if parsed.port else ""
+            return f"{parsed.scheme}://{parsed.hostname}{port_part}"
+    except Exception:
+        pass
+    return "<configured-proxy>"
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -268,6 +315,7 @@ def create_doh_client(
     http2: bool = False,
     resolver: Optional[DoHResolver] = None,
     limits: Optional[httpx.Limits] = None,
+    proxy: Optional[str] = None,
 ) -> httpx.AsyncClient:
     """Create an `httpx.AsyncClient` using DoH DNS resolution and anti-SSRF checks."""
     merged_headers = {**DEFAULT_HEADERS, **(headers or {})}
@@ -281,6 +329,8 @@ def create_doh_client(
         verify=verify,
         http2=http2,
         limits=transport_limits,
+        proxy=proxy,
+        trust_env=False,
     )
     return httpx.AsyncClient(
         transport=transport,
@@ -298,6 +348,7 @@ def create_standard_client(
     verify: ssl.SSLContext | str | bool = True,
     http2: bool = False,
     limits: Optional[httpx.Limits] = None,
+    proxy: Optional[str] = None,
 ) -> httpx.AsyncClient:
     """Create a standard `httpx.AsyncClient` with browser-like default headers."""
     merged_headers = {**DEFAULT_HEADERS, **(headers or {})}
@@ -313,4 +364,6 @@ def create_standard_client(
         verify=verify,
         http2=http2,
         limits=client_limits,
+        proxy=proxy,
+        trust_env=False,
     )
